@@ -1,15 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/beam-engine", "crates/beam-odata", "crates/beam-server"]
+members = ["crates/beam-accounts", "crates/beam-engine", "crates/beam-odata", "crates/beam-server"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/Klydo131/Open-Beam"
 
 [workspace.dependencies]
+beam-accounts = { path = "crates/beam-accounts" }
 beam-engine = { path = "crates/beam-engine" }
 beam-odata = { path = "crates/beam-odata" }
 duckdb = { version = "1", features = ["bundled"] }
@@ -23,3 +24,11 @@ unsafe_code = "forbid"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Password hashing is deliberately expensive. Left unoptimised it makes every
+# test that signs in take seconds, so these two crates are always optimised.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

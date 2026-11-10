@@ -5,8 +5,8 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-/// Environment variable holding the password for `[auth]`.
-pub const PASSWORD_ENV: &str = "BEAM_PASSWORD";
+/// Environment variable holding the password for `beam create-admin`.
+pub const ADMIN_PASSWORD_ENV: &str = "BEAM_ADMIN_PASSWORD";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,15 +18,11 @@ pub struct Config {
     pub public_url: Option<String>,
     #[serde(default = "default_page_size")]
     pub max_page_size: u64,
-    pub auth: Option<AuthConfig>,
+    /// SQLite file that holds accounts and sessions. Created on first run.
+    #[serde(default = "default_accounts")]
+    pub accounts: PathBuf,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthConfig {
-    pub username: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +46,10 @@ pub enum FormatConfig {
 
 fn default_bind() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8787))
+}
+
+fn default_accounts() -> PathBuf {
+    PathBuf::from("beam-accounts.sqlite")
 }
 
 fn default_page_size() -> u64 {
@@ -76,6 +76,7 @@ impl Config {
         }
         // Dataset paths are relative to the config file, not the working directory.
         let base = path.parent().unwrap_or(Path::new("."));
+        config.accounts = base.join(&config.accounts);
         for dataset in &mut config.datasets {
             match (&mut dataset.path, &dataset.sql, dataset.format) {
                 (Some(path), None, _) => *path = base.join(&*path),
@@ -110,26 +111,15 @@ impl Config {
     }
 }
 
-/// Username and password required on every request.
-#[derive(Clone)]
-pub struct Credentials {
-    pub username: String,
-    pub password: String,
-}
-
-/// Resolves credentials, refusing configurations that would expose data to
-/// the network without a password.
-pub fn credentials(config: &Config, password: Option<String>) -> Result<Option<Credentials>, String> {
-    match (&config.auth, password.filter(|p| !p.is_empty())) {
-        (Some(auth), Some(password)) => Ok(Some(Credentials {
-            username: auth.username.clone(),
-            password,
-        })),
-        (Some(_), None) => Err(format!("[auth] is configured but {PASSWORD_ENV} is not set")),
-        (None, _) if config.bind.ip().is_loopback() => Ok(None),
-        (None, _) => Err(format!(
-            "refusing to listen on {} without [auth]; add [auth] and set {PASSWORD_ENV}, or bind to 127.0.0.1",
-            config.bind
-        )),
+/// Refuses to start somewhere others can reach while nobody can sign in:
+/// the first visitor would otherwise be offered the administrator account.
+pub fn check_exposure(config: &Config, account_count: u64) -> Result<(), String> {
+    let exposed = !config.bind.ip().is_loopback() || config.public_url.is_some();
+    if exposed && account_count == 0 {
+        return Err(format!(
+            "no accounts exist yet, so Open Beam will not listen beyond this computer. \
+             Create the administrator first: set {ADMIN_PASSWORD_ENV} and run `beam create-admin <username>`"
+        ));
     }
+    Ok(())
 }

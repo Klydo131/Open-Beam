@@ -1,6 +1,8 @@
 /target
 /beam.toml
 /data/
+*.sqlite
+*.sqlite-*
 *.duckdb
 *.duckdb.wal
 .env

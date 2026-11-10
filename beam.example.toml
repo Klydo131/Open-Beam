@@ -1,34 +1,39 @@
 # Open Beam configuration. Copy to beam.toml and edit.
 #
-# File paths are relative to this file. Open Beam reads only the files listed
-# here, and never changes them.
+# File paths are relative to this file. Open Beam reads only the data files
+# listed here, and never changes them.
 
 # Address to listen on. The default is reachable from this computer only.
 bind = "127.0.0.1:8787"
 
-# Largest number of rows returned per response. Clients follow next-page
+# Largest number of rows returned per feed response. Clients follow next-page
 # links automatically, so this bounds memory use, not the size of a dataset.
 max_page_size = 5000
+
+# Where accounts are kept. The file is created on first run and belongs to
+# you: it is never part of this project and is ignored by Git.
+accounts = "beam-accounts.sqlite"
 
 # Set when Open Beam is published through an HTTPS reverse proxy.
 # public_url = "https://beam.example.org"
 
-# Require a username and password. Mandatory when `bind` is not a loopback
-# address. The password is read from the BEAM_PASSWORD environment variable
-# and is never stored in this file.
-# [auth]
-# username = "analyst"
-
 # A dataset from a CSV or Parquet file.
 [[dataset]]
 name = "sales"
-path = "data/sales.csv"
+path = "examples/sales.csv"
 # A column whose values are unique and never empty. Optional: without it,
 # Open Beam adds a `_row` number column to act as the key.
 key = "order_id"
 
 # A dataset computed from datasets declared above it. See
-# docs/guides/combine-and-clean-data.md.
-# [[dataset]]
-# name = "sales_by_region"
-# sql = "SELECT region, sum(units) AS units FROM sales GROUP BY region"
+# docs/guides/04-combine-and-clean-data.md.
+[[dataset]]
+name = "sales_by_region"
+key = "region"
+sql = """
+SELECT region,
+       sum(units)              AS units,
+       sum(units * unit_price) AS revenue
+FROM sales
+GROUP BY region
+"""

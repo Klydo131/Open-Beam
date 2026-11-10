@@ -66,6 +66,6 @@ This happens once; later builds take seconds.
 cargo run --release -- --version
 ```
 
-You should see `beam 0.1.0`.
+You should see `beam 0.2.0`.
 
-Next: [Share your first dataset](02-first-dataset.md).
+Next: [Start Open Beam and see your data](02-first-dataset.md).

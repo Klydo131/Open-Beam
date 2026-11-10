@@ -5,25 +5,25 @@ code as it exists today and marks planned parts as such.
 
 ## Overview
 
-Open Beam is one executable. Inside it, three layers each do one job:
+Open Beam is one executable. Inside it, four crates each do one job:
 
 ```text
- Excel / Power BI / any OData client
-              │  HTTP (OData v4, read-only)
-┌─────────────▼──────────────┐
-│ beam-server                │  configuration, HTTP, authentication
-├────────────────────────────┤
-│ beam-odata                 │  protocol: parse request → parameterised SQL
-├────────────────────────────┤
-│ beam-engine                │  embedded DuckDB, dataset catalog, sandbox
-└─────────────┬──────────────┘
-              │  read-only
-        your files (CSV, Parquet)
+   Browser                 Excel / Power BI / any OData client
+      │ HTML pages                │ OData v4, read-only
+┌─────▼───────────────────────────▼─────┐
+│ beam-server                           │  configuration, pages, sign-in
+├──────────────────┬────────────────────┤
+│ beam-accounts    │ beam-odata         │  who may ask  │  what is asked
+│ (SQLite file)    ├────────────────────┤
+│                  │ beam-engine        │  embedded DuckDB, sealed
+└──────────────────┴─────────┬──────────┘
+                             │ read-only
+                    your files (CSV, Parquet)
 ```
 
 Dependencies point downward only. `beam-odata` performs no I/O and does not
-depend on the engine, so the protocol logic can be tested exhaustively without
-a database, and a second protocol can be added beside it without touching it.
+depend on the engine, and `beam-accounts` knows nothing about HTTP, so each can
+be tested on its own and reused by another application.
 
 ## Layers
 
@@ -55,13 +55,36 @@ on length and nesting. The tree is then rendered to SQL in which every
 client-supplied value is a bind parameter and every name has been checked
 against the dataset's schema.
 
+### `beam-accounts`
+
+Stores accounts and browser sessions in one SQLite file owned by whoever runs
+Open Beam.
+
+- **Passwords** are stored as Argon2id hashes. Checking a password for an
+  unknown username takes as long as for a known one.
+- **Sessions** are 256-bit random tokens. The browser holds the token; the
+  file holds only its SHA-256 digest, so a copy of the file signs nobody in.
+- **Invariants live here, not in the pages.** The rule that at least one
+  active administrator always exists is enforced inside a transaction, and
+  creating the first administrator is a single statement that cannot succeed
+  twice.
+
 ### `beam-server`
 
-Loads `beam.toml`, opens the engine, and serves HTTP with
-[axum](https://github.com/tokio-rs/axum). Queries run on a blocking thread pool
-so a slow query does not stall other requests. Large results are returned in
-pages; each response includes a link to the next page, which OData clients
-follow automatically.
+Loads `beam.toml`, opens the engine and the account store, and serves HTTP
+with [axum](https://github.com/tokio-rs/axum).
+
+- **Pages** are rendered on the server with
+  [maud](https://maud.lambda.xyz), which escapes every value it interpolates.
+  They contain no JavaScript. Sorting, filtering and paging are ordinary links
+  and forms, and the dataset browser reuses the same query planner as the
+  feed.
+- **The feed** accepts a browser session or HTTP Basic credentials for an
+  account. Because password checks are deliberately slow and feed clients send
+  credentials with every request, a successful check is remembered for a few
+  minutes, keyed by a digest, and forgotten whenever any account changes.
+- Queries and password hashing run on a blocking thread pool so they do not
+  stall other requests.
 
 ## Security model
 
@@ -70,11 +93,18 @@ everything arriving over the network is not.
 
 | Threat | Defence |
 | --- | --- |
-| SQL injection through query options | Values are bound as parameters; identifiers are validated against the schema; unsupported syntax is rejected by the parser. |
+| SQL injection through the feed or the filter form | Values are bound as parameters; identifiers are validated against the schema; unsupported syntax is rejected by the parser. |
 | Reading files that were not shared | After start-up DuckDB's file access is restricted to the configured dataset files, external access is disabled and the configuration is locked. |
-| Modifying or deleting data | The database is in-memory, datasets are views, and the service only issues `SELECT` statements. |
-| Unintended network exposure | The default bind address is loopback. Binding elsewhere without authentication is refused at start-up. |
-| Resource exhaustion | Filters are bounded in size and depth; responses are bounded by `max_page_size`. |
+| Modifying or deleting data | The database is in-memory, datasets are views, and only `SELECT` statements are issued. |
+| Unintended network exposure | The default bind address is loopback. Open Beam refuses to listen elsewhere, or behind a public address, until an administrator exists. |
+| Password guessing | Argon2id hashing; five failures lock a username for five minutes; one message for every failed sign-in. |
+| Stolen account file | It contains password hashes and session digests, not passwords or tokens. |
+| Forged requests from other sites | Session cookies are `SameSite=Strict` and `HttpOnly`; every form carries a per-session token; posts that the browser labels as cross-site are refused. |
+| Script injection through data | Pages escape all values, contain no scripts, and are served with a content policy that allows none. |
+| Clickjacking | Pages may not be framed. |
+| Privilege escalation | Role checks run on every administrative request; the last active administrator cannot be demoted or disabled. |
+| Stale access | Disabling an account or changing its password ends its sessions and its feed access at once. |
+| Resource exhaustion | Filters are bounded in size and depth; responses are bounded by a page size; passwords are bounded in length before hashing. |
 | Information leaks in errors | Engine error text is logged on the server and never returned to the client. |
 | Unsafe Rust | `unsafe` is forbidden in every crate in this workspace. |
 
@@ -90,8 +120,8 @@ tracked in the [roadmap](ROADMAP.md).
   `beam-engine`.
 - **Database sources.** Datasets backed by PostgreSQL and SQLite databases that
   the user operates. Open Beam will hold connection settings only.
-- **Web interface.** A browser UI served by the same binary: dataset browser,
-  query editor, and dashboards built from panels.
+- **Charts and dashboards.** Panels arranged on dashboards, in the style of
+  monitoring tools.
 - **Assistant integrations.** An optional provider interface for language
   models, disabled by default. Users supply their own credentials, which stay
   on their machine. Applications built on Open Beam choose and are responsible

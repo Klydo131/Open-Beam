@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 250" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title id="t">How Open Beam works in three steps</title>
-  <desc id="d">List your files, start Open Beam, then load and refresh the data in Excel or Power BI.</desc>
+  <desc id="d">List your files, start Open Beam and sign in, then explore the data in your browser or load it into Excel or Power BI.</desc>
   <defs>
     <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 10 5 0 10z" fill="#5B6B82"/></marker>
   </defs>
@@ -16,16 +16,16 @@
     <rect x="355" y="40" width="250" height="170" rx="16" fill="#EEF3F9" stroke="#C4CFDD"/>
     <circle cx="391" cy="78" r="18" fill="#2EC4B6"/><text x="391" y="85" font-size="20" font-weight="700" fill="#0B1F3A" text-anchor="middle">2</text>
     <text x="421" y="85" font-size="20" font-weight="700" fill="#0B1F3A">Start Open Beam</text>
-    <text x="375" y="128" font-size="16" fill="#3C4A5E">One program publishes</text>
-    <text x="375" y="152" font-size="16" fill="#3C4A5E">them as a data feed.</text>
+    <text x="375" y="128" font-size="16" fill="#3C4A5E">One program serves them.</text>
+    <text x="375" y="152" font-size="16" fill="#3C4A5E">Sign in with your account.</text>
     <text x="375" y="186" font-size="14" fill="#5B6B82">On your machine by default.</text>
 
     <rect x="670" y="40" width="250" height="170" rx="16" fill="#EEF3F9" stroke="#C4CFDD"/>
     <circle cx="706" cy="78" r="18" fill="#5BC0EB"/><text x="706" y="85" font-size="20" font-weight="700" fill="#0B1F3A" text-anchor="middle">3</text>
-    <text x="736" y="85" font-size="20" font-weight="700" fill="#0B1F3A">Load and refresh</text>
-    <text x="690" y="128" font-size="16" fill="#3C4A5E">Excel and Power BI read</text>
-    <text x="690" y="152" font-size="16" fill="#3C4A5E">the feed. No driver needed.</text>
-    <text x="690" y="186" font-size="14" fill="#5B6B82">Refresh for current data.</text>
+    <text x="736" y="85" font-size="20" font-weight="700" fill="#0B1F3A">Explore and share</text>
+    <text x="690" y="128" font-size="16" fill="#3C4A5E">Browse in your browser, or</text>
+    <text x="690" y="152" font-size="16" fill="#3C4A5E">load into Excel or Power BI.</text>
+    <text x="690" y="186" font-size="14" fill="#5B6B82">No driver to install.</text>
   </g>
   <line x1="296" y1="125" x2="349" y2="125" stroke="#5B6B82" stroke-width="2" marker-end="url(#b)"/>
   <line x1="611" y1="125" x2="664" y2="125" stroke="#5B6B82" stroke-width="2" marker-end="url(#b)"/>

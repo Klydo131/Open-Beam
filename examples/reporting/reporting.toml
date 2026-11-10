@@ -1,0 +1,64 @@
+# Worked example: figures that pass up an organisation (branch → region →
+# head office) and are sometimes reported twice on the way.
+# See docs/guides/04-combine-and-clean-data.md. All data here is invented.
+#
+#   cargo run --release -- --config examples/reporting/reporting.toml
+
+bind = "127.0.0.1:8787"
+
+# 1. What was submitted, exactly as submitted: one row per customer per event.
+[[dataset]]
+name = "event_reports"
+path = "event_reports.csv"
+key = "report_id"
+
+# 2. Where each branch sits in the organisation.
+[[dataset]]
+name = "branches"
+path = "branches.csv"
+key = "branch"
+
+# 3. One row per customer per event, however many times it was reported.
+#    Reports that disagree are flagged for a person to check, not guessed at.
+[[dataset]]
+name = "events_reconciled"
+key = "event_key"
+sql = """
+SELECT
+    customer_id || ':' || event          AS event_key,
+    customer_id,
+    event,
+    min(event_date)                      AS event_date,
+    min(branch)                          AS branch,
+    count(*)                             AS times_reported,
+    string_agg(DISTINCT reported_by, '; ' ORDER BY reported_by) AS reported_by,
+    count(DISTINCT event_date) > 1
+        OR count(DISTINCT branch) > 1    AS needs_review
+FROM event_reports
+GROUP BY customer_id, event
+"""
+
+# 4. The audit trail: everything that was reported more than once.
+[[dataset]]
+name = "duplicate_reports"
+key = "event_key"
+sql = "SELECT * FROM events_reconciled WHERE times_reported > 1"
+
+# 5. The figures to present: reported versus confirmed, by level and quarter.
+[[dataset]]
+name = "quarterly_summary"
+sql = """
+SELECT
+    b.organisation,
+    b.region,
+    e.branch,
+    strftime(e.event_date, '%Y') || '-Q' || quarter(e.event_date) AS quarter,
+    e.event,
+    sum(e.times_reported)                        AS reported,
+    count(*)                                     AS confirmed,
+    sum(e.times_reported) - count(*)             AS duplicates_removed,
+    count(*) FILTER (WHERE e.needs_review)       AS needs_review
+FROM events_reconciled AS e
+JOIN branches AS b USING (branch)
+GROUP BY ALL
+"""

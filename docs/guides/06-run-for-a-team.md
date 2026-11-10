@@ -19,10 +19,19 @@ options to provide the HTTPS address.
 > These are general requirements. Open Beam has not yet been tested on
 > specific hosting providers; reports of what works are welcome.
 
-## Step 1: Require a password
+## Step 1: Create the administrator on the server
 
-Follow [Protect a feed with a password](05-protect-a-feed.md). Open Beam
-refuses to listen on a network address without one.
+Open Beam will not listen beyond its own computer until an administrator
+exists; otherwise the first visitor would be offered that account. On the
+server, run:
+
+```bash
+export BEAM_ADMIN_PASSWORD='choose-a-long-password'
+```
+
+```bash
+cargo run --release -- --config beam.toml create-admin yourname
+```
 
 ## Step 2: Put HTTPS in front
 
@@ -48,11 +57,21 @@ public_url = "https://beam.example.org"
 ## Step 4: Keep it running
 
 Use your operating system's service manager (systemd on Linux, Task Scheduler
-or a service wrapper on Windows) to start Open Beam at boot with
-`BEAM_PASSWORD` set in the service's environment.
+or a service wrapper on Windows) to start Open Beam at boot.
+
+## Step 5: Add your team
+
+Sign in at your public address and add an account for each person. See
+[Manage accounts](05-manage-accounts.md).
+
+## Back up
+
+Two things are yours to keep safe: `beam.toml` and the accounts file
+`beam-accounts.sqlite`. Back them up together with your data files.
 
 ## Where the data lives
 
-Open Beam does not include or host a database. It reads the files you list,
-from wherever you keep them. Reading directly from PostgreSQL and SQLite
+Open Beam does not host your data. It reads the files you list, from wherever
+you keep them, and stores only accounts in a small SQLite file beside
+`beam.toml`. Reading directly from PostgreSQL and SQLite
 databases that you operate is on the [roadmap](../ROADMAP.md).
