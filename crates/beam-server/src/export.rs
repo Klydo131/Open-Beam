@@ -32,8 +32,28 @@ pub enum Kind {
 /// Neutralises text that a spreadsheet would run as a formula when the CSV
 /// is opened (OWASP "CSV injection"): such cells gain a leading apostrophe.
 fn csv_text(text: &str) -> String {
-    let risky = text.starts_with(['=', '+', '-', '@', '\t', '\r']);
+    // Spreadsheets skip leading spaces before deciding a cell is a formula.
+    let risky = text
+        .trim_start_matches(' ')
+        .starts_with(['=', '+', '-', '@', '\t', '\r']);
     csv_field(&if risky { format!("'{text}") } else { text.to_string() })
+}
+
+/// Excel's own limits on a sheet. Exceeding them would make the file fail to
+/// build or open, so the person is told why instead.
+fn excel_limit(columns: &[Property], rows: &[Vec<Value>]) -> Option<&'static str> {
+    const MAX_COLUMNS: usize = 16_384;
+    const MAX_CELL_CHARACTERS: usize = 32_767;
+    if columns.len() > MAX_COLUMNS {
+        return Some("Excel sheets hold at most 16,384 columns. Choose fewer columns, or use Download CSV.");
+    }
+    let too_long = rows.iter().flatten().any(|value| match value {
+        Value::String(text) => text.chars().count() > MAX_CELL_CHARACTERS,
+        _ => false,
+    });
+    too_long.then_some(
+        "A cell in this view is longer than Excel allows (32,767 characters). Use Download CSV, which keeps it whole.",
+    )
 }
 
 pub fn to_csv(columns: &[Property], rows: &[Vec<Value>]) -> Vec<u8> {
@@ -188,6 +208,11 @@ async fn export(
             "Downloads hold up to 100,000 rows. Filter the table first, or connect Excel or Power BI to the data feed, which has no limit.",
         );
     }
+    if kind == Kind::Excel {
+        if let Some(problem) = excel_limit(&plan.columns, &rows) {
+            return message_page(StatusCode::BAD_REQUEST, "This view does not fit in Excel", problem);
+        }
+    }
     let columns = plan.columns;
     let set_name = set.name.clone();
     let built = tokio::task::spawn_blocking(move || match kind {
@@ -288,5 +313,26 @@ mod tests {
             panic!("expected a date")
         };
         assert_eq!(when.to_ymd_hms_milli(), (2025, 1, 7, 9, 15, 0, 0));
+    }
+
+    #[test]
+    fn spaces_do_not_hide_a_formula_and_excel_limits_are_explained() {
+        assert_eq!(csv_text(" =1+1"), "' =1+1");
+        assert_eq!(csv_text("  @x"), "'  @x");
+        assert_eq!(csv_text(" plain"), "\" plain\"");
+        let long = vec![vec![json!("x".repeat(32_768))]];
+        let one = vec![Property {
+            name: "a".into(),
+            edm: EdmType::String,
+        }];
+        assert!(excel_limit(&one, &long).unwrap().contains("32,767"));
+        assert!(excel_limit(&one, &[vec![json!("short")]]).is_none());
+        let wide: Vec<Property> = (0..16_385)
+            .map(|n| Property {
+                name: format!("c{n}"),
+                edm: EdmType::Double,
+            })
+            .collect();
+        assert!(excel_limit(&wide, &[]).unwrap().contains("16,384"));
     }
 }

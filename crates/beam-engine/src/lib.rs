@@ -12,6 +12,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
+/// Most columns an uploaded file may have. Wider files are refused: every
+/// check on the review page and every tidying rule scales with the width.
+pub const MAX_UPLOAD_COLUMNS: usize = 1_000;
+
+/// A hidden column holding each row's position in its file, so that rows
+/// keep file order and "the first copy" of a repeated row is well defined.
+const POSITION: &str = "__beam_position";
+
 /// Name of the row-number key added to datasets that declare no key column.
 pub const ROW_KEY: &str = "_row";
 
@@ -31,6 +39,8 @@ pub enum EngineError {
     InvalidQuery { dataset: String, reason: String },
     #[error("cannot use upload directory '{0}'")]
     UploadDir(PathBuf),
+    #[error("the file has more than {MAX_UPLOAD_COLUMNS} columns")]
+    TooWide,
     #[error("uploads are not enabled")]
     UploadsDisabled,
     #[error(transparent)]
@@ -267,7 +277,7 @@ impl Engine {
             key: None,
         };
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let created = cleaned_source(&conn, &base, cleaning)
+        let created = positioned_source(&conn, &base, cleaning)
             .and_then(|source| create_view(&conn, &spec, &source))
             .and_then(|dataset| {
                 conn.execute_batch(&format!("SELECT * FROM {} LIMIT 0", quote_ident(name)))?;
@@ -307,11 +317,12 @@ impl Engine {
             return Err(unreadable());
         }
         let path_text = path.to_str().ok_or_else(unreadable)?;
-        let reader = match format {
-            Format::Csv => "read_csv",
-            Format::Parquet => "read_parquet",
+        // Uploaded CSVs are sampled in full before column types are chosen,
+        // so a value far down the file cannot make the whole file unreadable.
+        let source = match format {
+            Format::Csv => format!("read_csv({}, sample_size = -1)", quote_literal(path_text)),
+            Format::Parquet => format!("read_parquet({})", quote_literal(path_text)),
         };
-        let source = format!("{reader}({})", quote_literal(path_text));
         Ok((path, source))
     }
 
@@ -332,7 +343,8 @@ impl Engine {
         };
         let dataset = {
             let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-            create_view(&conn, &spec, &base)?
+            let source = positioned_source(&conn, &base, Cleaning::default())?;
+            create_view(&conn, &spec, &source)?
         };
         let result = self.describe_preview(&name, &dataset, limit);
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -445,28 +457,48 @@ impl Engine {
     }
 }
 
-/// Wraps a file source so that `cleaning` applies whenever it is read.
-fn cleaned_source(conn: &Connection, base: &str, cleaning: Cleaning) -> Result<String, EngineError> {
-    if cleaning == Cleaning::default() {
-        return Ok(base.to_string());
-    }
+/// Wraps an uploaded file's source so its rows carry their file position and
+/// `cleaning` applies whenever it is read. Refuses files wider than
+/// [`MAX_UPLOAD_COLUMNS`].
+///
+/// "Repeated" means identical in every column to an earlier row with at least
+/// one value; the earliest copy is kept. Empty rows are only ever removed by
+/// `drop_empty_rows`, so the rows removed are exactly the ones counted.
+fn positioned_source(conn: &Connection, base: &str, cleaning: Cleaning) -> Result<String, EngineError> {
     let mut describe = conn.prepare(&format!("DESCRIBE SELECT * FROM {base}"))?;
     let names: Vec<String> = describe
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
+    if names.len() > MAX_UPLOAD_COLUMNS {
+        return Err(EngineError::TooWide);
+    }
     let idents: Vec<String> = names.iter().map(|n| quote_ident(n)).collect();
-    let distinct = if cleaning.drop_duplicate_rows { "DISTINCT " } else { "" };
-    let filter = if cleaning.drop_empty_rows && !idents.is_empty() {
-        let all_empty = idents
+    let all_empty = if idents.is_empty() {
+        "false".to_string()
+    } else {
+        idents
             .iter()
             .map(|c| format!("{c} IS NULL"))
             .collect::<Vec<_>>()
-            .join(" AND ");
+            .join(" AND ")
+    };
+    let position = quote_ident(POSITION);
+    let filter = if cleaning.drop_empty_rows {
         format!(" WHERE NOT ({all_empty})")
     } else {
         String::new()
     };
-    Ok(format!("(SELECT {distinct}* FROM {base}{filter}) AS cleaned"))
+    let qualify = if cleaning.drop_duplicate_rows {
+        format!(
+            " QUALIFY ({all_empty}) OR row_number() OVER (PARTITION BY {} ORDER BY {position}) = 1",
+            idents.join(", ")
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "(SELECT * FROM (SELECT *, row_number() OVER () AS {position} FROM {base}) AS numbered{filter}{qualify}) AS positioned"
+    ))
 }
 
 fn create_view(conn: &Connection, spec: &DatasetSpec, source: &str) -> Result<Dataset, EngineError> {
@@ -482,7 +514,8 @@ fn create_view(conn: &Connection, spec: &DatasetSpec, source: &str) -> Result<Da
     let mut columns = Vec::new();
     let mut select = Vec::new();
     let mut key = None;
-    for (source_name, source_type) in &source_columns {
+    let positioned = source_columns.iter().any(|(name, _)| name == POSITION);
+    for (source_name, source_type) in source_columns.iter().filter(|(name, _)| name != POSITION) {
         let name = unique_identifier(source_name, &mut taken);
         let (ty, cast) = normalise(source_type);
         select.push(format!(
@@ -505,7 +538,12 @@ fn create_view(conn: &Connection, spec: &DatasetSpec, source: &str) -> Result<Da
             })
         }
         (None, _) => {
-            select.insert(0, format!("row_number() OVER () AS {}", quote_ident(ROW_KEY)));
+            let order = if positioned {
+                format!("ORDER BY {}", quote_ident(POSITION))
+            } else {
+                String::new()
+            };
+            select.insert(0, format!("row_number() OVER ({order}) AS {}", quote_ident(ROW_KEY)));
             columns.insert(
                 0,
                 Column {
@@ -609,6 +647,10 @@ fn unique_identifier(source: &str, taken: &mut HashSet<String>) -> String {
         .collect();
     if !base.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
         base.insert(0, '_');
+    }
+    // Words the filter language reserves cannot be column names there.
+    if ["null", "true", "false", "not", "and", "or"].contains(&base.to_ascii_lowercase().as_str()) {
+        base.push('_');
     }
     let mut name = base.clone();
     let mut suffix = 2;
@@ -909,5 +951,176 @@ mod tests {
         assert!(engine.preview("../p1.csv", Format::Csv, 3).is_err());
         fs::write(uploads.join("bad.parquet"), "nope").unwrap();
         assert!(engine.preview("bad.parquet", Format::Parquet, 3).is_err());
+    }
+
+    #[test]
+    fn removing_repeats_keeps_the_first_copy_in_file_order_and_never_touches_empty_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+        // 9 rows: 2 empty, and repeats of rows 1 and 2 (three extra copies).
+        fs::write(
+            uploads.join("d.csv"),
+            "id,name,city\n1,Ann,Oslo\n2,Bob,Rome\n,,\n1,Ann,Oslo\n3,Cid,\n,,\n1,Ann,Oslo\n2,Bob,Rome\n4,,\n",
+        )
+        .unwrap();
+        let preview = engine.preview("d.csv", Format::Csv, 20).unwrap();
+        assert_eq!(
+            (preview.row_count, preview.empty_rows, preview.duplicate_rows),
+            (9, 2, 3)
+        );
+
+        let rows = |name: &str, cleaning| {
+            engine.add_upload_cleaned(name, "d.csv", Format::Csv, cleaning).unwrap();
+            engine
+                .query(
+                    &format!("SELECT _row, CAST(id AS VARCHAR) FROM {name} ORDER BY _row"),
+                    &[],
+                    2,
+                )
+                .unwrap()
+        };
+        let ids = |rows: Vec<Vec<Value>>| rows.into_iter().map(|r| r[1].clone()).collect::<Vec<_>>();
+        let repeats_only = rows(
+            "repeats_only",
+            Cleaning {
+                drop_empty_rows: false,
+                drop_duplicate_rows: true,
+            },
+        );
+        assert_eq!(repeats_only.len(), 6, "9 rows minus exactly the 3 repeats reported");
+        assert_eq!(
+            ids(repeats_only.clone()),
+            vec![json!("1"), json!("2"), Value::Null, json!("3"), Value::Null, json!("4")],
+            "first copies, in file order, empty rows kept"
+        );
+        let keys: Vec<Value> = repeats_only.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(keys, (1..=6).map(|n| json!(n)).collect::<Vec<_>>());
+        let both = rows(
+            "tidy_both",
+            Cleaning {
+                drop_empty_rows: true,
+                drop_duplicate_rows: true,
+            },
+        );
+        assert_eq!(ids(both), vec![json!("1"), json!("2"), json!("3"), json!("4")]);
+        let empty_only = rows(
+            "empty_only",
+            Cleaning {
+                drop_empty_rows: true,
+                drop_duplicate_rows: false,
+            },
+        );
+        assert_eq!(empty_only.len(), 7);
+        let raw = rows("raw", Cleaning::default());
+        assert_eq!(ids(raw)[3], json!("1"), "untidied rows stay in file order");
+    }
+
+    #[test]
+    fn large_uploads_keep_file_order_after_removing_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+        let mut text = String::from("n,group\n");
+        for n in 0..300_000 {
+            text.push_str(&format!("{},g{}\n", n / 2, n % 7));
+        }
+        fs::write(uploads.join("big.csv"), text).unwrap();
+        engine
+            .add_upload_cleaned(
+                "big",
+                "big.csv",
+                Format::Csv,
+                Cleaning {
+                    drop_empty_rows: false,
+                    drop_duplicate_rows: true,
+                },
+            )
+            .unwrap();
+        let ordered = engine
+            .query(
+                "SELECT count(*), count(*) FILTER (WHERE n_prev > n OR (n_prev = n AND g_prev = \"group\")) FROM \
+                 (SELECT n, \"group\", lag(n) OVER (ORDER BY _row) AS n_prev, lag(\"group\") OVER (ORDER BY _row) AS g_prev FROM big)",
+                &[],
+                2,
+            )
+            .unwrap();
+        assert_eq!(ordered[0][1], json!(0), "rows follow the file and no repeat survives");
+        let first = engine
+            .query("SELECT n, \"group\" FROM big WHERE _row = 1", &[], 2)
+            .unwrap();
+        assert_eq!(first, vec![vec![json!(0), json!("g0")]]);
+    }
+
+    #[test]
+    fn uploads_are_bounded_and_read_whole_files_before_choosing_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+        let header: Vec<String> = (0..1_001).map(|n| format!("c{n}")).collect();
+        let row: Vec<String> = (0..1_001).map(|n| n.to_string()).collect();
+        fs::write(
+            uploads.join("wide.csv"),
+            format!("{}\n{}\n", header.join(","), row.join(",")),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.preview("wide.csv", Format::Csv, 5),
+            Err(EngineError::TooWide)
+        ));
+        assert!(matches!(
+            engine.add_upload("wide", "wide.csv", Format::Csv),
+            Err(EngineError::TooWide)
+        ));
+
+        let mut late = String::from("amount\n");
+        for n in 0..30_000 {
+            late.push_str(&format!("{n}\n"));
+        }
+        late.push_str("not a number\n");
+        fs::write(uploads.join("late.csv"), late).unwrap();
+        let preview = engine.preview("late.csv", Format::Csv, 1).unwrap();
+        assert_eq!((preview.row_count, preview.columns[0].ty), (30_001, ColumnType::Text));
+
+        fs::write(uploads.join("words.csv"), "null,not,true,x\na,b,c,d\n").unwrap();
+        let names: Vec<String> = engine
+            .preview("words.csv", Format::Csv, 1)
+            .unwrap()
+            .columns
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["null_", "not_", "true_", "x"]);
+    }
+
+    #[test]
+    fn real_parquet_files_work_for_uploads_and_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        // Written by a separate, unsealed DuckDB: a genuine Parquet file.
+        let writer = Connection::open_in_memory().unwrap();
+        let target = uploads.join("p.parquet");
+        writer
+            .execute_batch(&format!(
+                "COPY (SELECT range AS id, 'item ' || range AS label FROM range(5)) TO {} (FORMAT parquet)",
+                quote_literal(target.to_str().unwrap())
+            ))
+            .unwrap();
+        let configured = dir.path().join("c.parquet");
+        fs::copy(&target, &configured).unwrap();
+
+        let engine = Engine::open_with_uploads(&[spec("configured", &configured, None)], Some(&uploads)).unwrap();
+        assert_eq!(
+            engine.query("SELECT count(*) FROM configured", &[], 1).unwrap()[0][0],
+            json!(5)
+        );
+        let preview = engine.preview("p.parquet", Format::Parquet, 2).unwrap();
+        assert_eq!((preview.row_count, preview.rows[1][1].clone()), (5, json!("item 1")));
+        engine.add_upload("items", "p.parquet", Format::Parquet).unwrap();
+        assert_eq!(
+            engine.query("SELECT label FROM items WHERE _row = 5", &[], 1).unwrap()[0][0],
+            json!("item 4")
+        );
     }
 }

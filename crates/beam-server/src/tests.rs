@@ -1719,3 +1719,154 @@ async fn tidying_survives_a_restart() {
         json!(3)
     );
 }
+
+// ------------------------------------------- findings from independent review
+
+#[tokio::test]
+async fn simultaneous_guesses_cannot_get_past_the_lockout() {
+    let site = site(false, 100);
+    let attempts = (0..20).map(|n| {
+        let password = if n == 19 {
+            USER_PASSWORD.to_string()
+        } else {
+            format!("wrong guess {n}")
+        };
+        let site = &site;
+        async move {
+            post(site, "/login", None, &[("username", "bob"), ("password", &password)])
+                .await
+                .status
+        }
+    });
+    let statuses = futures_join(attempts).await;
+    let checked = statuses.iter().filter(|s| **s != StatusCode::TOO_MANY_REQUESTS).count();
+    assert!(
+        checked <= 5,
+        "only five attempts may be checked at once, got {checked}: {statuses:?}"
+    );
+    assert!(statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count() >= 15);
+}
+
+/// Runs futures concurrently on the current runtime and collects results in order.
+async fn futures_join<F: std::future::Future>(futures: impl Iterator<Item = F>) -> Vec<F::Output> {
+    let mut pinned: Vec<std::pin::Pin<Box<F>>> = futures.map(Box::pin).collect();
+    let mut results: Vec<Option<F::Output>> = pinned.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, result) in pinned.iter_mut().zip(results.iter_mut()) {
+            if result.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => *result = Some(value),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    results.into_iter().map(|r| r.unwrap()).collect()
+}
+
+#[tokio::test]
+async fn forms_posted_from_another_origin_are_refused() {
+    let site = site(false, 100);
+    let login = |origin: &'static str| {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(HOST, "beam.test:9000")
+            .header("origin", origin)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "username=bob&password={}",
+                USER_PASSWORD.replace(' ', "+")
+            )))
+            .unwrap();
+        site.app.clone().oneshot(request)
+    };
+    assert_eq!(
+        login("https://evil.example").await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(login("null").await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        login("http://beam.test:9000").await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+}
+
+#[tokio::test]
+async fn real_parquet_files_can_be_added_through_the_website() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("items.parquet");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT range AS id, 'item ' || range AS label FROM range(7)) TO '{}' (FORMAT parquet)",
+            path.to_str().unwrap()
+        ))
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let saved = upload(&site, &bob, &csrf, "items.parquet", &bytes, "").await;
+    assert_eq!(saved.location(), "/datasets/items", "{}", saved.body);
+    assert!(get(&site, "/datasets/items", Some(&bob))
+        .await
+        .body
+        .contains("Rows 1–7 of 7"));
+}
+
+#[tokio::test]
+async fn charts_apply_is_empty_filters_and_owners_cannot_share_with_themselves() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let chart = get(
+        &site,
+        "/datasets/sales/chart?column=shipped_at&op=empty&value=",
+        Some(&bob),
+    )
+    .await;
+    assert!(
+        chart.body.contains("Only rows where"),
+        "the filter is applied and said so"
+    );
+    assert!(chart
+        .body
+        .contains("<td>&lt;script&gt;alert(1)&lt;/script&gt;</td><td class=\"num\">1</td>"));
+    assert!(
+        !chart.body.contains("<td>EU</td>"),
+        "rows with a shipping time are left out"
+    );
+
+    upload(&site, &bob, &csrf, "mine.csv", BUDGET, "").await;
+    let me = account_id(&site, "bob").to_string();
+    let refused = submit(&site, &bob, &csrf, "/datasets/mine/share", &[("account", &me)]).await;
+    assert_eq!(refused.location(), "/datasets/mine/share?error=not-found");
+    let upload = site.state.accounts.upload_named("mine").unwrap().unwrap();
+    assert!(site.state.accounts.shares(upload.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reserved_words_as_column_names_still_filter_correctly() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    upload(&site, &bob, &csrf, "words.csv", b"null,not,true\na,b,c\nd,e,f\n", "").await;
+    let table = get(&site, "/datasets/words?column=null_&op=eq&value=a", Some(&bob)).await;
+    assert!(table.body.contains("Rows 1–1 of 1"), "{}", table.body);
+    let feed = call(
+        &site,
+        "GET",
+        "/odata/words?$filter=not_%20eq%20'e'",
+        Call {
+            basic: Some(("bob", USER_PASSWORD)),
+            ..Call::default()
+        },
+    )
+    .await;
+    assert_eq!(feed.json()["value"].as_array().unwrap().len(), 1);
+}

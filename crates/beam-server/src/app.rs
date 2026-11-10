@@ -24,6 +24,9 @@ pub struct AppState {
     pub fallback_host: String,
     pub accounts: Store,
     pub guard: auth::Guard,
+    /// Review-page previews, worked out once per draft and kept while the
+    /// draft waits. Bounded; anything evicted is simply worked out again.
+    previews: std::sync::Mutex<std::collections::HashMap<String, Arc<beam_engine::Preview>>>,
 }
 
 impl AppState {
@@ -42,7 +45,29 @@ impl AppState {
             fallback_host,
             accounts,
             guard: auth::Guard::default(),
+            previews: std::sync::Mutex::default(),
         }
+    }
+
+    pub fn remember_preview(&self, file: &str, preview: beam_engine::Preview) {
+        const KEPT: usize = 64;
+        let mut previews = self.previews.lock().unwrap_or_else(|e| e.into_inner());
+        if previews.len() >= KEPT {
+            previews.clear();
+        }
+        previews.insert(file.to_string(), Arc::new(preview));
+    }
+
+    pub fn remembered_preview(&self, file: &str) -> Option<Arc<beam_engine::Preview>> {
+        self.previews
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(file)
+            .cloned()
+    }
+
+    pub fn forget_preview(&self, file: &str) {
+        self.previews.lock().unwrap_or_else(|e| e.into_inner()).remove(file);
     }
 
     /// Cookies are marked `Secure` when the site is published over HTTPS.
@@ -96,7 +121,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/accounts/{id}/role", post(web::set_role))
         .route("/admin/accounts/{id}/active", post(web::set_active))
         .route("/admin/accounts/{id}/password", post(web::reset_password))
-        .layer(middleware::from_fn(auth::same_site_posts_only));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::same_site_posts_only,
+        ));
 
     Router::new()
         .merge(feed)
