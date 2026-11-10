@@ -30,6 +30,11 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # DuckDB's build unpacks its sources into target/duckdb-sources and
+      # fails if a restored cache left a partial copy there.
+      - name: Clear stale DuckDB sources
+        shell: bash
+        run: rm -rf target/duckdb-sources
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
