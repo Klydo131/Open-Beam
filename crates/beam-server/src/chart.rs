@@ -4,12 +4,14 @@
 //! repeated in a table underneath, which is also what a screen reader uses.
 
 use crate::app::AppState;
+use crate::catalog;
 use crate::feed;
-use crate::web::{self, filter_expression, group_digits, layout, page, require_signed_in};
+use crate::table::{self, filter_expression, group_digits, Tab};
+use crate::web::{self, layout, page, require_signed_in};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use beam_odata::{Aggregate, Bucket, EdmType, EntitySet, Property};
+use beam_odata::{Aggregate, Bucket, EdmType, Property};
 use maud::{html, Markup};
 use serde::Deserialize;
 use serde_json::Value;
@@ -180,26 +182,6 @@ fn line_chart(points: &[(String, f64)], title: &str) -> Markup {
     }
 }
 
-/// The Table / Chart switch shown on both views of a dataset.
-pub fn view_tabs(set: &EntitySet, chart: bool, filter: &[(&str, &str)]) -> Markup {
-    let mut query = form_urlencoded::Serializer::new(String::new());
-    for (name, value) in filter {
-        query.append_pair(name, value);
-    }
-    let query = query.finish();
-    let suffix = if query.is_empty() {
-        String::new()
-    } else {
-        format!("?{query}")
-    };
-    html! {
-        nav.tabs aria-label="Views" {
-            a href={ "/datasets/" (set.name) (suffix) } aria-current=[(!chart).then_some("page")] { "Table" }
-            a href={ "/datasets/" (set.name) "/chart" (suffix) } aria-current=[chart.then_some("page")] { "Chart" }
-        }
-    }
-}
-
 pub async fn chart(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -210,13 +192,14 @@ pub async fn chart(
         Ok(signed) => signed,
         Err(response) => return response,
     };
-    let Some(set) = feed::find_set(&state, &name) else {
+    let Some(entry) = catalog::find(&state, &signed.session.account, &name) else {
         return web::message_page(
             StatusCode::NOT_FOUND,
             "Dataset not found",
             "There is no dataset with that name.",
         );
     };
+    let set = &entry.set;
 
     // Every choice falls back to something that works, so a chart always appears.
     let group = query
@@ -310,7 +293,7 @@ pub async fn chart(
     let body = html! {
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
         h1 { (set.name) }
-        (view_tabs(set, true, &carried))
+        (table::dataset_tabs(set, Tab::Chart, &carried, table::can_manage(&signed, &entry)))
         form.filter method="get" action={ "/datasets/" (set.name) "/chart" } {
             @for (name, value) in &carried { input type="hidden" name=(name) value=(value); }
             label for="agg" { "Show" }

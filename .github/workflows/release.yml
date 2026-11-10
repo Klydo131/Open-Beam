@@ -1,0 +1,65 @@
+name: Release
+
+# Builds ready-to-run downloads when a version tag such as v0.3.0 is pushed,
+# and attaches them to a GitHub release. People who just want to use Open
+# Beam download one of these; nobody needs Rust installed.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --draft --title "Open Beam $GITHUB_REF_NAME" --generate-notes
+
+  build:
+    needs: create
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            binary: beam.exe
+          - os: macos-latest
+            label: macos-apple-silicon
+            binary: beam
+          - os: ubuntu-latest
+            label: linux-x64
+            binary: beam
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          name="open-beam-${GITHUB_REF_NAME}-${{ matrix.label }}"
+          mkdir "$name"
+          cp "target/release/${{ matrix.binary }}" "$name/"
+          cp README.md LICENSE "$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber

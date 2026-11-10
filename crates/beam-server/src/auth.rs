@@ -28,7 +28,7 @@ pub struct Guard {
     /// Feed clients send their password with every request. Verifying a
     /// password is deliberately slow, so a successful check is remembered
     /// briefly, keyed by a digest of the credentials.
-    verified: Mutex<HashMap<[u8; 32], Instant>>,
+    verified: Mutex<HashMap<[u8; 32], (i64, Instant)>>,
 }
 
 impl Guard {
@@ -139,10 +139,13 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 
 /// Admits a feed request that carries either a browser session or HTTP Basic
 /// credentials for an active account.
-pub async fn feed_guard(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+pub async fn feed_guard(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
     let mut response = match admit(&state, request.headers()).await {
-        Ok(true) => next.run(request).await,
-        Ok(false) => {
+        Ok(Some(account)) => {
+            request.extensions_mut().insert(Viewer(account));
+            next.run(request).await
+        }
+        Ok(None) => {
             let mut denied = feed::error(
                 StatusCode::UNAUTHORIZED,
                 "Sign in with your Open Beam username and password",
@@ -163,12 +166,16 @@ pub async fn feed_guard(State(state): State<Arc<AppState>>, request: Request, ne
     response
 }
 
-async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<bool, ()> {
-    if signed_in(state, headers).is_some() {
-        return Ok(true);
+/// The account behind a feed request, for deciding which datasets it sees.
+#[derive(Clone)]
+pub struct Viewer(pub Account);
+
+async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Option<Account>, ()> {
+    if let Some(signed) = signed_in(state, headers) {
+        return Ok(Some(signed.session.account));
     }
     let Some((username, password)) = basic_credentials(headers) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut hasher = Sha256::new();
     hasher.update(username.as_bytes());
@@ -178,19 +185,21 @@ async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<bool, ()> {
 
     {
         let mut verified = state.guard.verified.lock().unwrap_or_else(|e| e.into_inner());
-        verified.retain(|_, at| at.elapsed() < FEED_CACHE_TTL);
-        if verified.contains_key(&key) {
-            return Ok(true);
+        verified.retain(|_, (_, at)| at.elapsed() < FEED_CACHE_TTL);
+        if let Some((id, _)) = verified.get(&key) {
+            // Re-read the account so a role change is seen at once; a
+            // disabled account is refused even while remembered.
+            return Ok(state.accounts.get(*id).ok().filter(|account| account.active));
         }
     }
-    if check_password(state, &username, &password).await?.is_none() {
-        return Ok(false);
-    }
+    let Some(account) = check_password(state, &username, &password).await? else {
+        return Ok(None);
+    };
     let mut verified = state.guard.verified.lock().unwrap_or_else(|e| e.into_inner());
     if verified.len() < MAX_TRACKED {
-        verified.insert(key, Instant::now());
+        verified.insert(key, (account.id, Instant::now()));
     }
-    Ok(true)
+    Ok(Some(account))
 }
 
 /// Browsers label where a request came from. A form posted from another site

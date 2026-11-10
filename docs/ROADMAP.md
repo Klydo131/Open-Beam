@@ -22,29 +22,43 @@ Milestones are ordered. Each one should leave the project usable on its own.
 - [x] Feed sign-in with account credentials
 - [x] Sign-in attempt limiting, anti-forgery tokens, strict content policy
 
-## 0.3 — Connect to your data
+## 0.3 — Your own data, together
+
+- [x] Add CSV, Excel (.xlsx) and Parquet files from the browser
+- [x] Uploaded datasets are private to their owner until shared
+- [x] People directory and personal contacts
+- [x] Share and stop sharing dataset by dataset; delete your own datasets
+- [x] Download the current view as Excel or CSV; Google Sheets import guidance
+- [x] Basic and Advanced modes in Settings; profile name and team
+- [x] Advanced: column choice, more filters, feed address and Power Query for a view
+- [x] Starts with no configuration file and opens the browser
+- [x] Release workflow building downloads for Windows, macOS and Linux
+- [ ] First published release, and signed downloads
+- [ ] Combine datasets from the browser (join, de-duplicate) without SQL
+
+## 0.4 — Connect to your data
 
 - [ ] PostgreSQL and SQLite as dataset sources
 - [ ] Excel workbooks (`.xlsx`) as dataset sources
 - [ ] Reload datasets without restarting
-- [ ] Per-dataset permissions
 - [ ] Pre-built binaries for Windows, macOS and Linux
 - [ ] Built-in TLS
 
-## 0.4 — Charts and dashboards
+## 0.5 — Dashboards and automation
 
 - [x] Charts on dataset pages: bars and lines, grouped by column or period
 - [ ] Dashboards built from panels
 - [ ] Saved views
+- [ ] Scheduled refresh and other automation
 - [ ] Export to CSV and Excel
 
-## 0.5 — PostgreSQL wire protocol
+## 0.6 — PostgreSQL wire protocol
 
 - [ ] Read-only SQL access for PostgreSQL-compatible clients
 - [ ] Catalog compatibility for the drivers used by Power BI and Excel
 - [ ] Per-query time and memory limits
 
-## 0.6 — Platform
+## 0.7 — Platform
 
 - [ ] Review and sign-off workflow for reported figures
 - [ ] Audit log of account and data-access events

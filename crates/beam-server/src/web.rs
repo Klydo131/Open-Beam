@@ -9,30 +9,18 @@
 
 use crate::app::AppState;
 use crate::auth::{self, Signed};
+use crate::catalog;
 use crate::feed;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use beam_accounts::{Account, AccountError, Role};
-use beam_odata::{EdmType, EntitySet, Property};
+use beam_accounts::{Account, AccountError, Mode, Role};
 use maud::{html, Markup, DOCTYPE};
 use serde::Deserialize;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-
-const PAGE_ROWS: u64 = 50;
-const OPERATORS: &[(&str, &str)] = &[
-    ("eq", "equals"),
-    ("contains", "contains"),
-    ("ne", "does not equal"),
-    ("gt", "is greater than"),
-    ("ge", "is at least"),
-    ("lt", "is less than"),
-    ("le", "is at most"),
-];
 
 type App = State<Arc<AppState>>;
 
@@ -47,7 +35,7 @@ pub fn page(status: StatusCode, markup: Markup) -> Response {
         .into_response()
 }
 
-fn redirect(to: &str) -> Response {
+pub fn redirect(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(LOCATION, to.to_string())]).into_response()
 }
 
@@ -71,16 +59,21 @@ pub fn layout(title: &str, signed: Option<&Signed>, body: Markup) -> Markup {
                     @if let Some(signed) = signed {
                         nav aria-label="Main" {
                             a href="/" { "Datasets" }
+                            a href="/data/new" { "Add data" }
+                            a href="/people" { "People" }
                             @if signed.session.account.role == Role::Admin {
                                 a href="/admin/accounts" { "Accounts" }
                             }
-                            a href="/account" { "My account" }
+                            a href="/account" { "Settings" }
                         }
                         form.signout method="post" action="/logout" {
                             input type="hidden" name="csrf" value=(signed.session.csrf);
                             span.who {
-                                (signed.session.account.username)
+                                (signed.session.account.name())
                                 span.badge { (role_label(signed.session.account.role)) }
+                                a.badge.mode href="/account#interface" title="Change in Settings" {
+                                    (if signed.session.account.mode == Mode::Advanced { "Advanced" } else { "Basic" })
+                                }
                             }
                             button.quiet type="submit" { "Sign out" }
                         }
@@ -137,7 +130,7 @@ pub async fn logo() -> Response {
         .into_response()
 }
 
-fn role_label(role: Role) -> &'static str {
+pub fn role_label(role: Role) -> &'static str {
     match role {
         Role::Admin => "Administrator",
         Role::User => "User",
@@ -169,7 +162,7 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Signed, Respon
     }
 }
 
-fn check_csrf(signed: &Signed, submitted: &str) -> Result<(), Response> {
+pub fn check_csrf(signed: &Signed, submitted: &str) -> Result<(), Response> {
     if bool::from(submitted.as_bytes().ct_eq(signed.session.csrf.as_bytes())) {
         Ok(())
     } else {
@@ -188,11 +181,12 @@ fn account_error_code(error: &AccountError) -> &'static str {
         AccountError::UsernameTaken => "taken",
         AccountError::LastAdministrator => "last-admin",
         AccountError::NotFound => "not-found",
+        AccountError::InvalidProfile => "profile",
         _ => "failed",
     }
 }
 
-fn notice(query: &HashMap<String, String>) -> Markup {
+pub fn notice(query: &HashMap<String, String>) -> Markup {
     let ok = match query.get("ok").map(String::as_str) {
         Some("created") => Some("Account created."),
         Some("role") => Some("Role updated."),
@@ -200,6 +194,13 @@ fn notice(query: &HashMap<String, String>) -> Markup {
         Some("disabled") => Some("Account disabled. It has been signed out everywhere."),
         Some("reset") => Some("Password reset. That account has been signed out everywhere."),
         Some("password") => Some("Your password has been changed. Other devices have been signed out."),
+        Some("profile") => Some("Profile saved."),
+        Some("mode") => Some("Interface updated."),
+        Some("shared") => Some("Shared."),
+        Some("unshared") => Some("No longer shared with that person."),
+        Some("deleted") => Some("Dataset deleted."),
+        Some("contact-added") => Some("Added to your contacts."),
+        Some("contact-removed") => Some("Removed from your contacts."),
         _ => None,
     };
     let error = match query.get("error").map(String::as_str) {
@@ -211,6 +212,8 @@ fn notice(query: &HashMap<String, String>) -> Markup {
         Some("mismatch") => Some("The two passwords do not match.".to_string()),
         Some("current") => Some("Your current password is not correct.".to_string()),
         Some("role") => Some("Choose a role.".to_string()),
+        Some("profile") => Some(AccountError::InvalidProfile.to_string()),
+        Some("confirm") => Some("Tick the box to confirm.".to_string()),
         Some(_) => Some("That did not work. Please try again.".to_string()),
         None => None,
     };
@@ -385,26 +388,70 @@ pub async fn logout(State(state): App, headers: HeaderMap, Form(form): Form<Csrf
 
 // ----------------------------------------------------------------- datasets
 
-pub async fn home(State(state): App, headers: HeaderMap) -> Response {
+pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>>, headers: HeaderMap) -> Response {
     let signed = match require_signed_in(&state, &headers) {
         Ok(signed) => signed,
         Err(response) => return response,
     };
+    let me = &signed.session.account;
+    let entries = catalog::visible(&state, me);
+    let people = state.accounts.list().unwrap_or_default();
+    let owner_name = |id: i64| {
+        people
+            .iter()
+            .find(|a| a.id == id)
+            .map_or("someone".to_string(), |a| a.name().to_string())
+    };
+    let mine: Vec<&catalog::Entry> = entries
+        .iter()
+        .filter(|e| e.upload.as_ref().is_some_and(|u| u.owner_id == me.id))
+        .collect();
+    let others: Vec<&catalog::Entry> = entries
+        .iter()
+        .filter(|e| e.upload.as_ref().is_some_and(|u| u.owner_id != me.id))
+        .collect();
+    let built_in: Vec<&catalog::Entry> = entries.iter().filter(|e| e.upload.is_none()).collect();
     let feed_url = format!("{}/odata/", feed::base_url(&state, &headers));
-    let body = html! {
-        h1 { "Datasets" }
-        @if state.sets.is_empty() {
-            p { "No datasets are configured yet." }
-        }
-        ul.cards {
-            @for set in &state.sets {
-                li {
-                    a.card href={ "/datasets/" (set.name) } {
-                        strong { (set.name) }
-                        span { (set.properties.len()) " columns" }
-                    }
+    let card = |entry: &catalog::Entry, note: String| {
+        html! {
+            li {
+                a.card href={ "/datasets/" (entry.set.name) } {
+                    strong { (entry.set.name) }
+                    span { (entry.set.properties.len()) " columns · " (note) }
                 }
             }
+        }
+    };
+    let others_heading = if me.role == Role::Admin {
+        "Added by others"
+    } else {
+        "Shared with you"
+    };
+
+    let body = html! {
+        div.titlebar {
+            h1 { "Datasets" }
+            div.actions { a.button href="/data/new" { "Add data" } }
+        }
+        (notice(&query))
+        @if entries.is_empty() {
+            section.panel.narrow {
+                h2 { "Start with your own data" }
+                p { "Add a CSV, Excel or Parquet file. You can explore it here, chart it, share it with colleagues, and open it in Excel or Power BI." }
+                a.button href="/data/new" { "Add data" }
+            }
+        }
+        @if !mine.is_empty() {
+            h2.section { "Yours" }
+            ul.cards { @for entry in &mine { (card(entry, format!("added {}", entry.upload.as_ref().map_or("", |u| u.created_at.get(..10).unwrap_or(""))))) } }
+        }
+        @if !others.is_empty() {
+            h2.section { (others_heading) }
+            ul.cards { @for entry in &others { (card(entry, format!("from {}", entry.upload.as_ref().map_or("someone".to_string(), |u| owner_name(u.owner_id))))) } }
+        }
+        @if !built_in.is_empty() {
+            h2.section { "Shared with everyone" }
+            ul.cards { @for entry in &built_in { (card(entry, "set up by your administrator".to_string())) } }
         }
         section.panel {
             h2 { "Use this data in Excel or Power BI" }
@@ -413,273 +460,10 @@ pub async fn home(State(state): App, headers: HeaderMap) -> Response {
                 li { "Enter this address: " code { (feed_url) } }
                 li { "When asked how to sign in, choose " strong { "Basic" } " and enter your Open Beam username and password." }
             }
+            p.hint { "You will see the same datasets there as here. To download one view instead, use " strong { "Download Excel" } " on its page." }
         }
     };
     page(StatusCode::OK, layout("Datasets", Some(&signed), body))
-}
-
-#[derive(Deserialize, Default)]
-pub struct TableQuery {
-    #[serde(default)]
-    page: Option<u64>,
-    #[serde(default)]
-    sort: Option<String>,
-    #[serde(default)]
-    dir: Option<String>,
-    #[serde(default)]
-    column: Option<String>,
-    #[serde(default)]
-    op: Option<String>,
-    #[serde(default)]
-    value: Option<String>,
-}
-
-/// Turns the filter form into an OData `$filter` expression. Values are
-/// written as OData literals; the planner then binds them as parameters.
-pub fn filter_expression(property: &Property, op: &str, value: &str) -> Result<String, &'static str> {
-    let value = value.trim();
-    let name = &property.name;
-    if op == "contains" {
-        if property.edm != EdmType::String {
-            return Err("“contains” works on text columns. Choose another comparison.");
-        }
-        return Ok(format!(
-            "contains(tolower({name}), '{}')",
-            value.to_lowercase().replace('\'', "''")
-        ));
-    }
-    if !OPERATORS.iter().any(|(code, _)| *code == op) {
-        return Err("Choose a comparison.");
-    }
-    let literal = match property.edm {
-        EdmType::String => format!("'{}'", value.replace('\'', "''")),
-        EdmType::Boolean => match value.to_ascii_lowercase().as_str() {
-            "true" | "yes" => "true".to_string(),
-            "false" | "no" => "false".to_string(),
-            _ => return Err("Enter true or false."),
-        },
-        EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. } => {
-            if let Ok(whole) = value.parse::<i64>() {
-                whole.to_string()
-            } else {
-                match value.parse::<f64>() {
-                    Ok(number) if number.is_finite() => number.to_string(),
-                    _ => return Err("Enter a number."),
-                }
-            }
-        }
-        EdmType::Date | EdmType::DateTimeOffset => {
-            let shaped = value.len() >= 10 && value.bytes().all(|b| b.is_ascii_digit() || b"-:T.Z+".contains(&b));
-            if !shaped {
-                return Err("Enter a date as YYYY-MM-DD.");
-            }
-            value.to_string()
-        }
-    };
-    Ok(format!("{name} {op} {literal}"))
-}
-
-fn table_link(set: &EntitySet, query: &TableQuery, page: u64, sort: Option<(&str, &str)>) -> String {
-    let mut link = form_urlencoded::Serializer::new(String::new());
-    let sort = sort.or(query.sort.as_deref().zip(query.dir.as_deref().or(Some("asc"))));
-    if let Some((column, dir)) = sort {
-        link.append_pair("sort", column).append_pair("dir", dir);
-    }
-    if let (Some(column), Some(op), Some(value)) = (&query.column, &query.op, &query.value) {
-        if !value.trim().is_empty() {
-            link.append_pair("column", column)
-                .append_pair("op", op)
-                .append_pair("value", value);
-        }
-    }
-    if page > 1 {
-        link.append_pair("page", &page.to_string());
-    }
-    let encoded = link.finish();
-    let separator = if encoded.is_empty() { "" } else { "?" };
-    format!("/datasets/{}{separator}{encoded}", set.name)
-}
-
-/// Groups a run of digits in threes: `1234567` becomes `1,234,567`.
-pub fn group_digits(digits: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn thousands(n: u64) -> String {
-    group_digits(&n.to_string())
-}
-
-/// Feed timestamps are ISO 8601 with microseconds. On a page, show them the
-/// way a person writes them: `2025-01-07 09:15:00`, keeping any fraction.
-fn readable_timestamp(text: &str) -> String {
-    let text = text.strip_suffix('Z').unwrap_or(text).replacen('T', " ", 1);
-    match text.split_once('.') {
-        Some((whole, fraction)) if fraction.bytes().all(|b| b == b'0') => whole.to_string(),
-        _ => text,
-    }
-}
-
-fn cell(value: &Value, edm: EdmType) -> Markup {
-    match value {
-        Value::Null => html! { td.null { "—" } },
-        Value::String(s) if edm == EdmType::DateTimeOffset => html! { td { (readable_timestamp(s)) } },
-        Value::Number(n) => html! { td.num { (n.to_string()) } },
-        Value::Bool(b) => html! { td { (if *b { "true" } else { "false" }) } },
-        Value::String(s) => html! { td { (s) } },
-        other => html! { td { (other.to_string()) } },
-    }
-}
-
-pub async fn dataset(
-    State(state): App,
-    Path(name): Path<String>,
-    Query(query): Query<TableQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let signed = match require_signed_in(&state, &headers) {
-        Ok(signed) => signed,
-        Err(response) => return response,
-    };
-    let Some(set) = feed::find_set(&state, &name) else {
-        return message_page(
-            StatusCode::NOT_FOUND,
-            "Dataset not found",
-            "There is no dataset with that name.",
-        );
-    };
-
-    let page_number = query.page.unwrap_or(1).clamp(1, 1_000_000);
-    let descending = query.dir.as_deref() == Some("desc");
-    let sort = query.sort.as_deref().filter(|column| set.property(column).is_some());
-    let filter_value = query.value.as_deref().unwrap_or("").trim();
-    let filter_column = query.column.as_deref().and_then(|column| set.property(column));
-
-    let mut problem = None;
-    let mut options = vec![
-        ("$top".to_string(), PAGE_ROWS.to_string()),
-        ("$skip".to_string(), ((page_number - 1) * PAGE_ROWS).to_string()),
-        ("$count".to_string(), "true".to_string()),
-    ];
-    if let Some(column) = sort {
-        options.push((
-            "$orderby".into(),
-            format!("{column} {}", if descending { "desc" } else { "asc" }),
-        ));
-    }
-    if let (Some(property), false) = (filter_column, filter_value.is_empty()) {
-        match filter_expression(property, query.op.as_deref().unwrap_or(""), filter_value) {
-            Ok(expression) => options.push(("$filter".into(), expression)),
-            Err(message) => problem = Some(message),
-        }
-    }
-
-    let mut rows = Vec::new();
-    let mut total = 0;
-    match beam_odata::plan(set, &options, PAGE_ROWS) {
-        Ok(plan) => {
-            let width = plan.columns.len();
-            let counted = match &plan.count_sql {
-                Some(sql) => feed::run(&state, sql.clone(), &plan.count_params, 1).await,
-                None => Ok(Vec::new()),
-            };
-            match (
-                feed::run(&state, plan.rows_sql, &plan.rows_params, width).await,
-                counted,
-            ) {
-                (Ok(mut fetched), Ok(count)) => {
-                    fetched.truncate(PAGE_ROWS as usize);
-                    rows = fetched;
-                    total = count
-                        .first()
-                        .and_then(|r| r.first())
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                }
-                _ => problem = Some("That filter could not be applied. Check the value and try again."),
-            }
-        }
-        Err(_) => problem = Some("That filter could not be applied. Check the value and try again."),
-    }
-
-    let first = (page_number - 1) * PAGE_ROWS + 1;
-    let last = first + rows.len() as u64 - u64::from(!rows.is_empty());
-    let has_next = page_number * PAGE_ROWS < total;
-    let filtered = filter_column.is_some() && !filter_value.is_empty();
-    // The Chart view keeps the filter chosen here.
-    let carried: Vec<(&str, &str)> = match (filter_column, filtered && problem.is_none()) {
-        (Some(property), true) => vec![
-            ("column", property.name.as_str()),
-            ("op", query.op.as_deref().unwrap_or("")),
-            ("value", filter_value),
-        ],
-        _ => Vec::new(),
-    };
-
-    let body = html! {
-        p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
-        h1 { (set.name) }
-        (crate::chart::view_tabs(set, false, &carried))
-        form.filter method="get" action={ "/datasets/" (set.name) } {
-            @if let Some(column) = sort {
-                input type="hidden" name="sort" value=(column);
-                input type="hidden" name="dir" value=(if descending { "desc" } else { "asc" });
-            }
-            label for="column" { "Show rows where" }
-            select #column name="column" {
-                @for property in &set.properties {
-                    option value=(property.name) selected[query.column.as_deref() == Some(property.name.as_str())] { (property.name) }
-                }
-            }
-            select name="op" aria-label="Comparison" {
-                @for (code, label) in OPERATORS {
-                    option value=(code) selected[query.op.as_deref() == Some(*code)] { (label) }
-                }
-            }
-            input name="value" value=(filter_value) aria-label="Value" placeholder="value";
-            button type="submit" { "Apply" }
-            @if filtered { a.quiet href=(table_link(set, &TableQuery::default(), 1, sort.map(|c| (c, if descending { "desc" } else { "asc" })))) { "Clear" } }
-        }
-        @if let Some(problem) = problem { p.notice.error role="alert" { (problem) } }
-        div.tablewrap {
-            table {
-                thead {
-                    tr {
-                        @for property in &set.properties {
-                            @let active = sort == Some(property.name.as_str());
-                            @let next = if active && !descending { "desc" } else { "asc" };
-                            th aria-sort=[active.then_some(if descending { "descending" } else { "ascending" })] {
-                                a href=(table_link(set, &query, 1, Some((&property.name, next)))) {
-                                    (property.name)
-                                    @if active { span.arrow aria-hidden="true" { (if descending { " ▼" } else { " ▲" }) } }
-                                }
-                            }
-                        }
-                    }
-                }
-                tbody {
-                    @for row in &rows {
-                        tr { @for (value, property) in row.iter().zip(&set.properties) { (cell(value, property.edm)) } }
-                    }
-                }
-            }
-        }
-        @if rows.is_empty() && problem.is_none() { p.empty { "No rows match." } }
-        nav.pager aria-label="Pages" {
-            @if !rows.is_empty() {
-                span { "Rows " (thousands(first)) "–" (thousands(last)) " of " (thousands(total)) }
-            }
-            @if page_number > 1 { a href=(table_link(set, &query, page_number - 1, None)) { "← Previous" } }
-            @if has_next { a href=(table_link(set, &query, page_number + 1, None)) { "Next →" } }
-        }
-    };
-    page(StatusCode::OK, layout(&set.name, Some(&signed), body))
 }
 
 // --------------------------------------------------------------- my account
@@ -690,20 +474,43 @@ pub async fn account(State(state): App, Query(query): Query<HashMap<String, Stri
         Err(response) => return response,
     };
     let me = &signed.session.account;
+    let csrf = &signed.session.csrf;
+    let advanced = me.mode == Mode::Advanced;
     let body = html! {
-        h1 { "My account" }
+        h1 { "Settings" }
         (notice(&query))
+        section.panel.narrow #interface {
+            h2 { "Interface" }
+            form method="post" action="/account/mode" {
+                input type="hidden" name="csrf" value=(csrf);
+                label.choice {
+                    input type="radio" name="mode" value="basic" checked[!advanced];
+                    span { strong { "Basic" } " — the essentials, kept simple: browse, filter, chart, share and download." }
+                }
+                label.choice {
+                    input type="radio" name="mode" value="advanced" checked[advanced];
+                    span { strong { "Advanced" } " — adds column choice, more filters, naming uploads, and ready-made connections for Excel and Power BI." }
+                }
+                button type="submit" { "Save" }
+            }
+            p.hint { "This only changes what you see. It never changes what you are allowed to do." }
+        }
         section.panel.narrow {
-            dl {
-                dt { "Username" } dd { (me.username) }
-                dt { "Role" } dd { (role_label(me.role)) }
-                dt { "Created" } dd { (me.created_at) " UTC" }
+            h2 { "Profile" }
+            p.hint { "How colleagues see you on the People page and when you share data." }
+            form method="post" action="/account/profile" {
+                input type="hidden" name="csrf" value=(csrf);
+                label for="display_name" { "Name" }
+                input #display_name name="display_name" value=(me.display_name.as_deref().unwrap_or("")) maxlength=(beam_accounts::MAX_PROFILE_CHARS) autocomplete="name";
+                label for="team" { "Team or role" }
+                input #team name="team" value=(me.team.as_deref().unwrap_or("")) maxlength=(beam_accounts::MAX_PROFILE_CHARS) autocomplete="organization-title";
+                button type="submit" { "Save profile" }
             }
         }
         section.panel.narrow {
             h2 { "Change password" }
             form method="post" action="/account/password" {
-                input type="hidden" name="csrf" value=(signed.session.csrf);
+                input type="hidden" name="csrf" value=(csrf);
                 label for="current" { "Current password" }
                 input #current name="current" type="password" required autocomplete="current-password";
                 label for="password" { "New password" }
@@ -714,8 +521,63 @@ pub async fn account(State(state): App, Query(query): Query<HashMap<String, Stri
                 button type="submit" { "Change password" }
             }
         }
+        section.panel.narrow {
+            h2 { "Account" }
+            dl {
+                dt { "Username" } dd { (me.username) }
+                dt { "Role" } dd { (role_label(me.role)) }
+                dt { "Created" } dd { (me.created_at) " UTC" }
+            }
+        }
     };
-    page(StatusCode::OK, layout("My account", Some(&signed), body))
+    page(StatusCode::OK, layout("Settings", Some(&signed), body))
+}
+
+#[derive(Deserialize)]
+pub struct ModeForm {
+    csrf: String,
+    mode: String,
+}
+
+pub async fn set_mode(State(state): App, headers: HeaderMap, Form(form): Form<ModeForm>) -> Response {
+    let signed = match require_signed_in(&state, &headers) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
+    if let Err(response) = check_csrf(&signed, &form.csrf) {
+        return response;
+    }
+    let Some(mode) = Mode::parse(&form.mode) else {
+        return redirect("/account?error=failed");
+    };
+    match state.accounts.set_mode(signed.session.account.id, mode) {
+        Ok(()) => redirect("/account?ok=mode"),
+        Err(e) => redirect(&format!("/account?error={}", account_error_code(&e))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ProfileForm {
+    csrf: String,
+    display_name: String,
+    team: String,
+}
+
+pub async fn set_profile(State(state): App, headers: HeaderMap, Form(form): Form<ProfileForm>) -> Response {
+    let signed = match require_signed_in(&state, &headers) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
+    if let Err(response) = check_csrf(&signed, &form.csrf) {
+        return response;
+    }
+    match state
+        .accounts
+        .set_profile(signed.session.account.id, &form.display_name, &form.team)
+    {
+        Ok(()) => redirect("/account?ok=profile"),
+        Err(e) => redirect(&format!("/account?error={}", account_error_code(&e))),
+    }
 }
 
 #[derive(Deserialize)]

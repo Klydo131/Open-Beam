@@ -9,10 +9,10 @@ single program on your own computer or server, reads the data you point it at,
 lets your team explore it in the browser, and makes it available to the tools
 you already use, starting with Microsoft Excel and Power BI.
 
-> **Status: early release (0.2).** The web interface, charts, accounts and the
-> data feed for Excel and Power BI work and are covered by automated tests.
-> Dashboards and database connections are still to come. See the
-> [roadmap](docs/ROADMAP.md).
+> **Status: early release (0.3).** Adding your own files, sharing, charts,
+> accounts, and export to Excel, CSV, Google Sheets and Power BI work and are
+> covered by automated tests. Dashboards, database connections and automation
+> are still to come. See the [roadmap](docs/ROADMAP.md).
 
 <p align="center">
   <img src="docs/images/screens/table.png" alt="A dataset in the Open Beam web interface, filtered to one region and sorted by units." width="100%">
@@ -24,12 +24,19 @@ you already use, starting with Microsoft Excel and Power BI.
 
 ## What you get
 
-- **A web interface.** Sign in, browse your datasets, sort, filter and page
-  through them. No scripts run in the browser.
+- **Bring your own data.** Add CSV, Excel or Parquet files from the browser.
+- **A simple web interface.** Browse, sort, filter and page through tables.
+  **Basic** mode keeps it simple; **Advanced** adds column choice, more
+  filters and ready-made Excel and Power BI connections. No scripts run in
+  the browser.
+- **Work together.** A People directory with personal contacts, and sharing
+  dataset by dataset.
+- **Export anywhere.** Download exactly the view on screen as Excel or CSV
+  (for Google Sheets), or connect Power BI and Excel live.
 - **Charts.** Summarise any dataset as bars or a line: counts, sums and
   averages, grouped by a column or by day, month, quarter or year.
-- **Accounts with two roles.** Administrators add people and manage access;
-  users read data. See [Manage accounts](docs/guides/05-manage-accounts.md).
+- **Accounts with two roles.** Administrators manage accounts; users add,
+  explore and share their own data. See [Manage accounts](docs/guides/05-manage-accounts.md).
 - **A data feed for Excel and Power BI.** Load any dataset with the built-in
   OData connector. No driver to install.
 - **Clean data in one place.** Define summaries, joins and de-duplicated
@@ -56,7 +63,17 @@ you already use, starting with Microsoft Excel and Power BI.
   <img src="docs/images/how-it-works.svg" alt="List your files, start Open Beam and sign in, then explore in your browser or load into Excel or Power BI." width="100%">
 </p>
 
-## Quick start
+## Use it (no technical skills needed)
+
+Download Open Beam for your computer from the
+[Releases page](https://github.com/Klydo131/Open-Beam/releases), unzip it, and
+double-click **beam**. Your browser opens; choose a password and select
+**Add data**. Full steps: [Start here](docs/guides/00-start-here.md).
+
+> No release has been published yet. Until then, use the developer steps
+> below.
+
+## Build it (developers)
 
 You need [rustup](https://rustup.rs), which installs the right Rust version
 for you, and a C++ compiler. Full instructions for Windows, macOS and Linux are in
@@ -102,12 +119,14 @@ for you, and a C++ compiler. Full instructions for Windows, macOS and Linux are 
 
 Step-by-step guides, in order:
 
-1. [Install Open Beam](docs/guides/01-install.md)
+0. [Start here](docs/guides/00-start-here.md) — for everyone
+1. [Install Open Beam](docs/guides/01-install.md) — build from source
 2. [Start Open Beam and see your data](docs/guides/02-first-dataset.md)
 3. [Connect Excel and Power BI](docs/guides/03-connect-excel-and-power-bi.md)
 4. [Combine and clean data](docs/guides/04-combine-and-clean-data.md)
 5. [Manage accounts](docs/guides/05-manage-accounts.md)
 6. [Run Open Beam for a team](docs/guides/06-run-for-a-team.md)
+7. [Add, share and export data](docs/guides/07-add-share-and-export.md)
 
 ## Architecture
 

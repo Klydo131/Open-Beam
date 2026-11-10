@@ -25,8 +25,14 @@ as untrusted.
 - **No built-in TLS yet.** To serve Open Beam beyond your own machine, place it
   behind an HTTPS reverse proxy and set `public_url` to the HTTPS address, so
   that passwords and session cookies are never sent in the clear.
-- **Every account can read every dataset.** Per-dataset permissions are
-  planned. Do not configure a dataset that some account holders must not see.
+- **Uploaded files are parsed on the server.** CSV and Parquet are read by
+  DuckDB and Excel workbooks by `calamine`. Uploads are limited in size, and
+  workbooks that declare more than 256 MB unpacked are refused, but a declared
+  size can be falsified, so a crafted workbook can still use a lot of memory.
+  Only signed-in accounts can upload.
+- **Built-in datasets are visible to every account.** Datasets from
+  `beam.toml` are shared with everyone; datasets added in the browser are
+  private to their owner, the people they share with, and administrators.
 - **Feed clients send the password with each request.** This is how HTTP Basic
   authentication works; it is the method Excel and Power BI support for OData.
 - **No query time limit yet.** A signed-in client can issue filters that are

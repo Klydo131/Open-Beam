@@ -1,4 +1,4 @@
-//! Accounts, roles and sessions for Open Beam.
+//! Accounts, roles, sessions, contacts and dataset ownership for Open Beam.
 //!
 //! Everything is kept in one SQLite file that belongs to whoever runs Open
 //! Beam. Passwords are stored as Argon2id hashes. Session tokens are random,
@@ -32,6 +32,12 @@ pub enum AccountError {
     AlreadySetUp,
     #[error("No such account.")]
     NotFound,
+    #[error("Names and teams are at most {MAX_PROFILE_CHARS} characters, without control characters.")]
+    InvalidProfile,
+    #[error("That dataset name is already in use.")]
+    NameTaken,
+    #[error("No such dataset.")]
+    UploadNotFound,
     #[error("account database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("password hashing failed")]
@@ -63,6 +69,31 @@ impl Role {
     }
 }
 
+/// How much of the interface a person sees. A preference, not a permission:
+/// it changes which tools are shown, never what an account may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Basic,
+    Advanced,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Basic => "basic",
+            Mode::Advanced => "advanced",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "basic" => Some(Mode::Basic),
+            "advanced" => Some(Mode::Advanced),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub id: i64,
@@ -72,7 +103,34 @@ pub struct Account {
     /// UTC, `YYYY-MM-DD HH:MM:SS`.
     pub created_at: String,
     pub last_sign_in: Option<String>,
+    /// How colleagues see this person, for example "Maria Santos".
+    pub display_name: Option<String>,
+    /// Team, department or job title, for example "Finance".
+    pub team: Option<String>,
+    pub mode: Mode,
 }
+
+impl Account {
+    /// The name to show people: the display name when set, else the username.
+    pub fn name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.username)
+    }
+}
+
+/// A dataset a person added through the web interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upload {
+    pub id: i64,
+    /// The dataset name, unique across all datasets.
+    pub name: String,
+    pub owner_id: i64,
+    /// File name inside the upload directory. Chosen by the server, never by
+    /// the person uploading.
+    pub file: String,
+    pub created_at: String,
+}
+
+pub const MAX_PROFILE_CHARS: usize = 64;
 
 /// A signed-in browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +154,9 @@ pub struct Store {
     decoy_hash: String,
 }
 
-const ACCOUNT_COLUMNS: &str = "id, username, role, active, created_at, last_sign_in";
+const ACCOUNT_COLUMNS: &str = "id, username, role, active, created_at, last_sign_in, display_name, team, mode";
+/// Number of columns in `ACCOUNT_COLUMNS`; extra columns in a query follow it.
+const ACCOUNT_WIDTH: usize = 9;
 
 impl Store {
     /// Opens the account database, creating it if needed.
@@ -133,8 +193,44 @@ impl Store {
                  csrf       TEXT NOT NULL,
                  expires_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS contacts (
+                 owner_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 contact_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 PRIMARY KEY (owner_id, contact_id),
+                 CHECK (owner_id <> contact_id)
+             );
+             CREATE TABLE IF NOT EXISTS uploads (
+                 id         INTEGER PRIMARY KEY,
+                 name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 owner_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 file       TEXT NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE IF NOT EXISTS shares (
+                 upload_id  INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 PRIMARY KEY (upload_id, account_id)
+             );
              DELETE FROM sessions WHERE expires_at <= datetime('now');",
         )?;
+        // Columns added after 0.2. Adding is the only kind of change made to
+        // an existing file, so older account files open unchanged.
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('accounts')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for (column, definition) in [
+            ("display_name", "TEXT"),
+            ("team", "TEXT"),
+            (
+                "mode",
+                "TEXT NOT NULL DEFAULT 'basic' CHECK (mode IN ('basic', 'advanced'))",
+            ),
+        ] {
+            if !existing.iter().any(|name| name == column) {
+                conn.execute_batch(&format!("ALTER TABLE accounts ADD COLUMN {column} {definition}"))?;
+            }
+        }
         let decoy_hash = hash_password(&random_token()?)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -216,7 +312,7 @@ impl Store {
                 .query_row(
                     &format!("SELECT {ACCOUNT_COLUMNS}, password_hash FROM accounts WHERE username = ?1"),
                     [username],
-                    |row| Ok((read_account(row)?, row.get::<_, String>(6)?)),
+                    |row| Ok((read_account(row)?, row.get::<_, String>(ACCOUNT_WIDTH)?)),
                 )
                 .optional()?,
             Err(_) => None,
@@ -296,6 +392,150 @@ impl Store {
         Ok(())
     }
 
+    /// Sets how colleagues see an account. Blank values clear the field.
+    pub fn set_profile(&self, id: i64, display_name: &str, team: &str) -> Result<(), AccountError> {
+        let display_name = clean_profile(display_name)?;
+        let team = clean_profile(team)?;
+        let changed = self.conn().execute(
+            "UPDATE accounts SET display_name = ?1, team = ?2 WHERE id = ?3",
+            params![display_name, team, id],
+        )?;
+        if changed == 0 {
+            return Err(AccountError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn set_mode(&self, id: i64, mode: Mode) -> Result<(), AccountError> {
+        let changed = self.conn().execute(
+            "UPDATE accounts SET mode = ?1 WHERE id = ?2",
+            params![mode.as_str(), id],
+        )?;
+        if changed == 0 {
+            return Err(AccountError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------- contacts
+
+    /// The ids of the accounts `owner` keeps as contacts.
+    pub fn contacts(&self, owner: i64) -> Result<Vec<i64>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare("SELECT contact_id FROM contacts WHERE owner_id = ?1")?;
+        let ids = statement
+            .query_map([owner], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Adds a contact. Only active accounts can be added; adding twice is harmless.
+    pub fn add_contact(&self, owner: i64, contact: i64) -> Result<(), AccountError> {
+        if owner == contact || !self.get(contact)?.active {
+            return Err(AccountError::NotFound);
+        }
+        self.conn().execute(
+            "INSERT OR IGNORE INTO contacts (owner_id, contact_id) VALUES (?1, ?2)",
+            params![owner, contact],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_contact(&self, owner: i64, contact: i64) -> Result<(), AccountError> {
+        self.conn().execute(
+            "DELETE FROM contacts WHERE owner_id = ?1 AND contact_id = ?2",
+            params![owner, contact],
+        )?;
+        Ok(())
+    }
+
+    // ----------------------------------------------------------- uploads
+
+    pub fn create_upload(&self, name: &str, owner: i64, file: &str) -> Result<Upload, AccountError> {
+        let conn = self.conn();
+        let inserted = conn.execute(
+            "INSERT INTO uploads (name, owner_id, file) VALUES (?1, ?2, ?3)",
+            params![name, owner, file],
+        );
+        match inserted {
+            Ok(_) => Ok(conn.query_row(
+                "SELECT id, name, owner_id, file, created_at FROM uploads WHERE id = ?1",
+                [conn.last_insert_rowid()],
+                read_upload,
+            )?),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                Err(AccountError::NameTaken)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn uploads(&self) -> Result<Vec<Upload>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare("SELECT id, name, owner_id, file, created_at FROM uploads ORDER BY name")?;
+        let uploads = statement.query_map([], read_upload)?.collect::<Result<_, _>>()?;
+        Ok(uploads)
+    }
+
+    pub fn upload_named(&self, name: &str) -> Result<Option<Upload>, AccountError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, name, owner_id, file, created_at FROM uploads WHERE name = ?1",
+                [name],
+                read_upload,
+            )
+            .optional()?)
+    }
+
+    pub fn delete_upload(&self, id: i64) -> Result<(), AccountError> {
+        if self.conn().execute("DELETE FROM uploads WHERE id = ?1", [id])? == 0 {
+            return Err(AccountError::UploadNotFound);
+        }
+        Ok(())
+    }
+
+    /// The accounts an upload is shared with, besides its owner.
+    pub fn shares(&self, upload: i64) -> Result<Vec<i64>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare("SELECT account_id FROM shares WHERE upload_id = ?1")?;
+        let ids = statement
+            .query_map([upload], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    pub fn share(&self, upload: i64, account: i64) -> Result<(), AccountError> {
+        if !self.get(account)?.active {
+            return Err(AccountError::NotFound);
+        }
+        let inserted = self.conn().execute(
+            "INSERT OR IGNORE INTO shares (upload_id, account_id) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM uploads WHERE id = ?1)",
+            params![upload, account],
+        )?;
+        if inserted == 0 && !self.shares(upload)?.contains(&account) {
+            return Err(AccountError::UploadNotFound);
+        }
+        Ok(())
+    }
+
+    pub fn unshare(&self, upload: i64, account: i64) -> Result<(), AccountError> {
+        self.conn().execute(
+            "DELETE FROM shares WHERE upload_id = ?1 AND account_id = ?2",
+            params![upload, account],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `account` may read `upload`: its owner, anyone it is shared
+    /// with, and administrators.
+    pub fn can_read(&self, account: &Account, upload: &Upload) -> Result<bool, AccountError> {
+        if account.role == Role::Admin || account.id == upload.owner_id {
+            return Ok(true);
+        }
+        Ok(self.shares(upload.id)?.contains(&account.id))
+    }
+
     pub fn start_session(&self, account_id: i64) -> Result<NewSession, AccountError> {
         let session = NewSession {
             token: random_token()?,
@@ -332,7 +572,7 @@ impl Store {
                 |row| {
                     Ok(Session {
                         account: read_account(row)?,
-                        csrf: row.get(6)?,
+                        csrf: row.get(ACCOUNT_WIDTH)?,
                     })
                 },
             )
@@ -356,7 +596,29 @@ fn read_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         active: row.get(3)?,
         created_at: row.get(4)?,
         last_sign_in: row.get(5)?,
+        display_name: row.get(6)?,
+        team: row.get(7)?,
+        // The CHECK constraint allows only the two known modes.
+        mode: Mode::parse(&row.get::<_, String>(8)?).unwrap_or(Mode::Basic),
     })
+}
+
+fn read_upload(row: &Row<'_>) -> rusqlite::Result<Upload> {
+    Ok(Upload {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        owner_id: row.get(2)?,
+        file: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+fn clean_profile(text: &str) -> Result<Option<String>, AccountError> {
+    let text = text.trim();
+    if text.chars().count() > MAX_PROFILE_CHARS || text.chars().any(char::is_control) {
+        return Err(AccountError::InvalidProfile);
+    }
+    Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
 fn normalise_username(username: &str) -> Result<String, AccountError> {
@@ -554,5 +816,117 @@ mod tests {
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.list().unwrap().len(), 1);
         assert!(reopened.verify("ada", PASSWORD).unwrap().is_some());
+    }
+
+    #[test]
+    fn profiles_and_modes() {
+        let (store, admin) = store_with_admin();
+        assert_eq!(
+            (admin.mode, admin.display_name.as_deref(), admin.name()),
+            (Mode::Basic, None, "ada")
+        );
+        store.set_profile(admin.id, "  Ada Lovelace ", "Analysis").unwrap();
+        store.set_mode(admin.id, Mode::Advanced).unwrap();
+        let ada = store.get(admin.id).unwrap();
+        assert_eq!(
+            (ada.name(), ada.team.as_deref(), ada.mode),
+            ("Ada Lovelace", Some("Analysis"), Mode::Advanced)
+        );
+        store.set_profile(admin.id, "", "").unwrap();
+        assert_eq!(store.get(admin.id).unwrap().display_name, None);
+        assert!(matches!(
+            store.set_profile(admin.id, &"x".repeat(65), ""),
+            Err(AccountError::InvalidProfile)
+        ));
+        assert!(matches!(
+            store.set_profile(admin.id, "bad\nname", ""),
+            Err(AccountError::InvalidProfile)
+        ));
+        assert!(matches!(store.set_mode(999, Mode::Basic), Err(AccountError::NotFound)));
+        // Sessions and sign-in still read the right columns after the additions.
+        let session = store.start_session(admin.id).unwrap();
+        assert_eq!(store.session(&session.token).unwrap().unwrap().csrf, session.csrf);
+        assert!(store.verify("ada", PASSWORD).unwrap().is_some());
+    }
+
+    #[test]
+    fn contacts_are_personal_and_only_for_active_accounts() {
+        let (store, admin) = store_with_admin();
+        let bob = store.create("bob", PASSWORD, Role::User).unwrap();
+        let cy = store.create("cyd", PASSWORD, Role::User).unwrap();
+        store.add_contact(bob.id, admin.id).unwrap();
+        store.add_contact(bob.id, admin.id).unwrap();
+        assert_eq!(store.contacts(bob.id).unwrap(), vec![admin.id]);
+        assert_eq!(store.contacts(admin.id).unwrap(), Vec::<i64>::new());
+        assert!(matches!(store.add_contact(bob.id, bob.id), Err(AccountError::NotFound)));
+        assert!(matches!(store.add_contact(bob.id, 999), Err(AccountError::NotFound)));
+        store.set_active(cy.id, false).unwrap();
+        assert!(matches!(store.add_contact(bob.id, cy.id), Err(AccountError::NotFound)));
+        store.remove_contact(bob.id, admin.id).unwrap();
+        assert!(store.contacts(bob.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn uploads_are_readable_by_owner_shares_and_administrators_only() {
+        let (store, admin) = store_with_admin();
+        let bob = store.create("bob", PASSWORD, Role::User).unwrap();
+        let cy = store.create("cyd", PASSWORD, Role::User).unwrap();
+        let upload = store.create_upload("budget", bob.id, "a1.csv").unwrap();
+        assert!(matches!(
+            store.create_upload("BUDGET", cy.id, "b2.csv"),
+            Err(AccountError::NameTaken)
+        ));
+
+        assert!(store.can_read(&bob, &upload).unwrap());
+        assert!(store.can_read(&admin, &upload).unwrap());
+        assert!(!store.can_read(&cy, &upload).unwrap());
+        store.share(upload.id, cy.id).unwrap();
+        store.share(upload.id, cy.id).unwrap();
+        assert!(store.can_read(&cy, &upload).unwrap());
+        assert_eq!(store.shares(upload.id).unwrap(), vec![cy.id]);
+        store.unshare(upload.id, cy.id).unwrap();
+        assert!(!store.can_read(&cy, &upload).unwrap());
+        assert!(matches!(store.share(999, cy.id), Err(AccountError::UploadNotFound)));
+
+        assert_eq!(
+            store.upload_named("budget").unwrap().map(|u| u.file),
+            Some("a1.csv".into())
+        );
+        store.share(upload.id, cy.id).unwrap();
+        store.delete_upload(upload.id).unwrap();
+        assert!(store.uploads().unwrap().is_empty());
+        assert!(store.shares(upload.id).unwrap().is_empty(), "shares go with the upload");
+        assert!(matches!(
+            store.delete_upload(upload.id),
+            Err(AccountError::UploadNotFound)
+        ));
+    }
+
+    #[test]
+    fn files_from_0_2_gain_the_new_columns_without_losing_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                     role TEXT NOT NULL CHECK (role IN ('admin', 'user')), active INTEGER NOT NULL DEFAULT 1,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')), last_sign_in TEXT);",
+            )
+            .unwrap();
+            let hash = hash_password(PASSWORD).unwrap();
+            conn.execute(
+                "INSERT INTO accounts (username, password_hash, role) VALUES ('ada', ?1, 'admin')",
+                [hash],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let ada = store.verify("ada", PASSWORD).unwrap().unwrap();
+        assert_eq!((ada.mode, ada.display_name), (Mode::Basic, None));
+        drop(store);
+        // Opening again must not try to add the columns twice.
+        assert_eq!(Store::open(&path).unwrap().count().unwrap(), 1);
     }
 }

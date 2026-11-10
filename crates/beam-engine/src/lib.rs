@@ -10,7 +10,7 @@ use duckdb::{params_from_iter, Connection};
 use serde_json::{Number, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// Name of the row-number key added to datasets that declare no key column.
 pub const ROW_KEY: &str = "_row";
@@ -29,6 +29,10 @@ pub enum EngineError {
     Empty(String),
     #[error("dataset '{dataset}': invalid query: {reason}")]
     InvalidQuery { dataset: String, reason: String },
+    #[error("cannot use upload directory '{0}'")]
+    UploadDir(PathBuf),
+    #[error("uploads are not enabled")]
+    UploadsDisabled,
     #[error(transparent)]
     Database(#[from] duckdb::Error),
 }
@@ -80,6 +84,8 @@ pub struct Dataset {
     pub name: String,
     pub key: String,
     pub columns: Vec<Column>,
+    /// `true` for datasets added at run time with [`Engine::add_upload`].
+    pub uploaded: bool,
 }
 
 /// A value bound to a `?` placeholder.
@@ -94,11 +100,28 @@ pub enum Param {
 
 pub struct Engine {
     conn: Mutex<Connection>,
-    datasets: Vec<Dataset>,
+    datasets: RwLock<Vec<Dataset>>,
+    /// Where files added at run time live. The only directory the sealed
+    /// database may read besides the configured files.
+    upload_dir: Option<PathBuf>,
 }
 
 impl Engine {
     pub fn open(specs: &[DatasetSpec]) -> Result<Self, EngineError> {
+        Self::open_with_uploads(specs, None)
+    }
+
+    /// Like [`Engine::open`], and also allows datasets to be added later from
+    /// files placed in `upload_dir`, which is created if needed.
+    pub fn open_with_uploads(specs: &[DatasetSpec], upload_dir: Option<&Path>) -> Result<Self, EngineError> {
+        let upload_dir = match upload_dir {
+            Some(dir) => {
+                let unusable = |_| EngineError::UploadDir(dir.to_path_buf());
+                std::fs::create_dir_all(dir).map_err(unusable)?;
+                Some(dir.canonicalize().map_err(unusable)?)
+            }
+            None => None,
+        };
         let conn = Connection::open_in_memory()?;
         let mut datasets = Vec::new();
         let mut allowed_paths = Vec::new();
@@ -137,8 +160,19 @@ impl Engine {
             datasets.push(dataset);
         }
 
+        // A trailing separator, so that "/data/uploads" does not also admit
+        // "/data/uploads-other".
+        let allowed_directories = match upload_dir.as_ref().and_then(|dir| dir.to_str()) {
+            Some(dir) => quote_literal(&format!(
+                "{}{}",
+                dir.trim_end_matches(std::path::MAIN_SEPARATOR),
+                std::path::MAIN_SEPARATOR
+            )),
+            None => String::new(),
+        };
         conn.execute_batch(&format!(
-            "SET allowed_paths = [{}]; SET enable_external_access = false; SET lock_configuration = true;",
+            "SET allowed_paths = [{}]; SET allowed_directories = [{allowed_directories}]; \
+             SET enable_external_access = false; SET lock_configuration = true;",
             allowed_paths.join(", ")
         ))?;
         // A query that reads a file which is not itself a configured dataset
@@ -153,12 +187,97 @@ impl Engine {
         }
         Ok(Self {
             conn: Mutex::new(conn),
-            datasets,
+            datasets: RwLock::new(datasets),
+            upload_dir,
         })
     }
 
-    pub fn datasets(&self) -> &[Dataset] {
-        &self.datasets
+    /// Every dataset, in the order they were added.
+    pub fn datasets(&self) -> Vec<Dataset> {
+        self.datasets.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn dataset(&self, name: &str) -> Option<Dataset> {
+        self.datasets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+    }
+
+    /// The directory uploaded files must be placed in, if uploads are enabled.
+    pub fn upload_dir(&self) -> Option<&Path> {
+        self.upload_dir.as_deref()
+    }
+
+    /// Adds a dataset over `file`, a plain file name inside the upload
+    /// directory. The file is read once now, so a file that cannot be parsed
+    /// is refused here rather than on someone's first request.
+    pub fn add_upload(&self, name: &str, file: &str, format: Format) -> Result<Dataset, EngineError> {
+        let dir = self.upload_dir.as_ref().ok_or(EngineError::UploadsDisabled)?;
+        let plain = !file.is_empty()
+            && file
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+            && !file.starts_with('.');
+        let unreadable = || EngineError::Unreadable {
+            dataset: name.to_string(),
+            path: PathBuf::from(file),
+        };
+        if !plain {
+            return Err(unreadable());
+        }
+        let path = dir.join(file).canonicalize().map_err(|_| unreadable())?;
+        if path.parent() != Some(dir.as_path()) {
+            return Err(unreadable());
+        }
+        let path_text = path.to_str().ok_or_else(unreadable)?;
+        let reader = match format {
+            Format::Csv => "read_csv",
+            Format::Parquet => "read_parquet",
+        };
+
+        let mut datasets = self.datasets.write().unwrap_or_else(|e| e.into_inner());
+        let taken = datasets.iter().any(|d| d.name.eq_ignore_ascii_case(name));
+        if !is_identifier(name) || taken {
+            return Err(EngineError::InvalidName(name.to_string()));
+        }
+        let spec = DatasetSpec {
+            name: name.to_string(),
+            source: Source::File {
+                path: path.clone(),
+                format: Some(format),
+            },
+            key: None,
+        };
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let source = format!("{reader}({})", quote_literal(path_text));
+        let created = create_view(&conn, &spec, &source).and_then(|dataset| {
+            conn.execute_batch(&format!("SELECT * FROM {} LIMIT 0", quote_ident(name)))?;
+            Ok(dataset)
+        });
+        match created {
+            Ok(mut dataset) => {
+                dataset.uploaded = true;
+                datasets.push(dataset.clone());
+                Ok(dataset)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)));
+                Err(e)
+            }
+        }
+    }
+
+    /// Removes a dataset added with [`Engine::add_upload`]. The file is left
+    /// for the caller to delete.
+    pub fn remove(&self, name: &str) -> Result<(), EngineError> {
+        let mut datasets = self.datasets.write().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)))?;
+        datasets.retain(|d| d.name != name);
+        Ok(())
     }
 
     /// Runs a statement and returns its rows, each `width` values wide.
@@ -244,6 +363,7 @@ fn create_view(conn: &Connection, spec: &DatasetSpec, source: &str) -> Result<Da
         name: spec.name.clone(),
         key,
         columns,
+        uploaded: false,
     })
 }
 
@@ -499,5 +619,69 @@ mod tests {
             .contains("invalid query"));
         assert!(open("SELECT * FROM missing").unwrap().contains("invalid query"));
         assert_eq!(open("SELECT region FROM sales"), None);
+    }
+
+    #[test]
+    fn uploads_are_added_and_removed_at_run_time_inside_their_directory_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = Engine::open_with_uploads(&[spec("sales", &sample(dir.path()), None)], Some(&uploads)).unwrap();
+        fs::write(uploads.join("a1.csv"), "team,score\nred,3\nblue,5\n").unwrap();
+
+        let added = engine.add_upload("scores", "a1.csv", Format::Csv).unwrap();
+        assert_eq!((added.key.as_str(), added.uploaded), (ROW_KEY, true));
+        assert!(!engine.dataset("sales").unwrap().uploaded);
+        assert_eq!(engine.datasets().len(), 2);
+        let rows = engine.query("SELECT sum(score) FROM scores", &[], 1).unwrap();
+        assert_eq!(rows, vec![vec![json!(8)]]);
+
+        // Names must be new and well formed; files must be plain names inside the directory.
+        assert!(matches!(
+            engine.add_upload("SALES", "a1.csv", Format::Csv),
+            Err(EngineError::InvalidName(_))
+        ));
+        assert!(matches!(
+            engine.add_upload("bad name", "a1.csv", Format::Csv),
+            Err(EngineError::InvalidName(_))
+        ));
+        let outside = sample(dir.path());
+        for file in [
+            "../it's data.csv",
+            "",
+            ".hidden",
+            "missing.csv",
+            outside.to_str().unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    engine.add_upload("other", file, Format::Csv),
+                    Err(EngineError::Unreadable { .. })
+                ),
+                "{file}"
+            );
+        }
+        // A file that does not parse is refused and leaves nothing behind.
+        fs::write(uploads.join("b2.parquet"), "not parquet").unwrap();
+        assert!(engine.add_upload("broken", "b2.parquet", Format::Parquet).is_err());
+        assert!(engine.dataset("broken").is_none());
+        assert!(engine.query("SELECT * FROM broken", &[], 0).is_err());
+
+        // The sandbox still holds: siblings of the upload directory stay unreadable.
+        let sibling = dir.path().join("uploads-other");
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("secret.csv"), "token\nhunter2\n").unwrap();
+        let read = format!(
+            "SELECT * FROM read_csv({})",
+            quote_literal(sibling.join("secret.csv").to_str().unwrap())
+        );
+        assert!(engine.query(&read, &[], 1).is_err());
+
+        engine.remove("scores").unwrap();
+        assert!(engine.dataset("scores").is_none());
+        assert!(engine.query("SELECT * FROM scores", &[], 0).is_err());
+        assert!(matches!(
+            Engine::open(&[]).unwrap().add_upload("x_y", "a1.csv", Format::Csv),
+            Err(EngineError::UploadsDisabled)
+        ));
     }
 }

@@ -1,7 +1,9 @@
 //! The read-only OData v4 data feed.
 
 use crate::app::AppState;
-use axum::extract::{Path, Query, State};
+use crate::auth::Viewer;
+use crate::catalog;
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::header::{CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -31,21 +33,29 @@ pub fn base_url(state: &AppState, headers: &HeaderMap) -> String {
     format!("http://{host}")
 }
 
-pub async fn service_document(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let document = beam_odata::service_document(&format!("{}/odata", base_url(&state, &headers)), &state.sets);
+fn visible_sets(state: &AppState, viewer: &Viewer) -> Vec<EntitySet> {
+    catalog::visible(state, &viewer.0)
+        .into_iter()
+        .map(|entry| entry.set)
+        .collect()
+}
+
+pub async fn service_document(
+    State(state): State<Arc<AppState>>,
+    Extension(viewer): Extension<Viewer>,
+    headers: HeaderMap,
+) -> Response {
+    let sets = visible_sets(&state, &viewer);
+    let document = beam_odata::service_document(&format!("{}/odata", base_url(&state, &headers)), &sets);
     ([(CONTENT_TYPE, JSON)], document.to_string()).into_response()
 }
 
-pub async fn metadata(State(state): State<Arc<AppState>>) -> Response {
+pub async fn metadata(State(state): State<Arc<AppState>>, Extension(viewer): Extension<Viewer>) -> Response {
     (
         [(CONTENT_TYPE, "application/xml;charset=utf-8")],
-        beam_odata::metadata_xml(&state.sets),
+        beam_odata::metadata_xml(&visible_sets(&state, &viewer)),
     )
         .into_response()
-}
-
-pub fn find_set<'a>(state: &'a AppState, name: &str) -> Option<&'a EntitySet> {
-    state.sets.iter().find(|s| s.name == name)
 }
 
 fn unknown_set() -> Response {
@@ -119,13 +129,15 @@ fn plan_error(e: beam_odata::QueryError) -> Response {
 
 pub async fn collection(
     State(state): State<Arc<AppState>>,
+    Extension(viewer): Extension<Viewer>,
     Path(name): Path<String>,
     Query(options): Query<Vec<(String, String)>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(set) = find_set(&state, &name) else {
+    let Some(entry) = catalog::find(&state, &viewer.0, &name) else {
         return unknown_set();
     };
+    let set = &entry.set;
     let plan = match beam_odata::plan(set, &options, state.max_page_size) {
         Ok(plan) => plan,
         Err(e) => return plan_error(e),
@@ -192,12 +204,14 @@ pub async fn collection(
 
 pub async fn count(
     State(state): State<Arc<AppState>>,
+    Extension(viewer): Extension<Viewer>,
     Path(name): Path<String>,
     Query(options): Query<Vec<(String, String)>>,
 ) -> Response {
-    let Some(set) = find_set(&state, &name) else {
+    let Some(entry) = catalog::find(&state, &viewer.0, &name) else {
         return unknown_set();
     };
+    let set = &entry.set;
     let mut options: Vec<_> = options.into_iter().filter(|(k, _)| k == "$filter").collect();
     options.push(("$count".into(), "true".into()));
     let plan = match beam_odata::plan(set, &options, state.max_page_size) {

@@ -74,7 +74,12 @@ fn site(fresh: bool, max_page_size: u64) -> Site {
         source: Source::File { path, format: None },
         key: Some(key.into()),
     };
-    let engine = Engine::open(&[file("sales", sales, "order_id"), file("many", many, "id")]).unwrap();
+    let uploads = dir.path().join("uploads");
+    let engine = Engine::open_with_uploads(
+        &[file("sales", sales, "order_id"), file("many", many, "id")],
+        Some(&uploads),
+    )
+    .unwrap();
     let accounts = Store::open_in_memory().unwrap();
     if !fresh {
         accounts.create_first_admin("ada", ADMIN_PASSWORD).unwrap();
@@ -932,4 +937,584 @@ async fn hostile_feed_input_is_rejected_or_inert() {
             "error bodies must not reveal file paths"
         );
     }
+}
+
+// --------------------------------------------------- uploads and sharing
+
+const CYD_PASSWORD: &str = "a third long password";
+
+/// Sends a multipart form, as a browser does for a file upload.
+async fn upload(site: &Site, cookie: &str, csrf: &str, file_name: &str, bytes: &[u8], name: &str) -> Reply {
+    let boundary = "----beamtestboundary";
+    let mut body = Vec::new();
+    for (field, value) in [("csrf", csrf), ("name", name)] {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n").as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/data")
+        .header(HOST, "beam.test:9000")
+        .header(COOKIE, cookie)
+        .header(CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .body(Body::from(body))
+        .unwrap();
+    let response = site.app.clone().oneshot(request).await.unwrap();
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    Reply {
+        status: parts.status,
+        headers: parts.headers,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+fn upload_files(site: &Site) -> usize {
+    std::fs::read_dir(site.state.engine.upload_dir().unwrap())
+        .unwrap()
+        .count()
+}
+
+const BUDGET: &[u8] = b"team,amount,due\nOps,1200.5,2025-04-01\nSales,=CMD|' /C calc'!A0,2025-05-01\nOps,300,\n";
+
+#[tokio::test]
+async fn uploads_are_private_until_shared() {
+    let site = site(false, 100);
+    site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap();
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let (cyd, cyd_csrf) = sign_in(&site, "cyd", CYD_PASSWORD).await;
+    let (ada, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+
+    let added = upload(&site, &bob, &bob_csrf, "Team Budget 2025.csv", BUDGET, "").await;
+    assert_eq!(
+        (added.status, added.location()),
+        (StatusCode::SEE_OTHER, "/datasets/team_budget_2025")
+    );
+    assert_eq!(upload_files(&site), 1);
+    let page = get(&site, "/datasets/team_budget_2025", Some(&bob)).await;
+    assert!(page.body.contains("Rows 1–3 of 3") && page.body.contains(">Sharing<"));
+    assert!(get(&site, "/", Some(&bob))
+        .await
+        .body
+        .contains("<h2 class=\"section\">Yours</h2>"));
+
+    // Nobody else sees it: not on pages, downloads, charts or the feed.
+    for uri in [
+        "/datasets/team_budget_2025",
+        "/datasets/team_budget_2025/chart",
+        "/datasets/team_budget_2025/export.csv",
+        "/datasets/team_budget_2025/export.xlsx",
+        "/datasets/team_budget_2025/share",
+    ] {
+        assert_eq!(get(&site, uri, Some(&cyd)).await.status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    assert!(!get(&site, "/", Some(&cyd)).await.body.contains("team_budget_2025"));
+    let as_cyd = || Call {
+        basic: Some(("cyd", CYD_PASSWORD)),
+        ..Call::default()
+    };
+    assert!(!call(&site, "GET", "/odata/", as_cyd())
+        .await
+        .body
+        .contains("team_budget_2025"));
+    assert!(!call(&site, "GET", "/odata/$metadata", as_cyd())
+        .await
+        .body
+        .contains("team_budget_2025"));
+    assert_eq!(
+        call(&site, "GET", "/odata/team_budget_2025", as_cyd()).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&site, "GET", "/odata/team_budget_2025/$count", as_cyd())
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // Someone who cannot see it cannot share or delete it either.
+    let cyd = cyd.as_str();
+    let cyd_id = account_id(&site, "cyd").to_string();
+    assert_eq!(
+        submit(
+            &site,
+            cyd,
+            &cyd_csrf,
+            "/datasets/team_budget_2025/share",
+            &[("account", &cyd_id)]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        submit(
+            &site,
+            cyd,
+            &cyd_csrf,
+            "/datasets/team_budget_2025/delete",
+            &[("confirm", "yes")]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Administrators see everything, under "Added by others".
+    let admin_home = get(&site, "/", Some(&ada)).await;
+    assert!(admin_home.body.contains("Added by others") && admin_home.body.contains("team_budget_2025"));
+    assert_eq!(
+        get(&site, "/datasets/team_budget_2025/share", Some(&ada)).await.status,
+        StatusCode::OK
+    );
+
+    // Sharing lets one colleague in, everywhere, and nobody else.
+    let shared = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/team_budget_2025/share",
+        &[("account", &cyd_id)],
+    )
+    .await;
+    assert_eq!(shared.location(), "/datasets/team_budget_2025/share?ok=shared");
+    assert_eq!(
+        get(&site, "/datasets/team_budget_2025", Some(cyd)).await.status,
+        StatusCode::OK
+    );
+    assert!(get(&site, "/", Some(cyd)).await.body.contains("Shared with you"));
+    assert_eq!(
+        call(&site, "GET", "/odata/team_budget_2025", as_cyd()).await.json()["value"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    // Being shared with is not ownership: no Sharing tab, no sharing onwards, no deleting.
+    assert!(!get(&site, "/datasets/team_budget_2025", Some(cyd))
+        .await
+        .body
+        .contains(">Sharing<"));
+    assert_eq!(
+        get(&site, "/datasets/team_budget_2025/share", Some(cyd)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        submit(
+            &site,
+            cyd,
+            &cyd_csrf,
+            "/datasets/team_budget_2025/delete",
+            &[("confirm", "yes")]
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let ada_id = account_id(&site, "ada").to_string();
+    assert_eq!(
+        submit(
+            &site,
+            cyd,
+            &cyd_csrf,
+            "/datasets/team_budget_2025/share",
+            &[("account", &ada_id)]
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    let stop = format!("/datasets/team_budget_2025/share/{cyd_id}/remove");
+    assert_eq!(
+        submit(&site, &bob, &bob_csrf, &stop, &[]).await.location(),
+        "/datasets/team_budget_2025/share?ok=unshared"
+    );
+    assert_eq!(
+        get(&site, "/datasets/team_budget_2025", Some(cyd)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&site, "GET", "/odata/team_budget_2025", as_cyd()).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Built-in datasets cannot be shared or deleted from the browser.
+    assert_eq!(
+        get(&site, "/datasets/sales/share", Some(&ada)).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Deleting needs the confirmation, then removes the data and the file.
+    let unconfirmed = submit(&site, &bob, &bob_csrf, "/datasets/team_budget_2025/delete", &[]).await;
+    assert_eq!(unconfirmed.location(), "/datasets/team_budget_2025/share?error=confirm");
+    let deleted = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/team_budget_2025/delete",
+        &[("confirm", "yes")],
+    )
+    .await;
+    assert_eq!(deleted.location(), "/?ok=deleted");
+    assert_eq!(
+        get(&site, "/datasets/team_budget_2025", Some(&bob)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(upload_files(&site), 0);
+    assert!(site.state.accounts.uploads().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn uploads_reject_bad_files_and_forged_forms() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    assert!(get(&site, "/data/new", Some(&bob))
+        .await
+        .body
+        .contains("CSV, Excel (.xlsx, first sheet) or Parquet"));
+    assert_eq!(get(&site, "/data/new", None).await.location(), "/login");
+
+    let forged = upload(&site, &bob, "not-the-token", "a.csv", BUDGET, "").await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    for (file, bytes, message) in [
+        ("tool.exe", &b"MZ"[..], "Choose a CSV, Excel (.xlsx) or Parquet file."),
+        ("old.xls", &b"\xd0\xcf"[..], "Save it as .xlsx"),
+        ("empty.csv", &b""[..], "That file is empty."),
+        ("binary.csv", &b"a,b\n\x00\x01"[..], "do not match its name"),
+        ("fake.parquet", &b"a,b\n1,2\n"[..], "do not match its name"),
+        ("fake.xlsx", &b"PK\x03\x04 broken"[..], "could not be read"),
+        (
+            "ragged.parquet",
+            &b"PAR1 not really parquet PAR1"[..],
+            "could not be read as a table",
+        ),
+    ] {
+        let reply = upload(&site, &bob, &csrf, file, bytes, "").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{file}");
+        assert!(reply.body.contains(message), "{file}: {}", reply.body);
+    }
+    assert_eq!(upload_files(&site), 0, "refused files leave nothing behind");
+
+    // A name nobody can trick into a path, and a new name when one is taken.
+    let tricky = upload(&site, &bob, &csrf, "x.csv", BUDGET, "../../sales").await;
+    assert_eq!(tricky.location(), "/datasets/sales_2");
+    let again = upload(&site, &bob, &csrf, "x.csv", BUDGET, "../../sales").await;
+    assert_eq!(again.location(), "/datasets/sales_3");
+    assert!(
+        get(&site, "/datasets/sales", Some(&bob))
+            .await
+            .body
+            .contains("Rows 1–4 of 4"),
+        "the built-in dataset is untouched"
+    );
+    for entry in std::fs::read_dir(site.state.engine.upload_dir().unwrap()).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        assert!(
+            name.len() == 36 && name.ends_with(".csv"),
+            "server-chosen file name, got {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn uploads_respect_the_size_limit() {
+    let mut site = site(false, 100);
+    site.app = Router::new();
+    let mut state = Arc::try_unwrap(site.state).ok().unwrap();
+    state.max_upload_bytes = 1024;
+    let state = Arc::new(state);
+    site.app = crate::app::router(state.clone());
+    site.state = state;
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let big = format!("a,b\n{}", "1,2\n".repeat(2000));
+    let reply = upload(&site, &bob, &csrf, "big.csv", big.as_bytes(), "").await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("That file is too large to add."));
+    // Beyond the request limit the body is cut off before it is read at all.
+    let huge = vec![b'a'; 200 * 1024];
+    assert!(upload(&site, &bob, &csrf, "huge.csv", &huge, "")
+        .await
+        .status
+        .is_client_error());
+    assert!(site.state.accounts.uploads().unwrap().is_empty() && upload_files(&site) == 0);
+}
+
+#[tokio::test]
+async fn excel_uploads_become_datasets_with_real_types() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    for (col, header) in ["member", "joined", "visits"].iter().enumerate() {
+        sheet.write(0, col as u16, *header).unwrap();
+    }
+    let date = rust_xlsxwriter::Format::new().set_num_format("yyyy-mm-dd");
+    for (row, (member, joined, visits)) in [("M-1", "2025-01-05", 3), ("M-2", "2025-02-11", 7)].iter().enumerate() {
+        let r = row as u32 + 1;
+        sheet.write(r, 0, *member).unwrap();
+        sheet
+            .write_with_format(
+                r,
+                1,
+                rust_xlsxwriter::ExcelDateTime::parse_from_str(joined).unwrap(),
+                &date,
+            )
+            .unwrap();
+        sheet.write(r, 2, *visits).unwrap();
+    }
+    let bytes = workbook.save_to_buffer().unwrap();
+    let added = upload(&site, &bob, &csrf, "Members.xlsx", &bytes, "").await;
+    assert_eq!(added.location(), "/datasets/members");
+    let xml = call(
+        &site,
+        "GET",
+        "/odata/$metadata",
+        Call {
+            basic: Some(("bob", USER_PASSWORD)),
+            ..Call::default()
+        },
+    )
+    .await
+    .body;
+    assert!(xml.contains("<Property Name=\"joined\" Type=\"Edm.Date\"/>"), "{xml}");
+    let chart = get(
+        &site,
+        "/datasets/members/chart?agg=sum&measure=visits&group=member",
+        Some(&bob),
+    )
+    .await;
+    assert!(chart.body.contains("<td>M-2</td><td class=\"num\">7</td>"));
+}
+
+#[tokio::test]
+async fn uploads_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts_file = dir.path().join("accounts.sqlite");
+    let uploads = dir.path().join("uploads");
+    {
+        let store = Store::open(&accounts_file).unwrap();
+        let bob = store.create_first_admin("bob", USER_PASSWORD).unwrap();
+        let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+        std::fs::write(uploads.join("0a.csv"), BUDGET).unwrap();
+        engine.add_upload("budget", "0a.csv", beam_engine::Format::Csv).unwrap();
+        store.create_upload("budget", bob.id, "0a.csv").unwrap();
+        store.create_upload("lost", bob.id, "gone.csv").unwrap();
+    }
+    let store = Store::open(&accounts_file).unwrap();
+    let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+    crate::restore_uploads(&engine, &store);
+    assert!(engine.dataset("budget").is_some_and(|d| d.uploaded));
+    assert!(engine.dataset("lost").is_none(), "a missing file is skipped, not fatal");
+}
+
+// ---------------------------------------------------------------- export
+
+#[tokio::test]
+async fn downloads_match_the_view_on_screen() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let csv = get(
+        &site,
+        "/datasets/sales/export.csv?column=region&op=eq&value=EU&sort=amount&dir=desc&cols=order_id&cols=amount",
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(csv.status, StatusCode::OK);
+    assert_eq!(csv.headers[CONTENT_TYPE], "text/csv; charset=utf-8");
+    assert_eq!(csv.headers["content-disposition"], "attachment; filename=\"sales.csv\"");
+    assert_eq!(
+        csv.body.trim_start_matches('\u{feff}'),
+        "order_id,amount\r\n3,30.25\r\n1,10.5\r\n"
+    );
+
+    upload(&site, &bob, &csrf, "budget.csv", BUDGET, "").await;
+    let risky = get(&site, "/datasets/budget/export.csv", Some(&bob)).await;
+    assert!(
+        risky.body.contains(",Sales,'=CMD|' /C calc'!A0,"),
+        "formula neutralised: {}",
+        risky.body
+    );
+
+    let request = Request::builder()
+        .uri("/datasets/sales/export.xlsx?column=region&op=eq&value=EU")
+        .header(HOST, "beam.test:9000")
+        .header(COOKIE, &bob)
+        .body(Body::empty())
+        .unwrap();
+    let response = site.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"sales.xlsx\""
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    use calamine::Reader;
+    let mut workbook: calamine::Xlsx<_> =
+        calamine::open_workbook_from_rs(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    let range = workbook.worksheet_range_at(0).unwrap().unwrap();
+    assert_eq!(range.height(), 3, "header and the two EU rows");
+
+    let bad = get(
+        &site,
+        "/datasets/sales/export.csv?column=amount&op=gt&value=lots",
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get(&site, "/datasets/sales/export.csv", None).await.location(),
+        "/login"
+    );
+}
+
+// ------------------------------------------------------ settings and people
+
+#[tokio::test]
+async fn advanced_mode_adds_tools_without_adding_permissions() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let basic = get(&site, "/datasets/sales", Some(&bob)).await;
+    assert!(
+        basic.body.contains("Download Excel")
+            && !basic.body.contains("Power Query")
+            && !basic.body.contains("starts with")
+    );
+    assert!(get(&site, "/", Some(&bob)).await.body.contains(">Basic</a>"));
+
+    let switched = submit(&site, &bob, &csrf, "/account/mode", &[("mode", "advanced")]).await;
+    assert_eq!(switched.location(), "/account?ok=mode");
+    let advanced = get(&site, "/datasets/sales?cols=region&cols=amount", Some(&bob)).await;
+    assert!(
+        advanced.body.contains("Power Query")
+            && advanced.body.contains("starts with")
+            && advanced.body.contains("Show these columns")
+    );
+    assert!(advanced.body.contains(
+        "<th><a href=\"/datasets/sales?sort=region&amp;dir=asc&amp;cols=region&amp;cols=amount\">region</a></th>"
+    ));
+    assert!(!advanced.body.contains(">order_id</a>"), "only the chosen columns");
+    assert!(advanced
+        .body
+        .contains("http://beam.test:9000/odata/sales?%24select=region%2Camount"));
+    let empty = get(&site, "/datasets/sales?column=shipped_at&op=empty", Some(&bob)).await;
+    assert!(empty.body.contains("Rows 1–1 of 1"));
+    // Still a user: advanced mode opens no administrator pages.
+    assert_eq!(
+        get(&site, "/admin/accounts", Some(&bob)).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    assert_eq!(
+        submit(&site, &bob, &csrf, "/account/mode", &[("mode", "expert")])
+            .await
+            .location(),
+        "/account?error=failed"
+    );
+    assert_eq!(
+        submit(&site, &bob, "wrong", "/account/mode", &[("mode", "basic")])
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn profiles_and_contacts() {
+    let site = site(false, 100);
+    site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap();
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let saved = submit(
+        &site,
+        &bob,
+        &csrf,
+        "/account/profile",
+        &[("display_name", "Bob <b>Reyes</b>"), ("team", "Finance")],
+    )
+    .await;
+    assert_eq!(saved.location(), "/account?ok=profile");
+    let home = get(&site, "/", Some(&bob)).await;
+    assert!(home.body.contains("Bob &lt;b&gt;Reyes&lt;/b&gt;") && !home.body.contains("<b>Reyes"));
+    let too_long = "x".repeat(65);
+    let refused = submit(
+        &site,
+        &bob,
+        &csrf,
+        "/account/profile",
+        &[("display_name", &too_long), ("team", "")],
+    )
+    .await;
+    assert_eq!(refused.location(), "/account?error=profile");
+
+    let people = get(&site, "/people", Some(&bob)).await;
+    assert!(people.body.contains("No contacts yet") && people.body.contains("@cyd") && people.body.contains("@ada"));
+    assert!(get(&site, "/people?q=fin", Some(&bob)).await.body.contains("@bob"));
+    assert!(!get(&site, "/people?q=fin", Some(&bob)).await.body.contains("@cyd"));
+
+    let cyd = account_id(&site, "cyd");
+    let add = submit(
+        &site,
+        &bob,
+        &csrf,
+        &format!("/people/{cyd}/contact"),
+        &[("action", "add")],
+    )
+    .await;
+    assert_eq!(add.location(), "/people?ok=contact-added");
+    assert_eq!(
+        site.state.accounts.contacts(account_id(&site, "bob")).unwrap(),
+        vec![cyd]
+    );
+    // Contacts come first when sharing.
+    upload(&site, &bob, &csrf, "plan.csv", BUDGET, "").await;
+    let sharing = get(&site, "/datasets/plan/share", Some(&bob)).await;
+    assert!(sharing.body.find("Your contacts").unwrap() < sharing.body.find("@cyd").unwrap());
+    let me = account_id(&site, "bob");
+    assert_eq!(
+        submit(
+            &site,
+            &bob,
+            &csrf,
+            &format!("/people/{me}/contact"),
+            &[("action", "add")]
+        )
+        .await
+        .location(),
+        "/people?error=not-found"
+    );
+
+    // Disabled accounts leave the directory and cannot be added.
+    site.state.accounts.set_active(cyd, false).unwrap();
+    assert!(!get(&site, "/people", Some(&bob)).await.body.contains("@cyd"));
+    let remove = submit(
+        &site,
+        &bob,
+        &csrf,
+        &format!("/people/{cyd}/contact"),
+        &[("action", "remove")],
+    )
+    .await;
+    assert_eq!(remove.location(), "/people?ok=contact-removed");
+    assert_eq!(get(&site, "/people", None).await.location(), "/login");
+}
+
+#[test]
+fn a_double_clicked_start_needs_no_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let personal = config::Config::personal(dir.path());
+    assert!(personal.datasets.is_empty() && personal.bind.ip().is_loopback() && personal.public_url.is_none());
+    assert_eq!(personal.accounts, dir.path().join("accounts.sqlite"));
+    assert_eq!(personal.uploads, dir.path().join("uploads"));
+    assert!(
+        config::check_exposure(&personal, 0).is_ok(),
+        "this computer only, so first-run set-up is safe"
+    );
+    // A configuration file with no datasets is now allowed: people add their own.
+    let path = dir.path().join("beam.toml");
+    std::fs::write(&path, "bind = \"127.0.0.1:9999\"\n").unwrap();
+    assert!(config::Config::load(&path).unwrap().datasets.is_empty());
 }

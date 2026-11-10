@@ -1,6 +1,7 @@
 //! Shared state and the route table.
 
-use crate::{auth, chart, feed, web};
+use crate::{auth, chart, export, feed, people, table, uploads, web};
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
@@ -11,14 +12,14 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use beam_accounts::Store;
-use beam_engine::{ColumnType, Engine};
-use beam_odata::{EdmType, EntitySet, Property};
+use beam_engine::Engine;
 use std::sync::Arc;
 
 pub struct AppState {
     pub engine: Engine,
-    pub sets: Vec<EntitySet>,
     pub max_page_size: u64,
+    /// Largest file accepted on the Add data page, in bytes.
+    pub max_upload_bytes: usize,
     pub public_url: Option<String>,
     pub fallback_host: String,
     pub accounts: Store,
@@ -33,35 +34,10 @@ impl AppState {
         public_url: Option<String>,
         fallback_host: String,
     ) -> Self {
-        let sets = engine
-            .datasets()
-            .iter()
-            .map(|d| EntitySet {
-                name: d.name.clone(),
-                key: d.key.clone(),
-                properties: d
-                    .columns
-                    .iter()
-                    .map(|c| Property {
-                        name: c.name.clone(),
-                        edm: match c.ty {
-                            ColumnType::Boolean => EdmType::Boolean,
-                            ColumnType::Int32 => EdmType::Int32,
-                            ColumnType::Int64 => EdmType::Int64,
-                            ColumnType::Float64 => EdmType::Double,
-                            ColumnType::Decimal { precision, scale } => EdmType::Decimal { precision, scale },
-                            ColumnType::Text => EdmType::String,
-                            ColumnType::Date => EdmType::Date,
-                            ColumnType::Timestamp => EdmType::DateTimeOffset,
-                        },
-                    })
-                    .collect(),
-            })
-            .collect();
         Self {
             engine,
-            sets,
             max_page_size,
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_MB * 1024 * 1024,
             public_url,
             fallback_host,
             accounts,
@@ -77,7 +53,11 @@ impl AppState {
     }
 }
 
+pub const DEFAULT_MAX_UPLOAD_MB: usize = 50;
+
 pub fn router(state: Arc<AppState>) -> Router {
+    // Room for the form's other fields around the file itself.
+    let upload_limit = state.max_upload_bytes.saturating_add(64 * 1024);
     let feed = Router::new()
         .route("/odata", get(feed::service_document))
         .route("/odata/", get(feed::service_document))
@@ -91,8 +71,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/setup", get(web::setup_form).post(web::setup))
         .route("/login", get(web::login_form).post(web::login))
         .route("/logout", post(web::logout))
-        .route("/datasets/{name}", get(web::dataset))
+        .route("/datasets/{name}", get(table::dataset))
         .route("/datasets/{name}/chart", get(chart::chart))
+        .route("/datasets/{name}/export.csv", get(export::csv))
+        .route("/datasets/{name}/export.xlsx", get(export::excel))
+        .route("/datasets/{name}/share", get(uploads::sharing).post(uploads::share))
+        .route("/datasets/{name}/share/{account}/remove", post(uploads::unshare))
+        .route("/datasets/{name}/delete", post(uploads::delete))
+        .route("/data/new", get(uploads::upload_form))
+        .route(
+            "/data",
+            post(uploads::upload).layer(DefaultBodyLimit::max(upload_limit)),
+        )
+        .route("/people", get(people::people))
+        .route("/people/{id}/contact", post(people::contact))
+        .route("/account/mode", post(web::set_mode))
+        .route("/account/profile", post(web::set_profile))
         .route("/account", get(web::account))
         .route("/account/password", post(web::change_password))
         .route("/admin/accounts", get(web::accounts).post(web::create_account))

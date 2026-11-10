@@ -6,3 +6,4 @@
 *.duckdb
 *.duckdb.wal
 .env
+/beam-uploads/

@@ -2,11 +2,16 @@
 
 mod app;
 mod auth;
+mod catalog;
 mod chart;
 mod config;
+mod export;
 mod feed;
+mod people;
+mod table;
 #[cfg(test)]
 mod tests;
+mod uploads;
 mod web;
 
 use beam_accounts::{Role, Store};
@@ -22,9 +27,14 @@ use std::sync::Arc;
     about = "Open Beam: explore your data and serve it to Excel, Power BI and other tools"
 )]
 struct Cli {
-    /// Path to the configuration file.
-    #[arg(short, long, default_value = "beam.toml", global = true)]
-    config: PathBuf,
+    /// Path to the configuration file. Without one, Open Beam uses beam.toml
+    /// in the current folder if there is one, and otherwise starts with
+    /// personal settings in an OpenBeam folder in your home folder.
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+    /// Do not open a browser window on start.
+    #[arg(long, global = true)]
+    no_browser: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -40,10 +50,14 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let outcome = match cli.command {
-        Some(Command::CreateAdmin { username }) => create_admin(&cli.config, &username),
-        Some(Command::Serve) | None => serve(&cli.config).await,
+    let outcome = match load_config(cli.config.as_deref()) {
+        Err(message) => Err(message),
+        Ok((config, personal)) => match cli.command {
+            Some(Command::CreateAdmin { username }) => create_admin(&config, &username),
+            Some(Command::Serve) | None => serve(config, personal && !cli.no_browser).await,
+        },
     };
+
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -57,23 +71,75 @@ fn open_accounts(config: &config::Config) -> Result<Store, String> {
     Store::open(&config.accounts).map_err(|e| format!("cannot open {}: {e}", config.accounts.display()))
 }
 
-fn create_admin(config_path: &std::path::Path, username: &str) -> Result<(), String> {
-    let config = config::Config::load(config_path)?;
+/// The configuration to use, and whether it is the personal default.
+fn load_config(path: Option<&std::path::Path>) -> Result<(config::Config, bool), String> {
+    if let Some(path) = path {
+        return Ok((config::Config::load(path)?, false));
+    }
+    let local = std::path::Path::new("beam.toml");
+    if local.exists() {
+        return Ok((config::Config::load(local)?, false));
+    }
+    let dir = config::personal_dir().ok_or("cannot find your home folder; pass --config")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    Ok((config::Config::personal(&dir), true))
+}
+
+/// Opens the address in the default browser. Failure is harmless: the
+/// address is also printed.
+fn open_browser(url: &str) {
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    let _ = command
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+fn create_admin(config: &config::Config, username: &str) -> Result<(), String> {
     let password = std::env::var(config::ADMIN_PASSWORD_ENV)
         .map_err(|_| format!("set {} to the new administrator's password", config::ADMIN_PASSWORD_ENV))?;
-    let account = open_accounts(&config)?
+    let account = open_accounts(config)?
         .create(username, &password, Role::Admin)
         .map_err(|e| e.to_string())?;
     println!("Created administrator '{}'.", account.username);
     Ok(())
 }
 
-async fn serve(config_path: &std::path::Path) -> Result<(), String> {
-    let config = config::Config::load(config_path)?;
+/// Re-adds the datasets people uploaded before the last restart. One that
+/// cannot be read is reported and skipped; the rest still start.
+fn restore_uploads(engine: &beam_engine::Engine, accounts: &Store) {
+    if engine.upload_dir().is_none() {
+        return;
+    }
+    for upload in accounts.uploads().unwrap_or_default() {
+        let format = if upload.file.ends_with(".parquet") {
+            beam_engine::Format::Parquet
+        } else {
+            beam_engine::Format::Csv
+        };
+        if let Err(e) = engine.add_upload(&upload.name, &upload.file, format) {
+            eprintln!("beam: uploaded dataset '{}' is unavailable: {e}", upload.name);
+        }
+    }
+}
+
+async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let accounts = open_accounts(&config)?;
     let account_count = accounts.count().map_err(|e| e.to_string())?;
     config::check_exposure(&config, account_count)?;
-    let engine = beam_engine::Engine::open(&config.dataset_specs()).map_err(|e| e.to_string())?;
+    let upload_dir = (config.max_upload_mb > 0).then_some(config.uploads.as_path());
+    let engine =
+        beam_engine::Engine::open_with_uploads(&config.dataset_specs(), upload_dir).map_err(|e| e.to_string())?;
+    restore_uploads(&engine, &accounts);
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
@@ -90,14 +156,19 @@ async fn serve(config_path: &std::path::Path) -> Result<(), String> {
     if account_count == 0 {
         println!("  No accounts yet. Open the address above to create the administrator.");
     }
+    println!("  Keep this window open while you use Open Beam. Close it to stop.");
+    if open {
+        open_browser(&format!("{base}/"));
+    }
 
-    let state = app::AppState::new(
+    let mut state = app::AppState::new(
         engine,
         accounts,
         config.max_page_size,
         config.public_url,
         address.to_string(),
     );
+    state.max_upload_bytes = config.max_upload_mb.saturating_mul(1024 * 1024);
     axum::serve(listener, app::router(Arc::new(state)))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

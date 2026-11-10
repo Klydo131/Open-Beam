@@ -120,3 +120,33 @@ td.null { color: var(--muted); }
 .chart .tick { fill: var(--muted); }
 th.num { text-align: right; }
 .panel + .tablewrap { margin-top: 1.25rem; }
+
+/* Add data, sharing, people and settings. */
+.titlebar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.titlebar h1 { margin-bottom: 0.5rem; }
+.actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+a.button { display: inline-block; font-weight: 600; color: var(--accent-ink); background: var(--accent); border: 1px solid var(--accent); border-radius: 6px; padding: 0.45rem 0.9rem; }
+a.button:hover { text-decoration: none; filter: brightness(1.08); }
+a.button.quiet { color: var(--text); background: transparent; border-color: var(--border); font-weight: 500; }
+h2.section { margin: 1.5rem 0 0.75rem; color: var(--muted); font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.lead { color: var(--muted); max-width: 46rem; }
+.muted { color: var(--muted); }
+.mode { text-decoration: none; }
+.mode:hover { color: var(--text); border-color: var(--accent); }
+.people { list-style: none; margin: 0; padding: 0; }
+.people li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; padding: 0.6rem 0; border-bottom: 1px solid var(--border); }
+.people li:last-child { border-bottom: 0; }
+label.check, label.choice { display: flex; align-items: flex-start; gap: 0.5rem; font-weight: 400; margin: 0.5rem 0; }
+label.check input, label.choice input { margin-top: 0.3rem; }
+.tools summary { cursor: pointer; font-weight: 600; }
+.tools[open] summary { margin-bottom: 0.75rem; }
+.columns { display: flex; flex-wrap: wrap; gap: 0 1.25rem; align-items: center; }
+.columns button { margin-top: 0.5rem; }
+input.copy, textarea.copy { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85rem; }
+.destinations { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.6rem; }
+.destinations li { display: grid; grid-template-columns: 9rem 1fr; gap: 0.75rem; }
+@media (max-width: 40rem) { .destinations li { grid-template-columns: 1fr; gap: 0.1rem; } }
+.tablewrap + .pager + .panel, .pager + .panel { margin-top: 1.25rem; }
+.danger { border-color: var(--danger); }
+button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+input[type="file"] { width: 100%; padding: 0.6rem; border-style: dashed; }

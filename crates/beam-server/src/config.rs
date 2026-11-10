@@ -21,6 +21,13 @@ pub struct Config {
     /// SQLite file that holds accounts and sessions. Created on first run.
     #[serde(default = "default_accounts")]
     pub accounts: PathBuf,
+    /// Folder for data people add in the browser. Created on first run.
+    #[serde(default = "default_uploads")]
+    pub uploads: PathBuf,
+    /// Largest file accepted on the Add data page, in megabytes. 0 turns
+    /// adding data off.
+    #[serde(default = "default_max_upload_mb")]
+    pub max_upload_mb: usize,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
 }
@@ -52,17 +59,40 @@ fn default_accounts() -> PathBuf {
     PathBuf::from("beam-accounts.sqlite")
 }
 
+fn default_uploads() -> PathBuf {
+    PathBuf::from("beam-uploads")
+}
+
+fn default_max_upload_mb() -> usize {
+    crate::app::DEFAULT_MAX_UPLOAD_MB
+}
+
 fn default_page_size() -> u64 {
     5000
 }
 
+/// Where Open Beam keeps its files when started without a configuration
+/// file: a folder named `OpenBeam` in the person's home folder.
+pub fn personal_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join("OpenBeam"))
+}
+
 impl Config {
+    /// The settings used when Open Beam is simply double-clicked: this
+    /// computer only, no built-in datasets, accounts and uploads in `dir`.
+    pub fn personal(dir: &Path) -> Self {
+        let mut config: Config = toml::from_str("").unwrap_or_else(|_| unreachable!("every setting has a default"));
+        config.accounts = dir.join("accounts.sqlite");
+        config.uploads = dir.join("uploads");
+        config
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let mut config: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        if config.datasets.is_empty() {
-            return Err(format!("{}: define at least one [[dataset]]", path.display()));
-        }
         if config.max_page_size == 0 {
             return Err("max_page_size must be at least 1".into());
         }
@@ -77,6 +107,10 @@ impl Config {
         // Dataset paths are relative to the config file, not the working directory.
         let base = path.parent().unwrap_or(Path::new("."));
         config.accounts = base.join(&config.accounts);
+        config.uploads = base.join(&config.uploads);
+        if config.max_upload_mb > 4096 {
+            return Err("max_upload_mb must be at most 4096".into());
+        }
         for dataset in &mut config.datasets {
             match (&mut dataset.path, &dataset.sql, dataset.format) {
                 (Some(path), None, _) => *path = base.join(&*path),
