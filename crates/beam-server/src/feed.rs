@@ -65,26 +65,45 @@ fn to_params(literals: &[Literal]) -> Vec<Param> {
         .collect()
 }
 
-/// Runs a planned statement off the async runtime. Engine errors at this
-/// point come from the client's values (for example an impossible date), so
-/// they are reported as a bad request; the detail goes to the server log only.
+/// Why a planned statement returned nothing. Deliberately tiny: each caller
+/// decides how to present it, and an error value should not be as large as a
+/// whole HTTP response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFailure {
+    /// The engine refused the statement, which at this point means one of the
+    /// client's values was unusable (for example an impossible date).
+    Rejected,
+    Internal,
+}
+
+impl QueryFailure {
+    fn response(self) -> Response {
+        match self {
+            QueryFailure::Rejected => error(StatusCode::BAD_REQUEST, "The query could not be executed"),
+            QueryFailure::Internal => error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
+        }
+    }
+}
+
+/// Runs a planned statement off the async runtime. The engine's own error
+/// text goes to the server log only, never to the client.
 pub async fn run(
     state: &Arc<AppState>,
     sql: String,
     literals: &[Literal],
     width: usize,
-) -> Result<Vec<Vec<Value>>, Response> {
+) -> Result<Vec<Vec<Value>>, QueryFailure> {
     let (state, params) = (state.clone(), to_params(literals));
     let outcome = tokio::task::spawn_blocking(move || state.engine.query(&sql, &params, width)).await;
     match outcome {
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(e)) => {
             eprintln!("query failed: {e}");
-            Err(error(StatusCode::BAD_REQUEST, "The query could not be executed"))
+            Err(QueryFailure::Rejected)
         }
         Err(e) => {
             eprintln!("query task failed: {e}");
-            Err(error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"))
+            Err(QueryFailure::Internal)
         }
     }
 }
@@ -113,7 +132,7 @@ pub async fn collection(
     };
     let mut rows = match run(&state, plan.rows_sql.clone(), &plan.rows_params, plan.columns.len()).await {
         Ok(rows) => rows,
-        Err(response) => return response,
+        Err(failure) => return failure.response(),
     };
 
     let base = format!("{}/odata", base_url(&state, &headers));
@@ -143,7 +162,7 @@ pub async fn collection(
     if let Some(count_sql) = &plan.count_sql {
         match run(&state, count_sql.clone(), &plan.count_params, 1).await {
             Ok(result) => body.insert("@odata.count".into(), result[0][0].clone()),
-            Err(response) => return response,
+            Err(failure) => return failure.response(),
         };
     }
 
@@ -188,6 +207,6 @@ pub async fn count(
     let sql = plan.count_sql.unwrap_or_default();
     match run(&state, sql, &plan.count_params, 1).await {
         Ok(result) => ([(CONTENT_TYPE, "text/plain;charset=utf-8")], result[0][0].to_string()).into_response(),
-        Err(response) => response,
+        Err(failure) => failure.response(),
     }
 }

@@ -5,12 +5,17 @@ changes.
 
 ## Building and testing
 
-You need a [Rust toolchain](https://rustup.rs) (1.88 or newer) and a C++
-compiler. The first build compiles DuckDB and takes several minutes.
+You need [rustup](https://rustup.rs) and a C++ compiler. The compiler version
+is pinned in `rust-toolchain.toml`; rustup installs it automatically, so you
+and CI always run the same compiler and the same lints. The first build
+compiles DuckDB and takes several minutes.
 
 ```bash
 cargo test --workspace
 ```
+
+Always pass `--workspace`. Testing one crate on its own makes Cargo rebuild
+DuckDB from scratch.
 
 Before opening a pull request, run the checks CI runs:
 

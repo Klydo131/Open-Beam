@@ -1,0 +1,5 @@
+# Everyone, including CI, builds with this exact compiler, so a new lint in a
+# newer release cannot break the build unannounced. Raise it deliberately.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
