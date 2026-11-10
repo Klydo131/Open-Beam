@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="t">Open Beam</title>
+  <desc id="d">Open-source analytics in Rust. Your data, in the tools you already use.</desc>
+  <rect width="1280" height="360" rx="28" fill="#0B1F3A"/>
+  <g transform="translate(72 52)"><circle cx="70" cy="128" r="24" fill="none" stroke="#FFB627" stroke-width="12"/><rect x="114" y="108" width="26" height="40" rx="6" fill="#FFB627"/><rect x="150" y="92" width="26" height="72" rx="6" fill="#2EC4B6"/><rect x="186" y="76" width="26" height="104" rx="6" fill="#5BC0EB"/></g>
+  <text x="360" y="172" font-size="92" font-weight="700" fill="#FFFFFF" letter-spacing="-2">Open Beam</text>
+  <text x="364" y="228" font-size="30" fill="#B8C7DC">Open-source analytics in Rust.</text>
+  <text x="364" y="270" font-size="30" fill="#B8C7DC">Your data, in the tools you already use.</text>
+</svg>

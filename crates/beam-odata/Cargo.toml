@@ -1,0 +1,15 @@
+[package]
+name = "beam-odata"
+description = "OData v4 query-option parsing, SQL planning and payload shaping for Open Beam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

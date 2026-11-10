@@ -1,0 +1,6 @@
+/target
+/beam.toml
+/data/
+*.duckdb
+*.duckdb.wal
+.env
