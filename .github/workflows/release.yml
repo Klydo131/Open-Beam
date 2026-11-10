@@ -1,8 +1,14 @@
 name: Release
 
 # Builds ready-to-run downloads when a version tag such as v0.3.0 is pushed,
-# and attaches them to a GitHub release. People who just want to use Open
+# and publishes them as a GitHub release. People who just want to use Open
 # Beam download one of these; nobody needs Rust installed.
+#
+# The release starts as a draft and is published only when every platform
+# has built and passed the full test suite, with a SHA256SUMS.txt file so
+# anyone can check a download is exactly what was built here. If any
+# platform fails, the release stays a draft and nothing is published.
+# Everything here runs on GitHub's free hosted runners for public projects.
 
 on:
   push:
@@ -16,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create the release
+      - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --draft --title "Open Beam $GITHUB_REF_NAME" --generate-notes
@@ -63,3 +69,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir assets && cd assets
+          gh release download "$GITHUB_REF_NAME"
+          sha256sum open-beam-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS.txt --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+

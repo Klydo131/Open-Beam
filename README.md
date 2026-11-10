@@ -47,6 +47,10 @@ you already use, starting with Microsoft Excel and Power BI.
 
 ## Principles
 
+The full list, including the rules every data-combining feature follows, is in
+[docs/PRINCIPLES.md](docs/PRINCIPLES.md).
+
+
 - **Fast.** Queries run on an embedded columnar engine (DuckDB) inside a
   compiled Rust binary. There is no separate database server to install.
 - **Secure by default.** Open Beam listens only on your own machine unless you
