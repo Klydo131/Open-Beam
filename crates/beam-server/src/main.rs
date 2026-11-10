@@ -2,6 +2,7 @@
 
 mod app;
 mod auth;
+mod chart;
 mod config;
 mod feed;
 #[cfg(test)]

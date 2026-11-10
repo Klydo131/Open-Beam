@@ -9,19 +9,25 @@ single program on your own computer or server, reads the data you point it at,
 lets your team explore it in the browser, and makes it available to the tools
 you already use, starting with Microsoft Excel and Power BI.
 
-> **Status: early release (0.2).** The web interface, accounts and the data
-> feed for Excel and Power BI work and are covered by automated tests. Charts,
-> dashboards and database connections are still to come. See the
+> **Status: early release (0.2).** The web interface, charts, accounts and the
+> data feed for Excel and Power BI work and are covered by automated tests.
+> Dashboards and database connections are still to come. See the
 > [roadmap](docs/ROADMAP.md).
 
 <p align="center">
   <img src="docs/images/screens/table.png" alt="A dataset in the Open Beam web interface, filtered to one region and sorted by units." width="100%">
 </p>
 
+<p align="center">
+  <img src="docs/images/screens/chart.png" alt="A bar chart of units sold by product in the Open Beam web interface." width="100%">
+</p>
+
 ## What you get
 
 - **A web interface.** Sign in, browse your datasets, sort, filter and page
   through them. No scripts run in the browser.
+- **Charts.** Summarise any dataset as bars or a line: counts, sums and
+  averages, grouped by a column or by day, month, quarter or year.
 - **Accounts with two roles.** Administrators add people and manage access;
   users read data. See [Manage accounts](docs/guides/05-manage-accounts.md).
 - **A data feed for Excel and Power BI.** Load any dataset with the built-in
@@ -52,8 +58,8 @@ you already use, starting with Microsoft Excel and Power BI.
 
 ## Quick start
 
-You need a [Rust toolchain](https://rustup.rs) (1.88 or newer) and a C++
-compiler. Full instructions for Windows, macOS and Linux are in
+You need [rustup](https://rustup.rs), which installs the right Rust version
+for you, and a C++ compiler. Full instructions for Windows, macOS and Linux are in
 [Install Open Beam](docs/guides/01-install.md).
 
 1. Get the code and build it. The first build compiles the DuckDB engine and

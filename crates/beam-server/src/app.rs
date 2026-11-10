@@ -1,6 +1,6 @@
 //! Shared state and the route table.
 
-use crate::{auth, feed, web};
+use crate::{auth, chart, feed, web};
 use axum::extract::Request;
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
@@ -92,6 +92,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/login", get(web::login_form).post(web::login))
         .route("/logout", post(web::logout))
         .route("/datasets/{name}", get(web::dataset))
+        .route("/datasets/{name}/chart", get(chart::chart))
         .route("/account", get(web::account))
         .route("/account/password", post(web::change_password))
         .route("/admin/accounts", get(web::accounts).post(web::create_account))

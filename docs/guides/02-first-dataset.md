@@ -66,7 +66,27 @@ The home page lists your datasets. Select **sales**.
 
 ![A dataset shown as a table with a filter applied](../images/screens/table.png)
 
-## Step 5: Use your own file
+## Step 5: Draw a chart
+
+Select **Chart** above the table.
+
+1. Under **Show**, choose what to measure: the number of rows, or the sum,
+   average, smallest or largest value of a number column.
+2. Under **by**, choose the column to group by.
+3. If you group by a date, choose whether **dates** are grouped by day, month,
+   quarter or year.
+4. Choose **bars** or **a line**, then select **Draw**.
+
+![A bar chart of units sold by product, with the same figures in a table below](../images/screens/chart.png)
+
+The figures behind the chart are listed underneath it. A filter you set on
+the Table view still applies when you switch to the Chart view, so you can
+chart just the rows you are looking at.
+
+Bar charts show the 24 largest groups. Line charts show up to 120 points; if
+there are more, group dates by a longer period.
+
+## Step 6: Use your own file
 
 1. Create a folder named `data` inside the Open Beam folder and put a CSV or
    Parquet file in it. The `data` folder is ignored by Git, so your files are

@@ -83,6 +83,9 @@ with [axum](https://github.com/tokio-rs/axum).
   account. Because password checks are deliberately slow and feed clients send
   credentials with every request, a successful check is remembered for a few
   minutes, keyed by a digest, and forgotten whenever any account changes.
+- **Charts** are SVG drawn on the server from a grouped summary, styled by
+  the page's stylesheet, with the same figures repeated in a table for anyone
+  who cannot see the drawing.
 - Queries and password hashing run on a blocking thread pool so they do not
   stall other requests.
 
@@ -120,8 +123,8 @@ tracked in the [roadmap](ROADMAP.md).
   `beam-engine`.
 - **Database sources.** Datasets backed by PostgreSQL and SQLite databases that
   the user operates. Open Beam will hold connection settings only.
-- **Charts and dashboards.** Panels arranged on dashboards, in the style of
-  monitoring tools.
+- **Dashboards.** Several charts arranged as panels on one page, in the style
+  of monitoring tools.
 - **Assistant integrations.** An optional provider interface for language
   models, disabled by default. Users supply their own credentials, which stay
   on their machine. Applications built on Open Beam choose and are responsible

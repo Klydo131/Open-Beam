@@ -104,3 +104,19 @@ td.null { color: var(--muted); }
 .status.on { color: var(--ok); }
 .status.off { color: var(--danger); }
 .pager { display: flex; align-items: center; gap: 1.25rem; margin-top: 0.9rem; color: var(--muted); }
+
+.tabs { display: flex; gap: 0.25rem; margin: 0 0 1rem; border-bottom: 1px solid var(--border); }
+.tabs a { padding: 0.4rem 0.9rem; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs a:hover { color: var(--text); text-decoration: none; }
+.tabs a[aria-current="page"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+
+.chart { display: block; width: 100%; height: auto; max-width: 60rem; font-size: 13px; }
+.chart .bar { fill: var(--accent); }
+.chart .line { fill: none; stroke: var(--accent); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.chart .dot { fill: var(--panel); stroke: var(--accent); stroke-width: 2; }
+.chart .grid { stroke: var(--border); stroke-width: 1; }
+.chart .axis { stroke: var(--muted); stroke-width: 1; }
+.chart .label, .chart .value { fill: var(--text); }
+.chart .tick { fill: var(--muted); }
+th.num { text-align: right; }
+.panel + .tablewrap { margin-top: 1.25rem; }

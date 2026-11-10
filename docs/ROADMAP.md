@@ -33,7 +33,7 @@ Milestones are ordered. Each one should leave the project usable on its own.
 
 ## 0.4 — Charts and dashboards
 
-- [ ] Charts on dataset pages
+- [x] Charts on dataset pages: bars and lines, grouped by column or period
 - [ ] Dashboards built from panels
 - [ ] Saved views
 - [ ] Export to CSV and Excel

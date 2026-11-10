@@ -695,6 +695,89 @@ async fn dataset_pages_show_sort_filter_and_page_through_rows() {
 }
 
 #[tokio::test]
+async fn charts_summarise_a_dataset_as_a_drawing_and_a_table() {
+    let site = site(false, 100);
+    assert_eq!(get(&site, "/datasets/sales/chart", None).await.location(), "/login");
+    let (cookie, _) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let view = |uri: &'static str| {
+        let (site, cookie) = (&site, cookie.as_str());
+        async move { get(site, uri, Some(cookie)).await }
+    };
+
+    // With no choices made: count rows by the first text column, as bars.
+    let default = view("/datasets/sales/chart").await;
+    assert_eq!(default.status, StatusCode::OK);
+    assert!(default.body.contains("<h2>Number of rows by region</h2>"));
+    assert!(default.body.contains("<svg class=\"chart\"") && default.body.contains("<rect class=\"bar\""));
+    assert!(default.body.contains("<td>EU</td><td class=\"num\">2</td>"));
+    assert!(default.body.find("<td>EU</td>").unwrap() < default.body.find("<td>US</td>").unwrap());
+    // Data is text inside the drawing too, never markup.
+    assert!(default.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;") && !default.body.contains("<script"));
+
+    let summed = view("/datasets/sales/chart?agg=sum&measure=amount&group=region").await;
+    assert!(summed.body.contains("<h2>Sum of amount by region</h2>"));
+    assert!(summed.body.contains("<td>EU</td><td class=\"num\">40.75</td>"));
+    let averaged = view("/datasets/sales/chart?agg=avg&measure=amount&group=region").await;
+    assert!(averaged.body.contains("<td>EU</td><td class=\"num\">20.38</td>"));
+
+    // Dates group by period, in date order, and draw as a line by default.
+    let monthly = view("/datasets/sales/chart?agg=sum&measure=amount&group=sold_on&bucket=month").await;
+    assert!(monthly.body.contains("<h2>Sum of amount by sold_on (month)</h2>"));
+    assert!(monthly.body.contains("<polyline class=\"line\"") && !monthly.body.contains("<rect class=\"bar\""));
+    assert!(monthly.body.contains("<td>2024-01</td><td class=\"num\">10.5</td>"));
+    assert!(monthly.body.find("<td>2024-01</td>").unwrap() < monthly.body.find("<td>2024-04</td>").unwrap());
+    let quarterly = view("/datasets/sales/chart?agg=sum&measure=amount&group=sold_on&bucket=quarter&kind=bar").await;
+    assert!(quarterly.body.contains("<td>2024-Q1</td><td class=\"num\">60.75</td>"));
+    assert!(quarterly.body.contains("<td>2024-Q2</td><td class=\"num\">40</td>"));
+    assert!(quarterly.body.contains("<rect class=\"bar\"") && !quarterly.body.contains("<polyline"));
+    let yearly = view("/datasets/sales/chart?agg=max&measure=amount&group=sold_on&bucket=year").await;
+    assert!(yearly.body.contains("<td>2024</td><td class=\"num\">40</td>"));
+
+    // A filter set on the table carries over, and limits what is charted.
+    let table = view("/datasets/sales?column=region&op=eq&value=EU").await;
+    assert!(table
+        .body
+        .contains("href=\"/datasets/sales/chart?column=region&amp;op=eq&amp;value=EU\""));
+    let filtered =
+        view("/datasets/sales/chart?column=region&op=eq&value=EU&agg=sum&measure=amount&group=sold_on&bucket=year")
+            .await;
+    assert!(
+        filtered.body.contains("<td>2024</td><td class=\"num\">40.75</td>")
+            && filtered.body.contains("Only rows where")
+    );
+    assert!(filtered
+        .body
+        .contains("href=\"/datasets/sales?column=region&amp;op=eq&amp;value=EU\""));
+    let hostile = view("/datasets/sales/chart?column=region&op=eq&value=x%27%3B+DROP+VIEW+sales%3B+--").await;
+    assert!(hostile.body.contains("There is nothing to chart."));
+    assert!(view("/datasets/sales/chart")
+        .await
+        .body
+        .contains("<td>EU</td><td class=\"num\">2</td>"));
+
+    // Choices that make no sense fall back to something that draws.
+    let nonsense = view("/datasets/sales/chart?group=nope&agg=nope&measure=region&bucket=nope&kind=nope").await;
+    assert!(nonsense.body.contains("<h2>Number of rows by region</h2>"));
+    assert!(view("/datasets/sales/chart?column=amount&op=gt&value=lots")
+        .await
+        .body
+        .contains("Enter a number."));
+
+    // Too many groups are cut off, and the page says so.
+    let crowded = view("/datasets/many/chart?group=label").await;
+    assert!(
+        crowded.body.contains("Showing the first 24 groups")
+            && crowded.body.matches("<rect class=\"bar\"").count() == 24
+    );
+    let ordered = view("/datasets/many/chart?group=id&agg=sum&measure=id").await;
+    assert!(
+        ordered.body.matches("<circle class=\"dot\"").count() == 120 && !ordered.body.contains("Showing the first")
+    );
+
+    assert_eq!(view("/datasets/nope/chart").await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn pages_are_locked_down_and_assets_are_served() {
     let site = site(false, 100);
     let login = get(&site, "/login", None).await;

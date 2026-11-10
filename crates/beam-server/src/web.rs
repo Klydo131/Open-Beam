@@ -38,7 +38,7 @@ type App = State<Arc<AppState>>;
 
 // ---------------------------------------------------------------- responses
 
-fn page(status: StatusCode, markup: Markup) -> Response {
+pub fn page(status: StatusCode, markup: Markup) -> Response {
     (
         status,
         [(CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -51,7 +51,7 @@ fn redirect(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(LOCATION, to.to_string())]).into_response()
 }
 
-fn layout(title: &str, signed: Option<&Signed>, body: Markup) -> Markup {
+pub fn layout(title: &str, signed: Option<&Signed>, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -148,7 +148,7 @@ fn role_label(role: Role) -> &'static str {
 
 /// The signed-in visitor, or the redirect that sends them to sign in (or to
 /// first-time set-up when no account exists yet).
-fn require_signed_in(state: &AppState, headers: &HeaderMap) -> Result<Signed, Response> {
+pub fn require_signed_in(state: &AppState, headers: &HeaderMap) -> Result<Signed, Response> {
     if let Some(signed) = auth::signed_in(state, headers) {
         return Ok(signed);
     }
@@ -436,7 +436,7 @@ pub struct TableQuery {
 
 /// Turns the filter form into an OData `$filter` expression. Values are
 /// written as OData literals; the planner then binds them as parameters.
-fn filter_expression(property: &Property, op: &str, value: &str) -> Result<String, &'static str> {
+pub fn filter_expression(property: &Property, op: &str, value: &str) -> Result<String, &'static str> {
     let value = value.trim();
     let name = &property.name;
     if op == "contains" {
@@ -500,8 +500,8 @@ fn table_link(set: &EntitySet, query: &TableQuery, page: u64, sort: Option<(&str
     format!("/datasets/{}{separator}{encoded}", set.name)
 }
 
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
+/// Groups a run of digits in threes: `1234567` becomes `1,234,567`.
+pub fn group_digits(digits: &str) -> String {
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
@@ -510,6 +510,10 @@ fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+fn thousands(n: u64) -> String {
+    group_digits(&n.to_string())
 }
 
 /// Feed timestamps are ISO 8601 with microseconds. On a page, show them the
@@ -608,10 +612,20 @@ pub async fn dataset(
     let last = first + rows.len() as u64 - u64::from(!rows.is_empty());
     let has_next = page_number * PAGE_ROWS < total;
     let filtered = filter_column.is_some() && !filter_value.is_empty();
+    // The Chart view keeps the filter chosen here.
+    let carried: Vec<(&str, &str)> = match (filter_column, filtered && problem.is_none()) {
+        (Some(property), true) => vec![
+            ("column", property.name.as_str()),
+            ("op", query.op.as_deref().unwrap_or("")),
+            ("value", filter_value),
+        ],
+        _ => Vec::new(),
+    };
 
     let body = html! {
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
         h1 { (set.name) }
+        (crate::chart::view_tabs(set, false, &carried))
         form.filter method="get" action={ "/datasets/" (set.name) } {
             @if let Some(column) = sort {
                 input type="hidden" name="sort" value=(column);
