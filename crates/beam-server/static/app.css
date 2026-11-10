@@ -150,3 +150,21 @@ input.copy, textarea.copy { width: 100%; font-family: ui-monospace, SFMono-Regul
 .danger { border-color: var(--danger); }
 button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 input[type="file"] { width: 100%; padding: 0.6rem; border-style: dashed; }
+
+/* Review before saving. */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.9rem; margin: 0 0 1.25rem; }
+.stats > div { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem 1rem; display: flex; flex-direction: column; }
+.stats strong { font-size: 1.6rem; line-height: 1.2; }
+.stats span { color: var(--muted); }
+.stats .good { border-left: 3px solid var(--ok); }
+.stats .good strong { color: var(--ok); }
+.stats .warn { border-left: 3px solid var(--accent); }
+.stats .warn strong { color: var(--accent); }
+.finding { border-left: 3px solid var(--accent); padding: 0.25rem 0 0.25rem 0.9rem; margin: 0 0 1rem; }
+.finding p { margin: 0 0 0.25rem; }
+form.panel h2 + .finding, form.panel h2:first-of-type { margin-top: 0; }
+form.panel .hint + h2 { margin-top: 1.5rem; }
+.columns-found { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: 0.4rem 1.25rem; }
+.columns-found li { display: flex; justify-content: space-between; gap: 0.5rem; border-bottom: 1px solid var(--border); padding: 0.3rem 0; }
+.attention { border-left: 3px solid var(--accent); }
+form.panel .actions { margin-top: 1rem; }

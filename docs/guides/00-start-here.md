@@ -29,7 +29,9 @@ home folder. Your data never leaves your computer.
 
 1. Choose a username and password. You are the administrator.
 2. Select **Add data** and pick a CSV, Excel (.xlsx) or Parquet file.
-3. That's it: your table appears. From there:
+3. Review it: Open Beam points out empty or repeated rows and lets you tidy
+   them, then you press **Save**. Nothing is saved until you do.
+4. Your table appears. From there:
    - **Chart** turns it into bars or a line.
    - **Download Excel** or **Download CSV** takes exactly what you see.
    - **Sharing** lets colleagues with an account see it too.

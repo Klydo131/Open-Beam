@@ -26,6 +26,8 @@ Milestones are ordered. Each one should leave the project usable on its own.
 
 - [x] Add CSV, Excel (.xlsx) and Parquet files from the browser
 - [x] Uploaded datasets are private to their owner until shared
+- [x] Review before saving: private drafts, checks for empty and repeated
+      rows and empty columns, optional tidying applied on read
 - [x] People directory and personal contacts
 - [x] Share and stop sharing dataset by dataset; delete your own datasets
 - [x] Download the current view as Excel or CSV; Google Sheets import guidance

@@ -117,6 +117,16 @@ impl Account {
     }
 }
 
+/// Clean-up applied when a dataset is read. The stored file is never
+/// changed, so what was removed can always be seen again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cleaning {
+    /// Leave out rows in which every cell is empty.
+    pub drop_empty_rows: bool,
+    /// Keep one copy of rows that are identical in every column.
+    pub drop_duplicate_rows: bool,
+}
+
 /// A dataset a person added through the web interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upload {
@@ -128,7 +138,25 @@ pub struct Upload {
     /// the person uploading.
     pub file: String,
     pub created_at: String,
+    pub cleaning: Cleaning,
 }
+
+/// A file someone added but has not yet reviewed and saved. Drafts are not
+/// datasets: nobody else can see them, and nothing can read them but the
+/// review page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub id: i64,
+    pub owner_id: i64,
+    /// File name inside the upload directory, chosen by the server.
+    pub file: String,
+    /// The name of the file on the person's computer, for display only.
+    pub original_name: String,
+    pub created_at: String,
+}
+
+const UPLOAD_COLUMNS: &str = "id, name, owner_id, file, created_at, drop_empty_rows, drop_duplicate_rows";
+const DRAFT_COLUMNS: &str = "id, owner_id, file, original_name, created_at";
 
 pub const MAX_PROFILE_CHARS: usize = 64;
 
@@ -206,6 +234,13 @@ impl Store {
                  file       TEXT NOT NULL UNIQUE,
                  created_at TEXT NOT NULL DEFAULT (datetime('now'))
              );
+             CREATE TABLE IF NOT EXISTS drafts (
+                 id            INTEGER PRIMARY KEY,
+                 owner_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 file          TEXT NOT NULL UNIQUE,
+                 original_name TEXT NOT NULL,
+                 created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+             );
              CREATE TABLE IF NOT EXISTS shares (
                  upload_id  INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
                  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -215,20 +250,23 @@ impl Store {
         )?;
         // Columns added after 0.2. Adding is the only kind of change made to
         // an existing file, so older account files open unchanged.
-        let existing: Vec<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('accounts')")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        for (column, definition) in [
-            ("display_name", "TEXT"),
-            ("team", "TEXT"),
+        for (table, column, definition) in [
+            ("accounts", "display_name", "TEXT"),
+            ("accounts", "team", "TEXT"),
             (
+                "accounts",
                 "mode",
                 "TEXT NOT NULL DEFAULT 'basic' CHECK (mode IN ('basic', 'advanced'))",
             ),
+            ("uploads", "drop_empty_rows", "INTEGER NOT NULL DEFAULT 0"),
+            ("uploads", "drop_duplicate_rows", "INTEGER NOT NULL DEFAULT 0"),
         ] {
+            let existing: Vec<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
             if !existing.iter().any(|name| name == column) {
-                conn.execute_batch(&format!("ALTER TABLE accounts ADD COLUMN {column} {definition}"))?;
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
             }
         }
         let decoy_hash = hash_password(&random_token()?)?;
@@ -459,7 +497,7 @@ impl Store {
         );
         match inserted {
             Ok(_) => Ok(conn.query_row(
-                "SELECT id, name, owner_id, file, created_at FROM uploads WHERE id = ?1",
+                &format!("SELECT {UPLOAD_COLUMNS} FROM uploads WHERE id = ?1"),
                 [conn.last_insert_rowid()],
                 read_upload,
             )?),
@@ -470,9 +508,97 @@ impl Store {
         }
     }
 
+    // ------------------------------------------------------------ drafts
+
+    pub fn create_draft(&self, owner: i64, file: &str, original_name: &str) -> Result<Draft, AccountError> {
+        let original: String = original_name.chars().filter(|c| !c.is_control()).take(200).collect();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO drafts (owner_id, file, original_name) VALUES (?1, ?2, ?3)",
+            params![owner, file, original],
+        )?;
+        Ok(conn.query_row(
+            &format!("SELECT {DRAFT_COLUMNS} FROM drafts WHERE id = ?1"),
+            [conn.last_insert_rowid()],
+            read_draft,
+        )?)
+    }
+
+    pub fn draft(&self, id: i64) -> Result<Option<Draft>, AccountError> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {DRAFT_COLUMNS} FROM drafts WHERE id = ?1"),
+                [id],
+                read_draft,
+            )
+            .optional()?)
+    }
+
+    pub fn drafts_of(&self, owner: i64) -> Result<Vec<Draft>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {DRAFT_COLUMNS} FROM drafts WHERE owner_id = ?1 ORDER BY id"
+        ))?;
+        let drafts = statement.query_map([owner], read_draft)?.collect::<Result<_, _>>()?;
+        Ok(drafts)
+    }
+
+    /// Drafts nobody saved or discarded within `days` days.
+    pub fn expired_drafts(&self, days: u32) -> Result<Vec<Draft>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {DRAFT_COLUMNS} FROM drafts WHERE created_at <= datetime('now', ?1)"
+        ))?;
+        let drafts = statement
+            .query_map([format!("-{days} days")], read_draft)?
+            .collect::<Result<_, _>>()?;
+        Ok(drafts)
+    }
+
+    pub fn delete_draft(&self, id: i64) -> Result<(), AccountError> {
+        if self.conn().execute("DELETE FROM drafts WHERE id = ?1", [id])? == 0 {
+            return Err(AccountError::UploadNotFound);
+        }
+        Ok(())
+    }
+
+    /// Turns a reviewed draft into a dataset in one step: either both the
+    /// dataset is recorded and the draft removed, or neither happens.
+    pub fn save_draft(&self, draft: i64, name: &str, cleaning: Cleaning) -> Result<Upload, AccountError> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        let found: Option<(i64, String)> = transaction
+            .query_row("SELECT owner_id, file FROM drafts WHERE id = ?1", [draft], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        let (owner, file) = found.ok_or(AccountError::UploadNotFound)?;
+        let inserted = transaction.execute(
+            "INSERT INTO uploads (name, owner_id, file, drop_empty_rows, drop_duplicate_rows) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, owner, file, cleaning.drop_empty_rows, cleaning.drop_duplicate_rows],
+        );
+        match inserted {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                return Err(AccountError::NameTaken)
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let id = transaction.last_insert_rowid();
+        transaction.execute("DELETE FROM drafts WHERE id = ?1", [draft])?;
+        let upload = transaction.query_row(
+            &format!("SELECT {UPLOAD_COLUMNS} FROM uploads WHERE id = ?1"),
+            [id],
+            read_upload,
+        )?;
+        transaction.commit()?;
+        Ok(upload)
+    }
+
     pub fn uploads(&self) -> Result<Vec<Upload>, AccountError> {
         let conn = self.conn();
-        let mut statement = conn.prepare("SELECT id, name, owner_id, file, created_at FROM uploads ORDER BY name")?;
+        let mut statement = conn.prepare(&format!("SELECT {UPLOAD_COLUMNS} FROM uploads ORDER BY name"))?;
         let uploads = statement.query_map([], read_upload)?.collect::<Result<_, _>>()?;
         Ok(uploads)
     }
@@ -481,7 +607,7 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, name, owner_id, file, created_at FROM uploads WHERE name = ?1",
+                &format!("SELECT {UPLOAD_COLUMNS} FROM uploads WHERE name = ?1"),
                 [name],
                 read_upload,
             )
@@ -609,6 +735,20 @@ fn read_upload(row: &Row<'_>) -> rusqlite::Result<Upload> {
         name: row.get(1)?,
         owner_id: row.get(2)?,
         file: row.get(3)?,
+        created_at: row.get(4)?,
+        cleaning: Cleaning {
+            drop_empty_rows: row.get(5)?,
+            drop_duplicate_rows: row.get(6)?,
+        },
+    })
+}
+
+fn read_draft(row: &Row<'_>) -> rusqlite::Result<Draft> {
+    Ok(Draft {
+        id: row.get(0)?,
+        owner_id: row.get(1)?,
+        file: row.get(2)?,
+        original_name: row.get(3)?,
         created_at: row.get(4)?,
     })
 }
@@ -928,5 +1068,51 @@ mod tests {
         drop(store);
         // Opening again must not try to add the columns twice.
         assert_eq!(Store::open(&path).unwrap().count().unwrap(), 1);
+    }
+
+    #[test]
+    fn drafts_are_saved_into_datasets_all_or_nothing() {
+        let (store, admin) = store_with_admin();
+        let draft = store.create_draft(admin.id, "f1.csv", "Budget\u{0}.csv").unwrap();
+        assert_eq!(draft.original_name, "Budget.csv", "control characters are dropped");
+        assert_eq!(store.drafts_of(admin.id).unwrap(), vec![draft.clone()]);
+        assert!(store.uploads().unwrap().is_empty(), "a draft is not a dataset");
+
+        store.create_upload("budget", admin.id, "other.csv").unwrap();
+        let cleaning = Cleaning {
+            drop_empty_rows: true,
+            drop_duplicate_rows: false,
+        };
+        assert!(matches!(
+            store.save_draft(draft.id, "BUDGET", cleaning),
+            Err(AccountError::NameTaken)
+        ));
+        assert_eq!(
+            store.drafts_of(admin.id).unwrap().len(),
+            1,
+            "a failed save keeps the draft"
+        );
+
+        let saved = store.save_draft(draft.id, "budget_2", cleaning).unwrap();
+        assert_eq!((saved.file.as_str(), saved.cleaning), ("f1.csv", cleaning));
+        assert_eq!(store.upload_named("budget_2").unwrap().unwrap().cleaning, cleaning);
+        assert!(store.drafts_of(admin.id).unwrap().is_empty());
+        assert!(matches!(
+            store.save_draft(draft.id, "again", cleaning),
+            Err(AccountError::UploadNotFound)
+        ));
+
+        let old = store.create_draft(admin.id, "f2.csv", "old.csv").unwrap();
+        assert!(store.expired_drafts(7).unwrap().is_empty());
+        store
+            .conn()
+            .execute("UPDATE drafts SET created_at = datetime('now', '-8 days')", [])
+            .unwrap();
+        assert_eq!(
+            store.expired_drafts(7).unwrap(),
+            vec![store.draft(old.id).unwrap().unwrap()]
+        );
+        store.delete_draft(old.id).unwrap();
+        assert!(matches!(store.delete_draft(old.id), Err(AccountError::UploadNotFound)));
     }
 }

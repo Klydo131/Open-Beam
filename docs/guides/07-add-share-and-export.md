@@ -7,7 +7,26 @@
    - **CSV** (also `.tsv` and `.txt`)
    - **Excel workbook** (`.xlsx`). The first sheet is used, and dates stay dates.
    - **Parquet**
-3. Select **Add data**. The table opens straight away.
+3. Select **Upload and review**.
+4. Check the review page:
+   - **Checks** points out rows that are completely empty, rows that repeat
+     an earlier row exactly, and columns with no values. Tick what you want
+     tidied. Empty rows are ticked for you; repeated rows are left to you,
+     because sometimes identical rows are genuine.
+   - **Name** is suggested from the file name. Change it if you like.
+   - The first rows are shown so you can see the file was read correctly.
+5. Select **Save dataset**. Only now does it become a dataset that can be
+   charted, shared and opened in Excel or Power BI.
+
+Until you save, the file is a draft that only you can see, not even
+administrators. **Discard draft** deletes it. Drafts you neither save nor
+discard are deleted after 7 days. Files you haven't reviewed yet are listed on
+the Datasets page under **Waiting for your review**.
+
+Tidying never edits your file. It is applied whenever the dataset is read, so
+the original is always there.
+
+![The review page: checks for empty and repeated rows, the name, and a preview](../images/screens/review.png)
 
 The first row should hold the column names. Files are limited to 50 MB by
 default; an administrator can change this with `max_upload_mb` in

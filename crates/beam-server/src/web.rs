@@ -201,6 +201,7 @@ pub fn notice(query: &HashMap<String, String>) -> Markup {
         Some("deleted") => Some("Dataset deleted."),
         Some("contact-added") => Some("Added to your contacts."),
         Some("contact-removed") => Some("Removed from your contacts."),
+        Some("discarded") => Some("Draft discarded."),
         _ => None,
     };
     let error = match query.get("error").map(String::as_str) {
@@ -214,6 +215,7 @@ pub fn notice(query: &HashMap<String, String>) -> Markup {
         Some("role") => Some("Choose a role.".to_string()),
         Some("profile") => Some(AccountError::InvalidProfile.to_string()),
         Some("confirm") => Some("Tick the box to confirm.".to_string()),
+        Some("name-taken") => Some("That dataset name is already in use. Choose another.".to_string()),
         Some(_) => Some("That did not work. Please try again.".to_string()),
         None => None,
     };
@@ -395,6 +397,7 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
     };
     let me = &signed.session.account;
     let entries = catalog::visible(&state, me);
+    let drafts = state.accounts.drafts_of(me.id).unwrap_or_default();
     let people = state.accounts.list().unwrap_or_default();
     let owner_name = |id: i64| {
         people
@@ -434,7 +437,21 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
             div.actions { a.button href="/data/new" { "Add data" } }
         }
         (notice(&query))
-        @if entries.is_empty() {
+        @if !drafts.is_empty() {
+            section.panel.attention {
+                h2 { "Waiting for your review" }
+                p.hint { "Only you can see these. Review each one and press Save to turn it into a dataset." }
+                ul.people {
+                    @for draft in &drafts {
+                        li {
+                            span { strong { (draft.original_name) } span.muted { " · added " (draft.created_at.get(..16).unwrap_or("")) " UTC" } }
+                            a.button href={ "/data/drafts/" (draft.id) } { "Review" }
+                        }
+                    }
+                }
+            }
+        }
+        @if entries.is_empty() && drafts.is_empty() {
             section.panel.narrow {
                 h2 { "Start with your own data" }
                 p { "Add a CSV, Excel or Parquet file. You can explore it here, chart it, share it with colleagues, and open it in Excel or Power BI." }

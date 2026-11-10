@@ -943,15 +943,31 @@ async fn hostile_feed_input_is_rejected_or_inert() {
 
 const CYD_PASSWORD: &str = "a third long password";
 
-/// Sends a multipart form, as a browser does for a file upload.
+/// Uploads a file and saves the resulting draft, as a person does with the
+/// Add data page and then Save on the review page. Returns the reply to
+/// whichever step stopped first.
 async fn upload(site: &Site, cookie: &str, csrf: &str, file_name: &str, bytes: &[u8], name: &str) -> Reply {
+    let drafted = upload_draft(site, cookie, csrf, file_name, bytes).await;
+    let Some(id) = drafted.location().strip_prefix("/data/drafts/").map(str::to_string) else {
+        return drafted;
+    };
+    submit(
+        site,
+        cookie,
+        csrf,
+        &format!("/data/drafts/{id}/save"),
+        &[("name", name)],
+    )
+    .await
+}
+
+/// Sends a multipart form, as a browser does for a file upload.
+async fn upload_draft(site: &Site, cookie: &str, csrf: &str, file_name: &str, bytes: &[u8]) -> Reply {
     let boundary = "----beamtestboundary";
     let mut body = Vec::new();
-    for (field, value) in [("csrf", csrf), ("name", name)] {
-        body.extend_from_slice(
-            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n").as_bytes(),
-        );
-    }
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n").as_bytes(),
+    );
     body.extend_from_slice(
         format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
     );
@@ -1202,10 +1218,11 @@ async fn uploads_reject_bad_files_and_forged_forms() {
     assert_eq!(upload_files(&site), 0, "refused files leave nothing behind");
 
     // A name nobody can trick into a path, and a new name when one is taken.
+    // A typed name is tidied into a plain name, and a name in use is refused on review.
     let tricky = upload(&site, &bob, &csrf, "x.csv", BUDGET, "../../sales").await;
-    assert_eq!(tricky.location(), "/datasets/sales_2");
-    let again = upload(&site, &bob, &csrf, "x.csv", BUDGET, "../../sales").await;
-    assert_eq!(again.location(), "/datasets/sales_3");
+    assert!(tricky.location().contains("error=name-taken"), "{}", tricky.location());
+    let renamed = upload(&site, &bob, &csrf, "x.csv", BUDGET, "../../sales 2").await;
+    assert_eq!(renamed.location(), "/datasets/sales_2");
     assert!(
         get(&site, "/datasets/sales", Some(&bob))
             .await
@@ -1517,4 +1534,188 @@ fn a_double_clicked_start_needs_no_configuration() {
     let path = dir.path().join("beam.toml");
     std::fs::write(&path, "bind = \"127.0.0.1:9999\"\n").unwrap();
     assert!(config::Config::load(&path).unwrap().datasets.is_empty());
+}
+
+// ---------------------------------------------------- review before saving
+
+const REPORTS: &[u8] = b"member,event,note\nM-1,joined,\nM-2,joined,\n,,\nM-1,joined,\nM-3,left,\n,,\n";
+
+#[tokio::test]
+async fn new_files_wait_as_private_drafts_until_saved() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let (ada, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let drafted = upload_draft(&site, &bob, &csrf, "Weekly Reports.csv", REPORTS).await;
+    let review = drafted.location().to_string();
+    assert!(review.starts_with("/data/drafts/"), "{review}");
+
+    // Not a dataset yet: invisible everywhere, even to administrators.
+    assert!(site.state.engine.datasets().iter().all(|d| !d.uploaded));
+    assert!(!get(&site, "/", Some(&ada)).await.body.contains("Weekly Reports.csv"));
+    assert_eq!(get(&site, &review, Some(&ada)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(get(&site, &review, None).await.location(), "/login");
+    let basic = Call {
+        basic: Some(("bob", USER_PASSWORD)),
+        ..Call::default()
+    };
+    assert!(!call(&site, "GET", "/odata/", basic).await.body.contains("weekly"));
+
+    // Its owner is reminded on the home page and sees the checks.
+    assert!(get(&site, "/", Some(&bob))
+        .await
+        .body
+        .contains("Waiting for your review"));
+    let page = get(&site, &review, Some(&bob)).await;
+    assert!(
+        page.body.contains("<strong>6</strong><span>rows</span>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("2 rows are completely empty."));
+    assert!(page.body.contains("1 row repeats an earlier row exactly."));
+    assert!(page.body.contains("No values in: note."));
+    assert!(page.body.contains("value=\"weekly_reports\""), "a name is suggested");
+    assert!(
+        page.body.contains("<td>M-3</td>")
+            && page
+                .body
+                .contains("<strong>member</strong><span class=\"muted\">Text</span>")
+    );
+
+    // Saving needs the form token, then applies only the chosen tidying.
+    let id = review.trim_start_matches("/data/drafts/");
+    let save = format!("/data/drafts/{id}/save");
+    assert_eq!(
+        submit(&site, &bob, "wrong", &save, &[("name", "w")]).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let saved = submit(
+        &site,
+        &bob,
+        &csrf,
+        &save,
+        &[("name", "Weekly Reports"), ("drop_empty", "yes")],
+    )
+    .await;
+    assert_eq!(saved.location(), "/datasets/weekly_reports");
+    assert!(get(&site, "/datasets/weekly_reports", Some(&bob))
+        .await
+        .body
+        .contains("Rows 1–4 of 4"));
+    let saved_upload = site.state.accounts.upload_named("weekly_reports").unwrap().unwrap();
+    assert!(saved_upload.cleaning.drop_empty_rows && !saved_upload.cleaning.drop_duplicate_rows);
+    assert!(!get(&site, "/", Some(&bob))
+        .await
+        .body
+        .contains("Waiting for your review"));
+    assert_eq!(
+        get(&site, &review, Some(&bob)).await.status,
+        StatusCode::NOT_FOUND,
+        "the draft is gone"
+    );
+
+    // Both kinds of tidying together.
+    let second = upload_draft(&site, &bob, &csrf, "again.csv", REPORTS)
+        .await
+        .location()
+        .to_string();
+    let second_save = format!("{second}/save");
+    let both = submit(
+        &site,
+        &bob,
+        &csrf,
+        &second_save,
+        &[("name", ""), ("drop_empty", "yes"), ("drop_duplicates", "yes")],
+    )
+    .await;
+    assert_eq!(both.location(), "/datasets/again");
+    assert!(get(&site, "/datasets/again", Some(&bob))
+        .await
+        .body
+        .contains("Rows 1–3 of 3"));
+}
+
+#[tokio::test]
+async fn drafts_can_be_discarded_and_expire() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let review = upload_draft(&site, &bob, &csrf, "oops.csv", REPORTS)
+        .await
+        .location()
+        .to_string();
+    assert_eq!(upload_files(&site), 1);
+
+    let discard = format!("{review}/discard");
+    assert_eq!(
+        submit(&site, &ada, &ada_csrf, &discard, &[]).await.status,
+        StatusCode::NOT_FOUND,
+        "only the owner"
+    );
+    assert_eq!(
+        submit(
+            &site,
+            &ada,
+            &ada_csrf,
+            &format!("{review}/save"),
+            &[("name", "taken_over")]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        submit(&site, &bob, "wrong", &discard, &[]).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        submit(&site, &bob, &csrf, &discard, &[]).await.location(),
+        "/?ok=discarded"
+    );
+    assert_eq!(upload_files(&site), 0, "the stored copy is deleted");
+    assert!(site
+        .state
+        .accounts
+        .drafts_of(account_id(&site, "bob"))
+        .unwrap()
+        .is_empty());
+
+    upload_draft(&site, &bob, &csrf, "forgotten.csv", REPORTS).await;
+    crate::review::remove_expired_drafts(&site.state.engine, &site.state.accounts, crate::review::DRAFT_DAYS);
+    assert_eq!(upload_files(&site), 1, "a draft added today is kept");
+    // With a limit of zero days every draft counts as expired.
+    crate::review::remove_expired_drafts(&site.state.engine, &site.state.accounts, 0);
+    assert_eq!(upload_files(&site), 0, "an expired draft's file is deleted");
+    assert!(site
+        .state
+        .accounts
+        .drafts_of(account_id(&site, "bob"))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn tidying_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts_file = dir.path().join("accounts.sqlite");
+    let uploads = dir.path().join("uploads");
+    {
+        let store = Store::open(&accounts_file).unwrap();
+        let bob = store.create_first_admin("bob", USER_PASSWORD).unwrap();
+        let _engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+        std::fs::write(uploads.join("0b.csv"), REPORTS).unwrap();
+        let draft = store.create_draft(bob.id, "0b.csv", "r.csv").unwrap();
+        let cleaning = beam_accounts::Cleaning {
+            drop_empty_rows: true,
+            drop_duplicate_rows: true,
+        };
+        store.save_draft(draft.id, "reports", cleaning).unwrap();
+    }
+    let store = Store::open(&accounts_file).unwrap();
+    let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+    crate::restore_uploads(&engine, &store);
+    assert_eq!(
+        engine.query("SELECT count(*) FROM reports", &[], 1).unwrap()[0][0],
+        json!(3)
+    );
 }

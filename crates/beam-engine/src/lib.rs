@@ -52,6 +52,31 @@ pub enum Source {
     Query(String),
 }
 
+/// Clean-up applied when an uploaded dataset is read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cleaning {
+    /// Leave out rows in which every cell is empty.
+    pub drop_empty_rows: bool,
+    /// Keep one copy of rows that are identical in every column.
+    pub drop_duplicate_rows: bool,
+}
+
+/// What a file looks like before it is saved as a dataset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preview {
+    pub columns: Vec<Column>,
+    /// The first rows, every value as text (`null` when empty).
+    pub rows: Vec<Vec<Value>>,
+    pub row_count: u64,
+    /// Rows in which every cell is empty.
+    pub empty_rows: u64,
+    /// Rows that repeat an earlier row exactly, in every column. Empty rows
+    /// are not counted here; they are counted in `empty_rows`.
+    pub duplicate_rows: u64,
+    /// Columns with no values at all.
+    pub empty_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DatasetSpec {
     pub name: String,
@@ -215,6 +240,55 @@ impl Engine {
     /// directory. The file is read once now, so a file that cannot be parsed
     /// is refused here rather than on someone's first request.
     pub fn add_upload(&self, name: &str, file: &str, format: Format) -> Result<Dataset, EngineError> {
+        self.add_upload_cleaned(name, file, format, Cleaning::default())
+    }
+
+    /// Like [`Engine::add_upload`], applying `cleaning` whenever the dataset
+    /// is read. The file itself is never changed.
+    pub fn add_upload_cleaned(
+        &self,
+        name: &str,
+        file: &str,
+        format: Format,
+        cleaning: Cleaning,
+    ) -> Result<Dataset, EngineError> {
+        let (path, base) = self.upload_source(name, file, format)?;
+        let mut datasets = self.datasets.write().unwrap_or_else(|e| e.into_inner());
+        let taken = datasets.iter().any(|d| d.name.eq_ignore_ascii_case(name));
+        if !is_identifier(name) || taken {
+            return Err(EngineError::InvalidName(name.to_string()));
+        }
+        let spec = DatasetSpec {
+            name: name.to_string(),
+            source: Source::File {
+                path,
+                format: Some(format),
+            },
+            key: None,
+        };
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let created = cleaned_source(&conn, &base, cleaning)
+            .and_then(|source| create_view(&conn, &spec, &source))
+            .and_then(|dataset| {
+                conn.execute_batch(&format!("SELECT * FROM {} LIMIT 0", quote_ident(name)))?;
+                Ok(dataset)
+            });
+        match created {
+            Ok(mut dataset) => {
+                dataset.uploaded = true;
+                datasets.push(dataset.clone());
+                Ok(dataset)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)));
+                Err(e)
+            }
+        }
+    }
+
+    /// Checks a file name from the upload directory and returns its path and
+    /// the expression that reads it.
+    fn upload_source(&self, label: &str, file: &str, format: Format) -> Result<(PathBuf, String), EngineError> {
         let dir = self.upload_dir.as_ref().ok_or(EngineError::UploadsDisabled)?;
         let plain = !file.is_empty()
             && file
@@ -222,7 +296,7 @@ impl Engine {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
             && !file.starts_with('.');
         let unreadable = || EngineError::Unreadable {
-            dataset: name.to_string(),
+            dataset: label.to_string(),
             path: PathBuf::from(file),
         };
         if !plain {
@@ -237,37 +311,102 @@ impl Engine {
             Format::Csv => "read_csv",
             Format::Parquet => "read_parquet",
         };
+        let source = format!("{reader}({})", quote_literal(path_text));
+        Ok((path, source))
+    }
 
-        let mut datasets = self.datasets.write().unwrap_or_else(|e| e.into_inner());
-        let taken = datasets.iter().any(|d| d.name.eq_ignore_ascii_case(name));
-        if !is_identifier(name) || taken {
-            return Err(EngineError::InvalidName(name.to_string()));
-        }
+    /// Reads a file from the upload directory without making it a dataset:
+    /// its columns, its first `limit` rows as text, and the problems a person
+    /// should know about before saving it.
+    pub fn preview(&self, file: &str, format: Format, limit: usize) -> Result<Preview, EngineError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let (path, base) = self.upload_source("preview", file, format)?;
+        let name = format!("__preview_{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let spec = DatasetSpec {
-            name: name.to_string(),
+            name: name.clone(),
             source: Source::File {
-                path: path.clone(),
+                path,
                 format: Some(format),
             },
             key: None,
         };
+        let dataset = {
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            create_view(&conn, &spec, &base)?
+        };
+        let result = self.describe_preview(&name, &dataset, limit);
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let source = format!("{reader}({})", quote_literal(path_text));
-        let created = create_view(&conn, &spec, &source).and_then(|dataset| {
-            conn.execute_batch(&format!("SELECT * FROM {} LIMIT 0", quote_ident(name)))?;
-            Ok(dataset)
-        });
-        match created {
-            Ok(mut dataset) => {
-                dataset.uploaded = true;
-                datasets.push(dataset.clone());
-                Ok(dataset)
-            }
-            Err(e) => {
-                let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)));
-                Err(e)
-            }
-        }
+        let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(&name)));
+        result
+    }
+
+    fn describe_preview(&self, view: &str, dataset: &Dataset, limit: usize) -> Result<Preview, EngineError> {
+        let columns: Vec<Column> = dataset.columns.iter().filter(|c| c.name != ROW_KEY).cloned().collect();
+        let idents: Vec<String> = columns.iter().map(|c| quote_ident(&c.name)).collect();
+        let from = quote_ident(view);
+        let number = |rows: Vec<Vec<Value>>, index: usize| {
+            rows.first()
+                .and_then(|r| r.get(index))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+
+        let all_empty = idents
+            .iter()
+            .map(|c| format!("{c} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let counts = self.query(
+            &format!(
+                // Repeats are counted among rows with at least one value, so
+                // blank rows are reported once, as empty, not again as repeats.
+                "SELECT count(*), count(*) FILTER (WHERE {all_empty}), \
+                 count(*) FILTER (WHERE NOT ({all_empty})) \
+                 - (SELECT count(*) FROM (SELECT DISTINCT {cols} FROM {from} WHERE NOT ({all_empty}))) FROM {from}",
+                cols = idents.join(", ")
+            ),
+            &[],
+            3,
+        )?;
+        let filled = self.query(
+            &format!(
+                "SELECT {} FROM {from}",
+                idents
+                    .iter()
+                    .map(|c| format!("count({c})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            &[],
+            idents.len(),
+        )?;
+        let empty_columns = columns
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| number(filled.clone(), *index) == 0)
+            .map(|(_, column)| column.name.clone())
+            .collect();
+        let rows = self.query(
+            &format!(
+                "SELECT {} FROM {from} ORDER BY {} LIMIT {limit}",
+                idents
+                    .iter()
+                    .map(|c| format!("CAST({c} AS VARCHAR)"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                quote_ident(ROW_KEY)
+            ),
+            &[],
+            idents.len(),
+        )?;
+        Ok(Preview {
+            row_count: number(counts.clone(), 0),
+            empty_rows: number(counts.clone(), 1),
+            duplicate_rows: number(counts, 2),
+            empty_columns,
+            columns,
+            rows,
+        })
     }
 
     /// Removes a dataset added with [`Engine::add_upload`]. The file is left
@@ -304,6 +443,30 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// Wraps a file source so that `cleaning` applies whenever it is read.
+fn cleaned_source(conn: &Connection, base: &str, cleaning: Cleaning) -> Result<String, EngineError> {
+    if cleaning == Cleaning::default() {
+        return Ok(base.to_string());
+    }
+    let mut describe = conn.prepare(&format!("DESCRIBE SELECT * FROM {base}"))?;
+    let names: Vec<String> = describe
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    let idents: Vec<String> = names.iter().map(|n| quote_ident(n)).collect();
+    let distinct = if cleaning.drop_duplicate_rows { "DISTINCT " } else { "" };
+    let filter = if cleaning.drop_empty_rows && !idents.is_empty() {
+        let all_empty = idents
+            .iter()
+            .map(|c| format!("{c} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(" WHERE NOT ({all_empty})")
+    } else {
+        String::new()
+    };
+    Ok(format!("(SELECT {distinct}* FROM {base}{filter}) AS cleaned"))
 }
 
 fn create_view(conn: &Connection, spec: &DatasetSpec, source: &str) -> Result<Dataset, EngineError> {
@@ -683,5 +846,68 @@ mod tests {
             Engine::open(&[]).unwrap().add_upload("x_y", "a1.csv", Format::Csv),
             Err(EngineError::UploadsDisabled)
         ));
+    }
+
+    #[test]
+    fn previews_report_problems_and_cleaning_applies_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = Engine::open_with_uploads(&[], Some(&uploads)).unwrap();
+        fs::write(
+            uploads.join("p1.csv"),
+            "member,event,note\nM-1,joined,\nM-2,joined,\n,,\nM-1,joined,\nM-3,left,\n,,\n",
+        )
+        .unwrap();
+
+        let preview = engine.preview("p1.csv", Format::Csv, 3).unwrap();
+        assert_eq!(
+            preview.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["member", "event", "note"]
+        );
+        assert_eq!(
+            (preview.row_count, preview.empty_rows, preview.duplicate_rows),
+            (6, 2, 1)
+        );
+        assert_eq!(preview.empty_columns, vec!["note".to_string()]);
+        assert_eq!(preview.rows.len(), 3);
+        assert_eq!(preview.rows[0], vec![json!("M-1"), json!("joined"), Value::Null]);
+        assert!(engine.datasets().is_empty(), "a preview is not a dataset");
+        assert!(
+            engine.query("SELECT * FROM __preview_1", &[], 0).is_err(),
+            "and leaves nothing behind"
+        );
+
+        let cleaned = Cleaning {
+            drop_empty_rows: true,
+            drop_duplicate_rows: true,
+        };
+        engine
+            .add_upload_cleaned("members", "p1.csv", Format::Csv, cleaned)
+            .unwrap();
+        let count = |sql: &str| engine.query(sql, &[], 1).unwrap()[0][0].clone();
+        assert_eq!(count("SELECT count(*) FROM members"), json!(3));
+        engine
+            .add_upload_cleaned(
+                "members_empty_only",
+                "p1.csv",
+                Format::Csv,
+                Cleaning {
+                    drop_empty_rows: true,
+                    drop_duplicate_rows: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(count("SELECT count(*) FROM members_empty_only"), json!(4));
+        engine.add_upload("members_raw", "p1.csv", Format::Csv).unwrap();
+        assert_eq!(count("SELECT count(*) FROM members_raw"), json!(6));
+        assert_eq!(
+            fs::read_to_string(uploads.join("p1.csv")).unwrap().lines().count(),
+            7,
+            "the file is untouched"
+        );
+
+        assert!(engine.preview("../p1.csv", Format::Csv, 3).is_err());
+        fs::write(uploads.join("bad.parquet"), "nope").unwrap();
+        assert!(engine.preview("bad.parquet", Format::Parquet, 3).is_err());
     }
 }

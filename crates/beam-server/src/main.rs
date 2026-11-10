@@ -8,6 +8,7 @@ mod config;
 mod export;
 mod feed;
 mod people;
+mod review;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -121,12 +122,12 @@ fn restore_uploads(engine: &beam_engine::Engine, accounts: &Store) {
         return;
     }
     for upload in accounts.uploads().unwrap_or_default() {
-        let format = if upload.file.ends_with(".parquet") {
-            beam_engine::Format::Parquet
-        } else {
-            beam_engine::Format::Csv
+        let cleaning = beam_engine::Cleaning {
+            drop_empty_rows: upload.cleaning.drop_empty_rows,
+            drop_duplicate_rows: upload.cleaning.drop_duplicate_rows,
         };
-        if let Err(e) = engine.add_upload(&upload.name, &upload.file, format) {
+        let format = uploads::format_of(&upload.file);
+        if let Err(e) = engine.add_upload_cleaned(&upload.name, &upload.file, format, cleaning) {
             eprintln!("beam: uploaded dataset '{}' is unavailable: {e}", upload.name);
         }
     }
@@ -140,6 +141,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let engine =
         beam_engine::Engine::open_with_uploads(&config.dataset_specs(), upload_dir).map_err(|e| e.to_string())?;
     restore_uploads(&engine, &accounts);
+    review::remove_expired_drafts(&engine, &accounts, review::DRAFT_DAYS);
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

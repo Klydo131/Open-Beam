@@ -1,6 +1,6 @@
 //! Shared state and the route table.
 
-use crate::{auth, chart, export, feed, people, table, uploads, web};
+use crate::{auth, chart, export, feed, people, review, table, uploads, web};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
 use axum::http::header::{
@@ -79,6 +79,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/{name}/share/{account}/remove", post(uploads::unshare))
         .route("/datasets/{name}/delete", post(uploads::delete))
         .route("/data/new", get(uploads::upload_form))
+        .route("/data/drafts/{id}", get(review::review))
+        .route("/data/drafts/{id}/save", post(review::save))
+        .route("/data/drafts/{id}/discard", post(review::discard))
         .route(
             "/data",
             post(uploads::upload).layer(DefaultBodyLimit::max(upload_limit)),

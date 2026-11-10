@@ -15,7 +15,7 @@ use crate::web::{check_csrf, layout, message_page, notice, page, redirect, requi
 use axum::extract::{Form, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use beam_accounts::{Account, AccountError, Mode};
+use beam_accounts::{Account, AccountError};
 use beam_engine::Format;
 use maud::html;
 use serde::Deserialize;
@@ -129,7 +129,7 @@ fn excel_to_csv(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
 
 /// A dataset name derived from what the person typed or the file's name:
 /// lower case, letters, digits and underscores, starting with a letter.
-fn base_name(text: &str) -> String {
+pub fn base_name(text: &str) -> String {
     let mut name = String::new();
     for c in text.trim().chars().flat_map(char::to_lowercase) {
         if c.is_ascii_alphanumeric() {
@@ -161,7 +161,6 @@ fn random_file_name(extension: &str) -> Result<String, &'static str> {
 // ------------------------------------------------------------------ pages
 
 fn upload_page(signed: &Signed, state: &AppState, error: Option<&str>) -> Response {
-    let advanced = signed.session.account.mode == Mode::Advanced;
     let limit_mb = state.max_upload_bytes / (1024 * 1024);
     let status = if error.is_some() {
         StatusCode::BAD_REQUEST
@@ -178,17 +177,17 @@ fn upload_page(signed: &Signed, state: &AppState, error: Option<&str>) -> Respon
                 label for="file" { "File" }
                 input #file name="file" type="file" required accept=".csv,.tsv,.txt,.xlsx,.parquet";
                 p.hint { "CSV, Excel (.xlsx, first sheet) or Parquet, up to " (limit_mb) " MB. The first row should hold the column names." }
-                @if advanced {
-                    label for="name" { "Dataset name (optional)" }
-                    input #name name="name" maxlength="48" placeholder="taken from the file name";
-                    p.hint { "Letters, digits and underscores. This is also its name in Excel and Power BI." }
-                }
-                button type="submit" { "Add data" }
+                button type="submit" { "Upload and review" }
             }
         }
         section.panel.narrow {
-            h2 { "Who can see it" }
-            p { "Only you, and administrators. Share it with colleagues from its " strong { "Sharing" } " tab once it is added." }
+            h2 { "What happens next" }
+            ol {
+                li { "You see a preview and a check for problems such as empty or repeated rows." }
+                li { "You choose a name and whether to tidy those problems." }
+                li { "Only when you press " strong { "Save" } " does it become a dataset. Until then nobody else can see it." }
+            }
+            p.hint { "Once saved, it is visible to you and administrators. Share it from its " strong { "Sharing" } " tab." }
         }
     };
     page(status, layout("Add data", Some(signed), body))
@@ -206,7 +205,7 @@ pub async fn upload(State(state): App, headers: HeaderMap, mut multipart: Multip
         Ok(signed) => signed,
         Err(response) => return response,
     };
-    let (mut csrf, mut name, mut file) = (String::new(), String::new(), None);
+    let (mut csrf, mut file) = (String::new(), None);
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
@@ -221,7 +220,6 @@ pub async fn upload(State(state): App, headers: HeaderMap, mut multipart: Multip
                 };
                 match field_name.as_str() {
                     "csrf" => csrf = String::from_utf8_lossy(&bytes).into_owned(),
-                    "name" => name = String::from_utf8_lossy(&bytes).chars().take(64).collect(),
                     "file" if bytes.len() > state.max_upload_bytes => {
                         let limit = state.max_upload_bytes / (1024 * 1024);
                         let message = if limit == 0 {
@@ -255,36 +253,43 @@ pub async fn upload(State(state): App, headers: HeaderMap, mut multipart: Multip
         Ok(kind) => kind,
         Err(message) => return upload_page(&signed, &state, Some(message)),
     };
-    let wanted = if name.trim().is_empty() {
-        file_name
-            .rsplit_once('.')
-            .map_or(file_name.as_str(), |(stem, _)| stem)
-            .to_string()
-    } else {
-        name
-    };
-
     let owner = signed.session.account.id;
     let worker = state.clone();
-    let added = tokio::task::spawn_blocking(move || add(&worker, owner, &wanted, kind, &bytes))
+    let stored = tokio::task::spawn_blocking(move || store_draft(&worker, owner, &file_name, kind, &bytes))
         .await
         .unwrap_or(Err("Could not add that file. Please try again."));
-    match added {
-        Ok(name) => redirect(&format!("/datasets/{name}")),
+    match stored {
+        Ok(draft) => redirect(&format!("/data/drafts/{draft}")),
         Err(message) => upload_page(&signed, &state, Some(message)),
     }
 }
 
-/// Stores, parses and records an upload. Undoes each step if a later one fails.
-fn add(state: &AppState, owner: i64, wanted: &str, kind: Kind, bytes: &[u8]) -> Result<String, &'static str> {
+/// The format a stored file is read with, from the extension the server gave it.
+pub fn format_of(file: &str) -> Format {
+    if file.ends_with(".parquet") {
+        Format::Parquet
+    } else {
+        Format::Csv
+    }
+}
+
+/// Stores an upload as a draft, after checking the engine can read it as a
+/// table. Returns the draft's id. Leaves nothing behind if any step fails.
+fn store_draft(
+    state: &AppState,
+    owner: i64,
+    original_name: &str,
+    kind: Kind,
+    bytes: &[u8],
+) -> Result<i64, &'static str> {
     let dir = state
         .engine
         .upload_dir()
         .ok_or("Adding data is turned off on this server.")?;
-    let (contents, extension, format) = match kind {
-        Kind::Excel => (std::borrow::Cow::Owned(excel_to_csv(bytes)?), "csv", Format::Csv),
-        Kind::Csv => (std::borrow::Cow::Borrowed(bytes), "csv", Format::Csv),
-        Kind::Parquet => (std::borrow::Cow::Borrowed(bytes), "parquet", Format::Parquet),
+    let (contents, extension) = match kind {
+        Kind::Excel => (std::borrow::Cow::Owned(excel_to_csv(bytes)?), "csv"),
+        Kind::Csv => (std::borrow::Cow::Borrowed(bytes), "csv"),
+        Kind::Parquet => (std::borrow::Cow::Borrowed(bytes), "parquet"),
     };
     let file = random_file_name(extension)?;
     let path = dir.join(&file);
@@ -297,8 +302,23 @@ fn add(state: &AppState, owner: i64, wanted: &str, kind: Kind, bytes: &[u8]) -> 
         let _ = std::fs::remove_file(&path);
         return Err("Could not store that file. Please try again.");
     }
+    if let Err(e) = state.engine.preview(&file, format_of(&file), 1) {
+        eprintln!("upload {file} not readable: {e}");
+        let _ = std::fs::remove_file(&path);
+        return Err("That file could not be read as a table. Check that its first row holds the column names.");
+    }
+    match state.accounts.create_draft(owner, &file, original_name) {
+        Ok(draft) => Ok(draft.id),
+        Err(e) => {
+            eprintln!("draft {file} not recorded: {e}");
+            let _ = std::fs::remove_file(&path);
+            Err("Could not add that file. Please try again.")
+        }
+    }
+}
 
-    // Pick a name nobody is using: sales, sales_2, sales_3, …
+/// A dataset name nobody is using, from what was typed: sales, sales_2, …
+pub fn unused_name(state: &AppState, wanted: &str) -> Option<String> {
     let base = base_name(wanted);
     let names: Vec<String> = state
         .engine
@@ -306,23 +326,9 @@ fn add(state: &AppState, owner: i64, wanted: &str, kind: Kind, bytes: &[u8]) -> 
         .into_iter()
         .map(|d| d.name.to_ascii_lowercase())
         .collect();
-    let name = (1..1000)
+    (1..1000)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}_{n}") })
         .find(|candidate| !names.contains(candidate))
-        .ok_or("Too many datasets share that name. Choose another name.")?;
-
-    if let Err(e) = state.engine.add_upload(&name, &file, format) {
-        eprintln!("upload {file} not added: {e}");
-        let _ = std::fs::remove_file(&path);
-        return Err("That file could not be read as a table. Check that its first row holds the column names.");
-    }
-    if let Err(e) = state.accounts.create_upload(&name, owner, &file) {
-        eprintln!("upload {file} not recorded: {e}");
-        let _ = state.engine.remove(&name);
-        let _ = std::fs::remove_file(&path);
-        return Err("Could not add that file. Please try again.");
-    }
-    Ok(name)
 }
 
 // ---------------------------------------------------------------- sharing

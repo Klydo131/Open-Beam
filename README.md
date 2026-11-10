@@ -24,7 +24,10 @@ you already use, starting with Microsoft Excel and Power BI.
 
 ## What you get
 
-- **Bring your own data.** Add CSV, Excel or Parquet files from the browser.
+- **Bring your own data, checked first.** Add CSV, Excel or Parquet files from
+  the browser. Each file waits as a private draft while you review it: Open
+  Beam points out empty rows and rows reported twice, you choose what to tidy,
+  and only then is it saved.
 - **A simple web interface.** Browse, sort, filter and page through tables.
   **Basic** mode keeps it simple; **Advanced** adds column choice, more
   filters and ready-made Excel and Power BI connections. No scripts run in
