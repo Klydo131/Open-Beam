@@ -144,7 +144,11 @@ async fn security_headers(request: Request, next: Next) -> Response {
     let headers = response.headers_mut();
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    // "same-origin", not "no-referrer": under "no-referrer" browsers send
+    // `Origin: null` on form posts, which the cross-site check must refuse,
+    // so every form on the site would stop working. Other sites still learn
+    // nothing about the page a visitor came from.
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(

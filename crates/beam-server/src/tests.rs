@@ -790,6 +790,8 @@ async fn pages_are_locked_down_and_assets_are_served() {
     assert!(policy.contains("default-src 'none'") && policy.contains("frame-ancestors 'none'"));
     assert!(!policy.contains("script-src"), "no page runs scripts");
     assert_eq!(login.headers["x-frame-options"], "DENY");
+    // Browsers send `Origin: null` under "no-referrer", which would make every form fail.
+    assert_eq!(login.headers["referrer-policy"], "same-origin");
     assert_eq!(login.headers["x-content-type-options"], "nosniff");
     assert_eq!(login.headers["cache-control"], "no-store");
     assert!(!login.body.contains("<script"));
