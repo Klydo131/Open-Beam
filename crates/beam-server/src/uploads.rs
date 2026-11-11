@@ -80,6 +80,12 @@ pub fn csv_field(text: &str) -> String {
 const MAX_SHEET_CELLS: u64 = 50_000_000;
 /// Most cells holding a value that a sheet may contain.
 const MAX_FILLED_CELLS: usize = 10_000_000;
+/// However sparse, a sheet may always fill a grid this size.
+const SMALL_GRID_CELLS: u64 = 1_000_000;
+/// Beyond that, empty cells allowed for each filled one. Real sheets are
+/// mostly filled; a few values scattered across a huge grid would otherwise
+/// turn a few kilobytes into tens of megabytes of empty fields.
+const EMPTY_PER_FILLED: u64 = 16;
 
 fn cell_text(cell: &calamine::DataRef<'_>) -> Option<String> {
     use calamine::DataRef;
@@ -108,8 +114,9 @@ fn cell_text(cell: &calamine::DataRef<'_>) -> Option<String> {
 /// Converts the first sheet of a workbook to CSV for the engine to read.
 ///
 /// Cells are read one at a time and only filled ones are kept, so the size
-/// of the result is known, and bounded, before it is built.
-fn excel_to_csv(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+/// of the result is known, and bounded, before it is built. The result may
+/// be at most `max_bytes`, the same limit a CSV upload has.
+fn excel_to_csv(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, &'static str> {
     use calamine::{Reader, Xlsx};
     let unreadable = "That workbook could not be read. Check it opens in Excel.";
     let too_large = "That workbook is too large to add.";
@@ -161,7 +168,9 @@ fn excel_to_csv(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
     if width > beam_engine::MAX_UPLOAD_COLUMNS as u64 {
         return Err("That sheet has more columns than Open Beam accepts (1,000).");
     }
-    if width.saturating_mul(height) > MAX_SHEET_CELLS {
+    let filled = cells.len() as u64;
+    let grid = width.saturating_mul(height);
+    if grid > MAX_SHEET_CELLS || grid > filled.saturating_mul(EMPTY_PER_FILLED).saturating_add(SMALL_GRID_CELLS) {
         return Err(too_large);
     }
     cells.sort_unstable_by_key(|c| (c.0, c.1));
@@ -173,6 +182,9 @@ fn excel_to_csv(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
             fields[(col - left) as usize] = text;
         }
         writeln!(out, "{}", fields.join(",")).map_err(|_| unreadable)?;
+        if out.len() > max_bytes {
+            return Err(too_large);
+        }
     }
     Ok(out)
 }
@@ -337,7 +349,10 @@ fn store_draft(
         .upload_dir()
         .ok_or("Adding data is turned off on this server.")?;
     let (contents, extension) = match kind {
-        Kind::Excel => (std::borrow::Cow::Owned(excel_to_csv(bytes)?), "csv"),
+        Kind::Excel => (
+            std::borrow::Cow::Owned(excel_to_csv(bytes, state.max_upload_bytes)?),
+            "csv",
+        ),
         Kind::Csv => (std::borrow::Cow::Borrowed(bytes), "csv"),
         Kind::Parquet => (std::borrow::Cow::Borrowed(bytes), "parquet"),
     };
@@ -364,6 +379,9 @@ fn store_draft(
             return Err(match e {
                 beam_engine::EngineError::TooWide => {
                     "That file has more than 1,000 columns, which Open Beam does not accept."
+                }
+                beam_engine::EngineError::ReservedColumn => {
+                    "That file has a column named __beam_position, which Open Beam keeps for itself. Rename that column and try again."
                 }
                 _ => "That file could not be read as a table. Check that its first row holds the column names.",
             });
@@ -704,9 +722,13 @@ mod tests {
         sheet.write(2, 0, "South").unwrap();
         sheet.write(2, 1, 4.5).unwrap();
         let bytes = workbook.save_to_buffer().unwrap();
-        let csv = String::from_utf8(excel_to_csv(&bytes).unwrap()).unwrap();
+        let csv = String::from_utf8(excel_to_csv_for_test(&bytes).unwrap()).unwrap();
         assert_eq!(csv, "region,units,sold on\n\"North, East\",12,2025-03-01\nSouth,4.5,\n");
-        assert!(excel_to_csv(b"PK\x03\x04 not really a zip").is_err());
+        assert!(excel_to_csv_for_test(b"PK\x03\x04 not really a zip").is_err());
+    }
+
+    fn excel_to_csv_for_test(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
+        excel_to_csv(bytes, crate::app::DEFAULT_MAX_UPLOAD_MB * 1024 * 1024)
     }
 
     fn workbook(cells: &[(u32, u16, &str)]) -> Vec<u8> {
@@ -723,12 +745,35 @@ mod tests {
         // A few kilobytes that would expand to 16,384 x 1,048,576 cells.
         let corner = workbook(&[(0, 0, "name"), (1, 0, "x"), (1_048_575, 16_383, "far")]);
         assert!(corner.len() < 20_000);
-        assert!(excel_to_csv(&corner).unwrap_err().contains("more columns"));
+        assert!(excel_to_csv_for_test(&corner).unwrap_err().contains("more columns"));
         let tall = workbook(&[(0, 0, "name"), (0, 999, "z"), (1_048_575, 0, "far")]);
-        assert_eq!(excel_to_csv(&tall).unwrap_err(), "That workbook is too large to add.");
+        assert_eq!(
+            excel_to_csv_for_test(&tall).unwrap_err(),
+            "That workbook is too large to add."
+        );
+        // Just under the grid limit, but almost every cell empty.
+        let sparse = workbook(&[(0, 0, "name"), (0, 999, "z"), (49_998, 0, "far")]);
+        assert_eq!(
+            excel_to_csv_for_test(&sparse).unwrap_err(),
+            "That workbook is too large to add."
+        );
+        // Full rows are fine, and the result obeys the upload size limit.
+        let rows: Vec<(u32, u16, String)> = (0..2_000)
+            .flat_map(|r| (0..10).map(move |c| (r, c, format!("v{r}"))))
+            .collect();
+        let rows: Vec<(u32, u16, &str)> = rows.iter().map(|(r, c, t)| (*r, *c, t.as_str())).collect();
+        let dense = workbook(&rows);
+        assert!(excel_to_csv_for_test(&dense).is_ok());
+        assert_eq!(
+            excel_to_csv(&dense, 10_000).unwrap_err(),
+            "That workbook is too large to add."
+        );
         // A sheet that starts away from A1 keeps its shape.
         let offset = workbook(&[(2, 2, "a"), (2, 3, "b"), (3, 3, "1")]);
-        assert_eq!(String::from_utf8(excel_to_csv(&offset).unwrap()).unwrap(), "a,b\n,1\n");
+        assert_eq!(
+            String::from_utf8(excel_to_csv_for_test(&offset).unwrap()).unwrap(),
+            "a,b\n,1\n"
+        );
     }
 
     #[test]
@@ -740,7 +785,7 @@ mod tests {
         sheet
             .write_with_format(1, 0, &time, &rust_xlsxwriter::Format::new().set_num_format("hh:mm"))
             .unwrap();
-        let csv = String::from_utf8(excel_to_csv(&workbook.save_to_buffer().unwrap()).unwrap()).unwrap();
+        let csv = String::from_utf8(excel_to_csv_for_test(&workbook.save_to_buffer().unwrap()).unwrap()).unwrap();
         assert_eq!(csv, "starts\n12:30:00\n");
     }
 }

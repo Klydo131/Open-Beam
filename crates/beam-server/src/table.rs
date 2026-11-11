@@ -357,6 +357,9 @@ pub async fn dataset(
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
                 }
+                (Err(feed::QueryFailure::TimedOut), _) | (_, Err(feed::QueryFailure::TimedOut)) => {
+                    problem = Some(feed::TOO_LONG)
+                }
                 _ => problem = Some(failed),
             }
         }

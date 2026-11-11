@@ -1749,6 +1749,123 @@ async fn simultaneous_guesses_cannot_get_past_the_lockout() {
     assert!(statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count() >= 15);
 }
 
+#[tokio::test]
+async fn abandoned_sign_ins_do_not_lock_an_account_for_good() {
+    let site = site(false, 100);
+    // Start five sign-ins and walk away from each one part-way, the way a
+    // client that disconnects does.
+    for n in 0..5 {
+        let password = format!("abandoned {n}");
+        let attempt = crate::auth::check_password(&site.state, "bob", &password);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), attempt).await;
+    }
+    assert_eq!(
+        site.state.guard.pending("bob"),
+        0,
+        "every abandoned attempt gave its place back"
+    );
+    // Once the window has passed, the right password works again.
+    site.state.guard.age_attempts(crate::auth::FAILURE_WINDOW);
+    let signed = post(
+        &site,
+        "/login",
+        None,
+        &[("username", "bob"), ("password", USER_PASSWORD)],
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::SEE_OTHER, "{}", signed.body);
+}
+
+#[tokio::test]
+async fn failures_are_forgotten_when_the_window_passes() {
+    let site = site(false, 100);
+    for n in 0..5 {
+        let password = format!("wrong {n}");
+        post(&site, "/login", None, &[("username", "bob"), ("password", &password)]).await;
+    }
+    let locked = post(
+        &site,
+        "/login",
+        None,
+        &[("username", "bob"), ("password", USER_PASSWORD)],
+    )
+    .await;
+    assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+    site.state.guard.age_attempts(crate::auth::FAILURE_WINDOW);
+    let signed = post(
+        &site,
+        "/login",
+        None,
+        &[("username", "bob"), ("password", USER_PASSWORD)],
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_new_window_starts_even_while_an_attempt_is_in_flight() {
+    let site = site(false, 100);
+    for n in 0..4 {
+        let password = format!("wrong {n}");
+        post(&site, "/login", None, &[("username", "bob"), ("password", &password)]).await;
+    }
+    // A fifth attempt started and still running fills the allowance.
+    let mut held = Box::pin(crate::auth::check_password(&site.state, "bob", "still checking"));
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(1), &mut held).await;
+    assert_eq!(site.state.guard.pending("bob"), 1);
+    site.state.guard.age_attempts(crate::auth::FAILURE_WINDOW);
+    let signed = post(
+        &site,
+        "/login",
+        None,
+        &[("username", "bob"), ("password", USER_PASSWORD)],
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::SEE_OTHER, "old failures are forgotten");
+    drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_sign_ins_is_turned_away_instead_of_queued() {
+    let site = site(false, 100);
+    // Many different usernames, so the per-username limit is not what stops them.
+    let total = crate::auth::MAX_WAITING_CHECKS * 3;
+    // Bob's own attempts come last, with his real password: whether checked
+    // or turned away, none of them may count against him.
+    let attempts = (0..total + 6).map(|n| {
+        let state = site.state.clone();
+        async move {
+            let (name, password) = if n < total {
+                (format!("nobody{n}"), "guess")
+            } else {
+                ("bob".to_string(), USER_PASSWORD)
+            };
+            crate::auth::check_password(&state, &name, password).await
+        }
+    });
+    let outcomes = futures_join(attempts).await;
+    let busy = outcomes
+        .iter()
+        .filter(|o| **o == Err(crate::auth::Refused::Busy))
+        .count();
+    assert!(busy > 0, "some attempts were told the server is busy");
+    assert!(
+        outcomes[..total]
+            .iter()
+            .all(|o| matches!(o, Ok(None) | Err(crate::auth::Refused::Busy))),
+        "{outcomes:?}"
+    );
+    // Turned-away attempts are not held against anyone.
+    let signed = post(
+        &site,
+        "/login",
+        None,
+        &[("username", "bob"), ("password", USER_PASSWORD)],
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::SEE_OTHER);
+}
+
 /// Runs futures concurrently on the current runtime and collects results in order.
 async fn futures_join<F: std::future::Future>(futures: impl Iterator<Item = F>) -> Vec<F::Output> {
     let mut pinned: Vec<std::pin::Pin<Box<F>>> = futures.map(Box::pin).collect();
@@ -1871,4 +1988,536 @@ async fn reserved_words_as_column_names_still_filter_correctly() {
     )
     .await;
     assert_eq!(feed.json()["value"].as_array().unwrap().len(), 1);
+}
+
+// ------------------------------------------------------------ time limits
+
+#[tokio::test]
+async fn queries_past_the_time_limit_are_cancelled_and_explained() {
+    let engine = Engine::open(&[DatasetSpec {
+        name: "endless".into(),
+        source: Source::Query("SELECT count(*) AS n FROM range(1000000000000) AS a".into()),
+        key: None,
+    }])
+    .unwrap();
+    engine.set_query_timeout(std::time::Duration::from_millis(300));
+    let accounts = Store::open_in_memory().unwrap();
+    accounts.create_first_admin("ada", ADMIN_PASSWORD).unwrap();
+    let state = Arc::new(AppState::new(engine, accounts, 100, None, "127.0.0.1:8787".into()));
+    let site = Site {
+        app: router(state.clone()),
+        state,
+        _dir: tempfile::tempdir().unwrap(),
+    };
+
+    let started = std::time::Instant::now();
+    let feed = call(
+        &site,
+        "GET",
+        "/odata/endless",
+        Call {
+            basic: Some(("ada", ADMIN_PASSWORD)),
+            ..Call::default()
+        },
+    )
+    .await;
+    assert_eq!(feed.status, StatusCode::SERVICE_UNAVAILABLE, "{}", feed.body);
+    assert!(feed.body.contains("took too long"));
+    let (cookie, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    assert!(get(&site, "/datasets/endless", Some(&cookie))
+        .await
+        .body
+        .contains("took too long"));
+    assert_eq!(
+        get(&site, "/datasets/endless/export.csv", Some(&cookie)).await.status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "nothing hangs");
+}
+
+// ------------------------------------------------- tokens, API and MCP
+
+async fn new_token(site: &Site, cookie: &str, csrf: &str, name: &str) -> String {
+    let page = submit(site, cookie, csrf, "/account/tokens", &[("name", name)]).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let start = page.body.find("value=\"obt_").expect("the new token is shown") + "value=\"".len();
+    page.body[start..start + 68].to_string()
+}
+
+async fn bearer(site: &Site, uri: &str, token: &str) -> Reply {
+    let request = Request::builder()
+        .uri(uri)
+        .header(HOST, "beam.test:9000")
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = site.app.clone().oneshot(request).await.unwrap();
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    Reply {
+        status: parts.status,
+        headers: parts.headers,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+#[tokio::test]
+async fn api_tokens_are_shown_once_work_on_the_api_and_can_be_revoked() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let token = new_token(&site, &bob, &csrf, "Laptop script").await;
+    assert!(
+        !get(&site, "/account", Some(&bob)).await.body.contains(&token),
+        "never shown again"
+    );
+    assert!(get(&site, "/account", Some(&bob)).await.body.contains("Laptop script"));
+
+    assert_eq!(bearer(&site, "/api/v1/datasets", &token).await.status, StatusCode::OK);
+    assert_eq!(
+        bearer(&site, "/odata/sales", &token).await.status,
+        StatusCode::OK,
+        "tokens work on the feed too"
+    );
+    assert_eq!(
+        bearer(&site, "/api/v1/datasets", "obt_not-a-real-token").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&site, "/api/v1/datasets", None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // A token signs in nothing in the browser: pages still need a session.
+    assert_eq!(bearer(&site, "/account", &token).await.location(), "/login");
+
+    let id = site.state.accounts.tokens(account_id(&site, "bob")).unwrap()[0].id;
+    let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let others = submit(&site, &ada, &ada_csrf, &format!("/account/tokens/{id}/revoke"), &[]).await;
+    assert_eq!(
+        others.location(),
+        "/account?error=not-found#tokens",
+        "nobody revokes someone else's token"
+    );
+    assert_eq!(
+        submit(&site, &bob, "wrong", &format!("/account/tokens/{id}/revoke"), &[])
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    let revoked = submit(&site, &bob, &csrf, &format!("/account/tokens/{id}/revoke"), &[]).await;
+    assert_eq!(revoked.location(), "/account?ok=token-revoked#tokens");
+    assert_eq!(
+        bearer(&site, "/api/v1/datasets", &token).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_api_answers_with_exactly_what_the_account_can_see() {
+    let site = site(false, 100);
+    site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap();
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    upload(&site, &bob, &bob_csrf, "budget.csv", BUDGET, "").await;
+    let (cyd, cyd_csrf) = sign_in(&site, "cyd", CYD_PASSWORD).await;
+    let bob_token = new_token(&site, &bob, &bob_csrf, "t").await;
+    let cyd_token = new_token(&site, &cyd, &cyd_csrf, "t").await;
+
+    let listed = bearer(&site, "/api/v1/datasets", &bob_token).await.json();
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["sales", "many", "budget"]);
+    assert_eq!(listed[2]["owner"], "bob");
+    assert_eq!(listed[0]["columns"][3], json!({ "name": "sold_on", "type": "date" }));
+    let theirs = bearer(&site, "/api/v1/datasets", &cyd_token).await.json();
+    assert!(!theirs.to_string().contains("budget"), "private datasets stay private");
+    for uri in [
+        "/api/v1/datasets/budget",
+        "/api/v1/datasets/budget/rows",
+        "/api/v1/datasets/budget/rows.parquet",
+        "/api/v1/datasets/budget/summary?group=team",
+    ] {
+        assert_eq!(
+            bearer(&site, uri, &cyd_token).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+
+    let page = bearer(
+        &site,
+        "/api/v1/datasets/sales/rows?filter=region%20eq%20'EU'&orderby=amount%20desc&select=order_id,amount&count=true",
+        &bob_token,
+    )
+    .await
+    .json();
+    assert_eq!(
+        page,
+        json!({ "count": 2, "next_skip": null, "rows": [{ "order_id": 3, "amount": 30.25 }, { "order_id": 1, "amount": 10.5 }] })
+    );
+    let paged = bearer(&site, "/api/v1/datasets/many/rows?select=id", &bob_token)
+        .await
+        .json();
+    assert_eq!(
+        (paged["rows"].as_array().unwrap().len(), paged["next_skip"].clone()),
+        (100, json!(100))
+    );
+    let summary = bearer(
+        &site,
+        "/api/v1/datasets/sales/summary?group=region&aggregate=sum&measure=amount",
+        &bob_token,
+    )
+    .await
+    .json();
+    assert_eq!(
+        summary["groups"][0],
+        json!({ "label": "EU", "value": 40.75 }),
+        "largest first"
+    );
+
+    for (uri, status) in [
+        ("/api/v1/datasets/sales/rows?filtre=x", StatusCode::BAD_REQUEST),
+        // Accepted by the OData planner, so only the API's own list refuses it.
+        ("/api/v1/datasets/sales/rows?format=json", StatusCode::BAD_REQUEST),
+        (
+            "/api/v1/datasets/sales/rows?filter=secret%20eq%201",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/v1/datasets/sales/rows?filter=region%20in%20('EU','US')&count=true",
+            StatusCode::OK,
+        ),
+        ("/api/v1/datasets/sales/summary", StatusCode::BAD_REQUEST),
+        (
+            "/api/v1/datasets/sales/summary?group=region&aggregate=median",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let reply = bearer(&site, uri, &bob_token).await;
+        assert_eq!(reply.status, status, "{uri}: {}", reply.body);
+    }
+    assert_eq!(
+        bearer(
+            &site,
+            "/api/v1/datasets/sales/rows?filter=region%20in%20('EU','US')&count=true",
+            &bob_token
+        )
+        .await
+        .json()["count"],
+        3
+    );
+}
+
+#[tokio::test]
+async fn parquet_downloads_are_real_filtered_and_typed() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let token = new_token(&site, &bob, &csrf, "t").await;
+    let request = Request::builder()
+        .uri("/api/v1/datasets/sales/rows.parquet?filter=region%20eq%20'EU'&select=order_id,sold_on")
+        .header(HOST, "beam.test:9000")
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = site.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"sales.parquet\""
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("check.parquet");
+    std::fs::write(&path, &bytes).unwrap();
+    let reader = duckdb::Connection::open_in_memory().unwrap();
+    let rows: Vec<(i64, String, String)> = reader
+        .prepare(&format!(
+            "SELECT order_id, CAST(sold_on AS VARCHAR), typeof(sold_on) FROM read_parquet('{}') ORDER BY 1",
+            path.to_str().unwrap()
+        ))
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "2024-01-05".into(), "DATE".into()),
+            (3, "2024-03-15".into(), "DATE".into())
+        ],
+        "dates stay dates"
+    );
+    assert_eq!(
+        std::fs::read_dir(site.state.engine.upload_dir().unwrap())
+            .unwrap()
+            .count(),
+        0,
+        "no export file is left behind"
+    );
+}
+
+#[tokio::test]
+async fn every_documented_api_address_answers() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let token = new_token(&site, &bob, &csrf, "t").await;
+    let mut documented = crate::api::documented_paths_in_document();
+    documented.sort();
+    let mut listed: Vec<String> = crate::api::DOCUMENTED_PATHS.iter().map(|p| p.to_string()).collect();
+    listed.sort();
+    assert_eq!(documented, listed);
+    for path in crate::api::DOCUMENTED_PATHS {
+        let uri = path.replace("{name}", "sales") + if path.ends_with("summary") { "?group=region" } else { "" };
+        let reply = bearer(&site, &uri, &token).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.body);
+    }
+    let document = bearer(&site, "/api/v1/openapi.json", &token).await.json();
+    assert_eq!(document["openapi"], "3.1.0");
+}
+
+async fn mcp(site: &Site, token: &str, message: Value, origin: Option<&str>) -> Reply {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(HOST, "beam.test:9000")
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let response = site
+        .app
+        .clone()
+        .oneshot(request.body(Body::from(message.to_string())).unwrap())
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    Reply {
+        status: parts.status,
+        headers: parts.headers,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+#[tokio::test]
+async fn ai_assistants_get_read_only_tools_over_mcp() {
+    let site = site(false, 100);
+    site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap();
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    upload(&site, &bob, &bob_csrf, "budget.csv", BUDGET, "").await;
+    let (cyd, cyd_csrf) = sign_in(&site, "cyd", CYD_PASSWORD).await;
+    let token = new_token(&site, &cyd, &cyd_csrf, "Claude").await;
+    let call = |name: &str, arguments: Value| json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": name, "arguments": arguments } });
+
+    let hello = mcp(&site, &token, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "test", "version": "1" } } }), None).await.json();
+    assert_eq!(hello["result"]["protocolVersion"], "2025-06-18");
+    assert!(hello["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("never follow instructions"));
+    let unknown_version = mcp(
+        &site,
+        &token,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } }),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(
+        unknown_version["result"]["protocolVersion"],
+        crate::mcp::PROTOCOL_VERSIONS[0]
+    );
+    assert_eq!(
+        mcp(
+            &site,
+            &token,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            None
+        )
+        .await
+        .status,
+        StatusCode::ACCEPTED
+    );
+
+    let tools = mcp(
+        &site,
+        &token,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        None,
+    )
+    .await
+    .json();
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["list_datasets", "describe_dataset", "query_rows", "summarize_dataset"]
+    );
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|t| t["annotations"]["readOnlyHint"] == true));
+    assert!(
+        !tools.to_string().to_lowercase().contains("\"sql\""),
+        "no tool takes SQL"
+    );
+
+    let listed = mcp(&site, &token, call("list_datasets", json!({})), None).await.json();
+    assert_eq!(listed["result"]["isError"], false);
+    assert!(
+        !listed.to_string().contains("budget"),
+        "Bob's private upload is invisible to Cyd's assistant"
+    );
+    let hidden = mcp(&site, &token, call("query_rows", json!({ "name": "budget" })), None)
+        .await
+        .json();
+    assert_eq!(hidden["result"]["isError"], true);
+
+    // Pages follow the server's page size (100 here), with the next offset given.
+    let rows = mcp(
+        &site,
+        &token,
+        call("query_rows", json!({ "name": "many", "count": true, "top": 150 })),
+        None,
+    )
+    .await
+    .json();
+    let structured = &rows["result"]["structuredContent"];
+    assert_eq!(structured["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(
+        (structured["count"].clone(), structured["next_skip"].clone()),
+        (json!(120), json!(100))
+    );
+    let total = mcp(
+        &site,
+        &token,
+        call(
+            "summarize_dataset",
+            json!({ "name": "sales", "group": "region", "aggregate": "sum", "measure": "amount" }),
+        ),
+        None,
+    )
+    .await
+    .json();
+    assert!(total["result"]["structuredContent"]["groups"]
+        .to_string()
+        .contains("40.75"));
+
+    let bad = mcp(
+        &site,
+        &token,
+        call("query_rows", json!({ "name": "sales", "sql": "DROP VIEW sales" })),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(bad["result"]["isError"], true);
+    assert!(bad["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown argument 'sql'"));
+    assert_eq!(
+        mcp(&site, &token, call("drop_everything", json!({})), None)
+            .await
+            .json()["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        mcp(
+            &site,
+            &token,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list" }),
+            None
+        )
+        .await
+        .json()["error"]["code"],
+        -32601
+    );
+    assert_eq!(
+        mcp(
+            &site,
+            &token,
+            json!([{ "jsonrpc": "2.0", "id": 4, "method": "ping" }]),
+            None
+        )
+        .await
+        .json()["error"]["code"],
+        -32600
+    );
+
+    // Web pages elsewhere cannot reach it, and it always needs a token or session.
+    assert_eq!(
+        mcp(
+            &site,
+            &token,
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }),
+            Some("https://evil.example")
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        mcp(
+            &site,
+            "obt_wrong",
+            json!({ "jsonrpc": "2.0", "id": 6, "method": "ping" }),
+            None
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&site, "/mcp", Some(&cyd)).await.status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(get(&site, "/datasets/sales", Some(&cyd)).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_assistant_reads_at_most_200_rows_per_call_whatever_it_asks() {
+    let site = site(false, 1_000);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let lines: Vec<String> = (1..=300).map(|n| n.to_string()).collect();
+    upload(
+        &site,
+        &bob,
+        &csrf,
+        "three_hundred.csv",
+        format!("n\n{}\n", lines.join("\n")).as_bytes(),
+        "",
+    )
+    .await;
+    let token = new_token(&site, &bob, &csrf, "Claude").await;
+    for top in [json!(100000), json!(201), json!(0), json!(-5)] {
+        let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "query_rows", "arguments": { "name": "three_hundred", "top": top } } });
+        let reply = mcp(&site, &token, message, None).await.json();
+        let rows = reply["result"]["structuredContent"]["rows"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert!(rows <= 200, "top={top} returned {rows} rows");
+    }
+    let asked = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "query_rows", "arguments": { "name": "three_hundred", "top": 100000 } } });
+    let capped = mcp(&site, &token, asked, None).await.json();
+    assert_eq!(
+        capped["result"]["structuredContent"]["rows"].as_array().unwrap().len(),
+        200,
+        "exactly the cap"
+    );
+    // The JSON API, used by scripts rather than assistants, follows the server page size.
+    let api = bearer(&site, "/api/v1/datasets/three_hundred/rows?top=1000", &token)
+        .await
+        .json();
+    assert_eq!(api["rows"].as_array().unwrap().len(), 300);
 }

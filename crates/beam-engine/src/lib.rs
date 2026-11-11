@@ -16,6 +16,9 @@ use std::sync::{Mutex, RwLock};
 /// check on the review page and every tidying rule scales with the width.
 pub const MAX_UPLOAD_COLUMNS: usize = 1_000;
 
+/// How long a query may run unless configured otherwise.
+pub const DEFAULT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A hidden column holding each row's position in its file, so that rows
 /// keep file order and "the first copy" of a repeated row is well defined.
 const POSITION: &str = "__beam_position";
@@ -41,6 +44,11 @@ pub enum EngineError {
     UploadDir(PathBuf),
     #[error("the file has more than {MAX_UPLOAD_COLUMNS} columns")]
     TooWide,
+    /// The file has a column whose name Open Beam uses for its own bookkeeping.
+    #[error("the file has a column named {POSITION}, which is reserved")]
+    ReservedColumn,
+    #[error("the query took longer than the time limit")]
+    TimedOut,
     #[error("uploads are not enabled")]
     UploadsDisabled,
     #[error(transparent)]
@@ -135,6 +143,12 @@ pub enum Param {
 
 pub struct Engine {
     conn: Mutex<Connection>,
+    /// Held while an upload becomes a dataset, so two uploads cannot claim
+    /// one name. Reading and type-checking the file happen on a connection of
+    /// their own, so other people's queries carry on meanwhile.
+    adding: Mutex<()>,
+    /// Longest a single query may run before it is cancelled, in milliseconds.
+    query_timeout_ms: std::sync::atomic::AtomicU64,
     datasets: RwLock<Vec<Dataset>>,
     /// Where files added at run time live. The only directory the sealed
     /// database may read besides the configured files.
@@ -221,7 +235,9 @@ impl Engine {
             })?;
         }
         Ok(Self {
+            query_timeout_ms: std::sync::atomic::AtomicU64::new(DEFAULT_QUERY_TIMEOUT.as_millis() as u64),
             conn: Mutex::new(conn),
+            adding: Mutex::new(()),
             datasets: RwLock::new(datasets),
             upload_dir,
         })
@@ -263,9 +279,15 @@ impl Engine {
         cleaning: Cleaning,
     ) -> Result<Dataset, EngineError> {
         let (path, base) = self.upload_source(name, file, format)?;
-        let mut datasets = self.datasets.write().unwrap_or_else(|e| e.into_inner());
-        let taken = datasets.iter().any(|d| d.name.eq_ignore_ascii_case(name));
-        if !is_identifier(name) || taken {
+        let _adding = self.adding.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = || {
+            self.datasets
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(name))
+        };
+        if !is_identifier(name) || taken() {
             return Err(EngineError::InvalidName(name.to_string()));
         }
         let spec = DatasetSpec {
@@ -276,7 +298,8 @@ impl Engine {
             },
             key: None,
         };
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // The slow part: the whole file is read to choose column types.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
         let created = positioned_source(&conn, &base, cleaning)
             .and_then(|source| create_view(&conn, &spec, &source))
             .and_then(|dataset| {
@@ -286,10 +309,14 @@ impl Engine {
         match created {
             Ok(mut dataset) => {
                 dataset.uploaded = true;
-                datasets.push(dataset.clone());
+                self.datasets
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(dataset.clone());
                 Ok(dataset)
             }
             Err(e) => {
+                // Safe: the name was free and no other upload can take it meanwhile.
                 let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)));
                 Err(e)
             }
@@ -341,13 +368,13 @@ impl Engine {
             },
             key: None,
         };
+        // On a connection of its own, so reading the file holds no one up.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
         let dataset = {
-            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
             let source = positioned_source(&conn, &base, Cleaning::default())?;
             create_view(&conn, &spec, &source)?
         };
         let result = self.describe_preview(&name, &dataset, limit);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(&name)));
         result
     }
@@ -431,20 +458,83 @@ impl Engine {
         Ok(())
     }
 
-    /// Runs a statement and returns its rows, each `width` values wide.
+    /// Sets the longest a single query may run before it is cancelled.
+    pub fn set_query_timeout(&self, limit: std::time::Duration) {
+        let millis = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.query_timeout_ms
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Runs a statement and returns its rows, each `width` values wide. A
+    /// statement still running after the time limit is cancelled and
+    /// reported as [`EngineError::TimedOut`].
     pub fn query(&self, sql: &str, params: &[Param], width: usize) -> Result<Vec<Vec<Value>>, EngineError> {
         // Each query gets its own connection so slow queries do not queue
         // behind the lock; the lock only guards the clone itself.
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        let mut statement = conn.prepare(sql)?;
-        let bound = params.iter().map(|p| match p {
-            Param::Null => DuckValue::Null,
-            Param::Bool(b) => DuckValue::Boolean(*b),
-            Param::Int(i) => DuckValue::BigInt(*i),
-            Param::Float(f) => DuckValue::Double(*f),
-            Param::Text(s) => DuckValue::Text(s.clone()),
+        self.within_time_limit(&conn, || Self::run(&conn, sql, params, width))
+    }
+
+    /// Runs `work` on `conn`, cancelling it if it outlasts the time limit.
+    fn within_time_limit<T>(
+        &self,
+        conn: &Connection,
+        work: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let limit = std::time::Duration::from_millis(self.query_timeout_ms.load(std::sync::atomic::Ordering::Relaxed));
+        let handle = conn.interrupt_handle();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let fired = fired.clone();
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(limit) {
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    handle.interrupt();
+                }
+            })
+        };
+        let result = work();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        match result {
+            Err(_) if fired.load(std::sync::atomic::Ordering::SeqCst) => Err(EngineError::TimedOut),
+            other => other,
+        }
+    }
+
+    /// Runs a `SELECT` and returns its result as a Parquet file. The file is
+    /// written inside the upload directory, read back and deleted, so the
+    /// sealed database never writes anywhere else. Needs uploads enabled.
+    pub fn query_to_parquet(&self, sql: &str, params: &[Param]) -> Result<Vec<u8>, EngineError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let dir = self.upload_dir.as_ref().ok_or(EngineError::UploadsDisabled)?;
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("export-{}-{n}.parquet", std::process::id()));
+        let path_text = path.to_str().ok_or(EngineError::UploadsDisabled)?.to_string();
+        let table = format!("__export_{n}");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+        let result = self.within_time_limit(&conn, || {
+            let bound: Vec<DuckValue> = params.iter().map(to_duck).collect();
+            conn.execute(
+                &format!("CREATE TEMP TABLE {} AS {sql}", quote_ident(&table)),
+                params_from_iter(bound),
+            )?;
+            conn.execute_batch(&format!(
+                "COPY {} TO {} (FORMAT parquet)",
+                quote_ident(&table),
+                quote_literal(&path_text)
+            ))?;
+            std::fs::read(&path).map_err(|_| EngineError::UploadDir(path.clone()))
         });
-        let mut rows = statement.query(params_from_iter(bound))?;
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(&table)));
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    fn run(conn: &Connection, sql: &str, params: &[Param], width: usize) -> Result<Vec<Vec<Value>>, EngineError> {
+        let mut statement = conn.prepare(sql)?;
+        let mut rows = statement.query(params_from_iter(params.iter().map(to_duck)))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let mut values = Vec::with_capacity(width);
@@ -471,6 +561,11 @@ fn positioned_source(conn: &Connection, base: &str, cleaning: Cleaning) -> Resul
         .collect::<Result<_, _>>()?;
     if names.len() > MAX_UPLOAD_COLUMNS {
         return Err(EngineError::TooWide);
+    }
+    // Column names compare without regard to case, so any spelling would
+    // clash with the hidden column that keeps the file's row order.
+    if names.iter().any(|n| n.eq_ignore_ascii_case(POSITION)) {
+        return Err(EngineError::ReservedColumn);
     }
     let idents: Vec<String> = names.iter().map(|n| quote_ident(n)).collect();
     let all_empty = if idents.is_empty() {
@@ -597,6 +692,16 @@ fn normalise(source_type: &str) -> (ColumnType, String) {
 fn parse_decimal(upper: &str) -> Option<(u8, u8)> {
     let (precision, scale) = upper.strip_prefix("DECIMAL(")?.strip_suffix(')')?.split_once(',')?;
     Some((precision.trim().parse().ok()?, scale.trim().parse().ok()?))
+}
+
+fn to_duck(param: &Param) -> DuckValue {
+    match param {
+        Param::Null => DuckValue::Null,
+        Param::Bool(b) => DuckValue::Boolean(*b),
+        Param::Int(i) => DuckValue::BigInt(*i),
+        Param::Float(f) => DuckValue::Double(*f),
+        Param::Text(s) => DuckValue::Text(s.clone()),
+    }
 }
 
 fn to_json(value: ValueRef<'_>) -> Value {
@@ -1072,6 +1177,15 @@ mod tests {
             engine.add_upload("wide", "wide.csv", Format::Csv),
             Err(EngineError::TooWide)
         ));
+        fs::write(uploads.join("clash.csv"), "id,__BEAM_Position\n1,2\n2,1\n").unwrap();
+        assert!(matches!(
+            engine.preview("clash.csv", Format::Csv, 5),
+            Err(EngineError::ReservedColumn)
+        ));
+        assert!(matches!(
+            engine.add_upload("clash", "clash.csv", Format::Csv),
+            Err(EngineError::ReservedColumn)
+        ));
 
         let mut late = String::from("amount\n");
         for n in 0..30_000 {
@@ -1122,5 +1236,98 @@ mod tests {
             engine.query("SELECT label FROM items WHERE _row = 5", &[], 1).unwrap()[0][0],
             json!("item 4")
         );
+    }
+
+    #[test]
+    fn slow_queries_are_cancelled_at_the_time_limit() {
+        let engine = Engine::open(&[]).unwrap();
+        engine.set_query_timeout(std::time::Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let slow = engine.query("SELECT count(*) FROM range(1000000000000) AS a", &[], 1);
+        assert!(matches!(slow, Err(EngineError::TimedOut)), "{slow:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancelled promptly"
+        );
+        // Ordinary queries still answer, and failures that are not timeouts say so.
+        assert_eq!(engine.query("SELECT 41 + 1", &[], 1).unwrap(), vec![vec![json!(42)]]);
+        assert!(matches!(
+            engine.query("SELECT * FROM missing", &[], 1),
+            Err(EngineError::Database(_))
+        ));
+    }
+
+    #[test]
+    fn views_export_as_real_parquet_and_leave_no_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = Engine::open_with_uploads(&[spec("sales", &sample(dir.path()), None)], Some(&uploads)).unwrap();
+        let bytes = engine
+            .query_to_parquet(
+                "SELECT \"Region\", amount FROM sales WHERE amount > ? ORDER BY _row",
+                &[Param::Int(4)],
+            )
+            .unwrap();
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+        assert_eq!(
+            fs::read_dir(&uploads).unwrap().count(),
+            0,
+            "the temporary file is removed"
+        );
+        // Read it back with a separate DuckDB to prove it is what was asked for.
+        let copy = dir.path().join("check.parquet");
+        fs::write(&copy, &bytes).unwrap();
+        let reader = Connection::open_in_memory().unwrap();
+        let rows: Vec<(Option<String>, i64)> = reader
+            .prepare(&format!(
+                "SELECT \"Region\", amount FROM read_parquet({})",
+                quote_literal(copy.to_str().unwrap())
+            ))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(Some("US".into()), 5), (None, 7)]);
+        assert!(matches!(
+            Engine::open(&[]).unwrap().query_to_parquet("SELECT 1", &[]),
+            Err(EngineError::UploadsDisabled)
+        ));
+    }
+
+    #[test]
+    fn reading_a_large_upload_does_not_hold_up_other_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        let engine = std::sync::Arc::new(Engine::open_with_uploads(&[], Some(&uploads)).unwrap());
+        let mut csv = String::from("a,b,c\n");
+        for n in 0..400_000 {
+            csv.push_str(&format!("{n},x{n},{}\n", n % 7));
+        }
+        std::fs::write(uploads.join("big.csv"), csv).unwrap();
+        let started = std::time::Instant::now();
+        engine.add_upload("first", "big.csv", Format::Csv).unwrap();
+        let alone = started.elapsed();
+
+        // A small query asked while another upload, then a preview, reads
+        // the same file must not wait for that read to finish.
+        type Job = Box<dyn FnOnce(&Engine) + Send>;
+        let jobs: [Job; 2] = [
+            Box::new(|e| drop(e.add_upload("second", "big.csv", Format::Csv).unwrap())),
+            Box::new(|e| drop(e.preview("big.csv", Format::Csv, 5).unwrap())),
+        ];
+        for job in jobs {
+            let worker = engine.clone();
+            let reading = std::thread::spawn(move || job(&worker));
+            std::thread::sleep(alone / 4);
+            let asked = std::time::Instant::now();
+            engine.query("SELECT 1", &[], 1).unwrap();
+            let waited = asked.elapsed();
+            reading.join().unwrap();
+            assert!(
+                waited < alone / 8,
+                "a small query waited {waited:?} behind a {alone:?} file read"
+            );
+        }
     }
 }

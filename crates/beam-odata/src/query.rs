@@ -44,6 +44,10 @@ pub struct Plan {
     pub skip: u64,
     /// Client-requested `$top`, if any.
     pub top: Option<u64>,
+    /// The same rows with values in their stored types (no text formatting
+    /// of dates), honouring `$top` and `$skip` but not the page size. Used
+    /// for file exports. Takes `rows_params`.
+    pub export_sql: String,
 }
 
 /// Plans a collection request. `options` are the decoded query string pairs.
@@ -125,7 +129,16 @@ pub fn plan(set: &EntitySet, options: &[(String, String)], max_page_size: u64) -
         page_size.saturating_add(1),
     );
 
+    let plain: Vec<String> = columns.iter().map(|c| quote_ident(&c.name)).collect();
+    let limit = top.map_or(String::new(), |t| format!(" LIMIT {t}"));
+    let export_sql = format!(
+        "SELECT {} FROM {from}{where_sql} ORDER BY {}{limit} OFFSET {skip}",
+        plain.join(", "),
+        order_terms.join(", "),
+    );
+
     Ok(Plan {
+        export_sql,
         columns,
         rows_sql,
         rows_params: where_params.clone(),
@@ -186,6 +199,10 @@ mod tests {
              FROM \"sales\" ORDER BY \"id\" ASC LIMIT 101 OFFSET 0"
         );
         assert_eq!(plan.count_sql, None);
+        assert_eq!(
+            plan.export_sql, "SELECT \"id\", \"region\", \"sold_on\" FROM \"sales\" ORDER BY \"id\" ASC OFFSET 0",
+            "exports keep stored types and are not paged"
+        );
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub enum AccountError {
     NameTaken,
     #[error("No such dataset.")]
     UploadNotFound,
+    #[error("You already have the most tokens allowed. Revoke one you no longer use.")]
+    TooManyTokens,
     #[error("account database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("password hashing failed")]
@@ -155,6 +157,24 @@ pub struct Draft {
     pub created_at: String,
 }
 
+/// A personal API token as listed in Settings. The secret itself is shown
+/// once, when the token is created, and stored only as a digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiToken {
+    pub id: i64,
+    pub account_id: i64,
+    /// What the person called it, for example "Power BI on my laptop".
+    pub name: String,
+    pub created_at: String,
+    pub last_used: Option<String>,
+}
+
+/// Every token starts with this, so secret scanners and people can
+/// recognise one that was pasted somewhere it should not be.
+pub const TOKEN_PREFIX: &str = "obt_";
+/// Most tokens one account may hold.
+pub const MAX_TOKENS: i64 = 20;
+
 const UPLOAD_COLUMNS: &str = "id, name, owner_id, file, created_at, drop_empty_rows, drop_duplicate_rows";
 const DRAFT_COLUMNS: &str = "id, owner_id, file, original_name, created_at";
 
@@ -233,6 +253,14 @@ impl Store {
                  owner_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                  file       TEXT NOT NULL UNIQUE,
                  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE IF NOT EXISTS api_tokens (
+                 id         INTEGER PRIMARY KEY,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 name       TEXT NOT NULL,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_used  TEXT
              );
              CREATE TABLE IF NOT EXISTS drafts (
                  id            INTEGER PRIMARY KEY,
@@ -508,6 +536,82 @@ impl Store {
         }
     }
 
+    // -------------------------------------------------------- API tokens
+
+    /// Creates a token and returns it with its secret. The secret is not
+    /// stored and cannot be shown again.
+    pub fn create_token(&self, account: i64, name: &str) -> Result<(ApiToken, String), AccountError> {
+        let name = clean_profile(name)?.ok_or(AccountError::InvalidProfile)?;
+        let secret = format!("{TOKEN_PREFIX}{}", random_token()?);
+        let conn = self.conn();
+        let held: i64 = conn.query_row(
+            "SELECT count(*) FROM api_tokens WHERE account_id = ?1",
+            [account],
+            |r| r.get(0),
+        )?;
+        if held >= MAX_TOKENS {
+            return Err(AccountError::TooManyTokens);
+        }
+        conn.execute(
+            "INSERT INTO api_tokens (account_id, name, token_hash) VALUES (?1, ?2, ?3)",
+            params![account, name, digest(&secret)],
+        )?;
+        let token = conn.query_row(
+            "SELECT id, account_id, name, created_at, last_used FROM api_tokens WHERE id = ?1",
+            [conn.last_insert_rowid()],
+            read_token,
+        )?;
+        Ok((token, secret))
+    }
+
+    pub fn tokens(&self, account: i64) -> Result<Vec<ApiToken>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT id, account_id, name, created_at, last_used FROM api_tokens WHERE account_id = ?1 ORDER BY id",
+        )?;
+        let tokens = statement.query_map([account], read_token)?.collect::<Result<_, _>>()?;
+        Ok(tokens)
+    }
+
+    /// Revokes one of `account`'s tokens. Another account's token is "not found".
+    pub fn revoke_token(&self, account: i64, id: i64) -> Result<(), AccountError> {
+        let removed = self.conn().execute(
+            "DELETE FROM api_tokens WHERE id = ?1 AND account_id = ?2",
+            params![id, account],
+        )?;
+        if removed == 0 {
+            return Err(AccountError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// The active account a token belongs to. Records when it was used.
+    pub fn token_account(&self, secret: &str) -> Result<Option<Account>, AccountError> {
+        if !secret.starts_with(TOKEN_PREFIX) || secret.len() > 128 {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let columns = ACCOUNT_COLUMNS.replace(", ", ", a.");
+        let found = conn
+            .query_row(
+                &format!(
+                    "SELECT a.{columns}, t.id FROM api_tokens AS t JOIN accounts AS a ON a.id = t.account_id
+                     WHERE t.token_hash = ?1 AND a.active"
+                ),
+                [digest(secret)],
+                |row| Ok((read_account(row)?, row.get::<_, i64>(ACCOUNT_WIDTH)?)),
+            )
+            .optional()?;
+        let Some((account, token_id)) = found else {
+            return Ok(None);
+        };
+        conn.execute(
+            "UPDATE api_tokens SET last_used = datetime('now') WHERE id = ?1",
+            [token_id],
+        )?;
+        Ok(Some(account))
+    }
+
     // ------------------------------------------------------------ drafts
 
     pub fn create_draft(&self, owner: i64, file: &str, original_name: &str) -> Result<Draft, AccountError> {
@@ -740,6 +844,16 @@ fn read_upload(row: &Row<'_>) -> rusqlite::Result<Upload> {
             drop_empty_rows: row.get(5)?,
             drop_duplicate_rows: row.get(6)?,
         },
+    })
+}
+
+fn read_token(row: &Row<'_>) -> rusqlite::Result<ApiToken> {
+    Ok(ApiToken {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        name: row.get(2)?,
+        created_at: row.get(3)?,
+        last_used: row.get(4)?,
     })
 }
 
@@ -1114,5 +1228,55 @@ mod tests {
         );
         store.delete_draft(old.id).unwrap();
         assert!(matches!(store.delete_draft(old.id), Err(AccountError::UploadNotFound)));
+    }
+
+    #[test]
+    fn api_tokens_are_shown_once_stored_hashed_and_revocable() {
+        let (store, admin) = store_with_admin();
+        let bob = store.create("bob", PASSWORD, Role::User).unwrap();
+        let (token, secret) = store.create_token(bob.id, "Power BI").unwrap();
+        assert!(secret.starts_with(TOKEN_PREFIX) && secret.len() == TOKEN_PREFIX.len() + 64);
+        let stored: String = store
+            .conn()
+            .query_row("SELECT token_hash FROM api_tokens", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(stored, secret);
+        assert!(!stored.contains(&secret[4..]));
+
+        assert_eq!(store.token_account(&secret).unwrap().map(|a| a.id), Some(bob.id));
+        assert!(store.tokens(bob.id).unwrap()[0].last_used.is_some(), "use is recorded");
+        assert_eq!(store.token_account("obt_wrong").unwrap(), None);
+        assert_eq!(
+            store.token_account(&secret[4..]).unwrap(),
+            None,
+            "the prefix is required"
+        );
+        assert_eq!(store.token_account(&"obt_x".repeat(100)).unwrap(), None);
+
+        assert!(
+            matches!(store.revoke_token(admin.id, token.id), Err(AccountError::NotFound)),
+            "only its owner revokes it"
+        );
+        store.set_active(bob.id, false).unwrap();
+        assert_eq!(
+            store.token_account(&secret).unwrap(),
+            None,
+            "a disabled account's tokens stop working"
+        );
+        store.set_active(bob.id, true).unwrap();
+        store.revoke_token(bob.id, token.id).unwrap();
+        assert_eq!(store.token_account(&secret).unwrap(), None);
+
+        assert!(matches!(
+            store.create_token(bob.id, "  "),
+            Err(AccountError::InvalidProfile)
+        ));
+        for n in 0..MAX_TOKENS {
+            store.create_token(bob.id, &format!("t{n}")).unwrap();
+        }
+        assert!(matches!(
+            store.create_token(bob.id, "one more"),
+            Err(AccountError::TooManyTokens)
+        ));
     }
 }

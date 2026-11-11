@@ -16,13 +16,18 @@ use std::time::{Duration, Instant};
 
 pub const SESSION_COOKIE: &str = "beam_session";
 const MAX_FAILURES: u32 = 5;
-const FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub const FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const FEED_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_TRACKED: usize = 10_000;
 
 /// Password checks that may run at once. Each Argon2 check holds about
 /// 19 MiB, so this bounds memory under a flood of sign-in attempts.
 const CONCURRENT_PASSWORD_CHECKS: usize = 4;
+
+/// Sign-in attempts that may wait for a free check. Beyond this the server
+/// answers at once that it is busy, so a flood of guesses cannot queue up
+/// in front of real people and delay their sign-in for many seconds.
+pub const MAX_WAITING_CHECKS: usize = 32;
 
 /// Sign-in attempts for one username within the current window.
 struct Attempts {
@@ -41,6 +46,49 @@ pub struct Guard {
     /// briefly, keyed by a digest of the credentials.
     verified: Mutex<HashMap<[u8; 32], (i64, Instant)>>,
     checks: tokio::sync::Semaphore,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+/// Why a sign-in attempt was refused before the password was looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The username used up its attempts for now.
+    Locked,
+    /// Too many sign-in attempts are already waiting.
+    Busy,
+}
+
+impl Refused {
+    pub fn message(self) -> &'static str {
+        match self {
+            Refused::Locked => "Too many failed attempts. Wait a few minutes and try again.",
+            Refused::Busy => "Sign-in is busy right now. Try again in a moment.",
+        }
+    }
+}
+
+/// One reserved attempt. It is released when dropped, so a request that is
+/// abandoned part-way (the client disconnects) still gives its place back.
+/// An attempt that never reported a result counts as a failure.
+struct Reservation<'a> {
+    guard: &'a Guard,
+    key: String,
+    succeeded: Option<bool>,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.guard.finish(&self.key, self.succeeded.unwrap_or(false));
+    }
+}
+
+/// Counts a caller waiting for a password check; undone when dropped.
+struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Default for Guard {
@@ -49,6 +97,7 @@ impl Default for Guard {
             attempts: Mutex::default(),
             verified: Mutex::default(),
             checks: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -60,7 +109,7 @@ impl Guard {
 
     /// Reserves a sign-in attempt, or refuses when the username has used up
     /// its attempts. Reserving and checking happen under one lock.
-    fn begin(&self, username: &str) -> bool {
+    fn begin(&self, username: &str) -> Option<Reservation<'_>> {
         let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         if attempts.len() >= MAX_TRACKED {
             attempts.retain(|_, a| a.pending > 0 || a.since.elapsed() < FAILURE_WINDOW);
@@ -73,29 +122,48 @@ impl Guard {
             pending: 0,
             since: Instant::now(),
         });
-        if entry.since.elapsed() >= FAILURE_WINDOW && entry.pending == 0 {
-            *entry = Attempts {
-                failed: 0,
-                pending: 0,
-                since: Instant::now(),
-            };
+        // A new window forgets old failures. Attempts still in flight keep
+        // their places, so they cannot be overtaken by a fresh burst.
+        if entry.since.elapsed() >= FAILURE_WINDOW {
+            entry.failed = 0;
+            entry.since = Instant::now();
         }
         if entry.failed + entry.pending >= MAX_FAILURES {
-            return false;
+            return None;
         }
         entry.pending += 1;
-        true
+        Some(Reservation {
+            guard: self,
+            key: Self::key(username),
+            succeeded: None,
+        })
     }
 
-    fn finish(&self, username: &str, succeeded: bool) {
+    fn finish(&self, key: &str, succeeded: bool) {
         let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = attempts.get_mut(&Self::key(username)) {
+        if let Some(entry) = attempts.get_mut(key) {
             entry.pending = entry.pending.saturating_sub(1);
             if succeeded {
                 entry.failed = 0;
             } else {
                 entry.failed += 1;
             }
+        }
+    }
+
+    /// Attempts for `username` still marked as in flight.
+    #[cfg(test)]
+    pub fn pending(&self, username: &str) -> u32 {
+        let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        attempts.get(&Self::key(username)).map_or(0, |a| a.pending)
+    }
+
+    /// Moves every window into the past, as if `by` had elapsed.
+    #[cfg(test)]
+    pub fn age_attempts(&self, by: Duration) {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in attempts.values_mut() {
+            entry.since = entry.since.checked_sub(by).unwrap_or(entry.since);
         }
     }
 
@@ -143,13 +211,19 @@ pub fn expired_cookie() -> HeaderValue {
 }
 
 /// Checks a username and password off the async runtime, applying the
-/// failed-attempt limit. `Err` means too many recent failures.
-pub async fn check_password(state: &Arc<AppState>, username: &str, password: &str) -> Result<Option<Account>, ()> {
-    if !state.guard.begin(username) {
-        return Err(());
+/// failed-attempt limit and the bound on waiting attempts.
+pub async fn check_password(state: &Arc<AppState>, username: &str, password: &str) -> Result<Option<Account>, Refused> {
+    use std::sync::atomic::Ordering;
+    // Counted before anything else, and undone when this attempt ends or
+    // is abandoned.
+    let waiting = Waiting(&state.guard.waiting);
+    if state.guard.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING_CHECKS {
+        return Err(Refused::Busy);
     }
+    let mut reservation = state.guard.begin(username).ok_or(Refused::Locked)?;
     let verified = match state.guard.checks.acquire().await {
         Ok(_permit) => {
+            drop(waiting);
             let (worker, name, secret) = (state.clone(), username.to_string(), password.to_string());
             tokio::task::spawn_blocking(move || worker.accounts.verify(&name, &secret)).await
         }
@@ -159,8 +233,17 @@ pub async fn check_password(state: &Arc<AppState>, username: &str, password: &st
         Ok(Ok(account)) => account,
         _ => None,
     };
-    state.guard.finish(username, account.is_some());
+    reservation.succeeded = Some(account.is_some());
     Ok(account)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
 }
 
 fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
@@ -189,10 +272,7 @@ pub async fn feed_guard(State(state): State<Arc<AppState>>, mut request: Request
                 .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Open Beam\""));
             denied
         }
-        Err(()) => feed::error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed sign-in attempts. Try again in a few minutes.",
-        ),
+        Err(refused) => feed::error(StatusCode::TOO_MANY_REQUESTS, refused.message()),
     };
     response
         .headers_mut()
@@ -204,9 +284,13 @@ pub async fn feed_guard(State(state): State<Arc<AppState>>, mut request: Request
 #[derive(Clone)]
 pub struct Viewer(pub Account);
 
-async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Option<Account>, ()> {
+async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Option<Account>, Refused> {
     if let Some(signed) = signed_in(state, headers) {
         return Ok(Some(signed.session.account));
+    }
+    // A personal API token: a long random secret looked up by its digest.
+    if let Some(secret) = bearer_token(headers) {
+        return Ok(state.accounts.token_account(secret).ok().flatten());
     }
     let Some((username, password)) = basic_credentials(headers) else {
         return Ok(None);

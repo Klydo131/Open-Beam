@@ -202,6 +202,7 @@ pub fn notice(query: &HashMap<String, String>) -> Markup {
         Some("contact-added") => Some("Added to your contacts."),
         Some("contact-removed") => Some("Removed from your contacts."),
         Some("discarded") => Some("Draft discarded."),
+        Some("token-revoked") => Some("Token revoked. Anything using it can no longer connect."),
         _ => None,
     };
     let error = match query.get("error").map(String::as_str) {
@@ -215,6 +216,7 @@ pub fn notice(query: &HashMap<String, String>) -> Markup {
         Some("role") => Some("Choose a role.".to_string()),
         Some("profile") => Some(AccountError::InvalidProfile.to_string()),
         Some("confirm") => Some("Tick the box to confirm.".to_string()),
+        Some("tokens") => Some(AccountError::TooManyTokens.to_string()),
         Some("name-taken") => Some("That dataset name is already in use. Choose another.".to_string()),
         Some(_) => Some("That did not work. Please try again.".to_string()),
         None => None,
@@ -363,11 +365,7 @@ pub async fn login(State(state): App, Form(form): Form<LoginForm>) -> Response {
             &form.username,
             Some("Incorrect username or password."),
         ),
-        Err(()) => login_page(
-            StatusCode::TOO_MANY_REQUESTS,
-            &form.username,
-            Some("Too many failed attempts. Wait a few minutes and try again."),
-        ),
+        Err(refused) => login_page(StatusCode::TOO_MANY_REQUESTS, &form.username, Some(refused.message())),
     }
 }
 
@@ -524,6 +522,7 @@ pub async fn account(State(state): App, Query(query): Query<HashMap<String, Stri
                 button type="submit" { "Save profile" }
             }
         }
+        (tokens_section(&state, &signed, None))
         section.panel.narrow {
             h2 { "Change password" }
             form method="post" action="/account/password" {
@@ -548,6 +547,95 @@ pub async fn account(State(state): App, Query(query): Query<HashMap<String, Stri
         }
     };
     page(StatusCode::OK, layout("Settings", Some(&signed), body))
+}
+
+/// The API tokens part of Settings. `new_secret` is shown only on the page
+/// that created it.
+fn tokens_section(state: &AppState, signed: &Signed, new_secret: Option<&str>) -> Markup {
+    let tokens = state.accounts.tokens(signed.session.account.id).unwrap_or_default();
+    let csrf = &signed.session.csrf;
+    html! {
+        section.panel.narrow #tokens {
+            h2 { "API tokens" }
+            p.hint { "For tools that connect on your behalf: the API, AI assistants, scripts. A token can read what you can read, nothing more. Send it as " code { "Authorization: Bearer <token>" } "." }
+            @if let Some(secret) = new_secret {
+                div.notice.ok role="status" {
+                    p { strong { "Copy your new token now." } " It will not be shown again." }
+                    input.copy readonly value=(secret) aria-label="Your new API token";
+                }
+            }
+            @if !tokens.is_empty() {
+                ul.people {
+                    @for token in &tokens {
+                        li {
+                            span {
+                                strong { (token.name) }
+                                span.muted { " · created " (token.created_at.get(..10).unwrap_or("")) " · " (token.last_used.as_deref().map_or("never used".to_string(), |t| format!("last used {}", t.get(..16).unwrap_or(t)))) }
+                            }
+                            form.row method="post" action={ "/account/tokens/" (token.id) "/revoke" } {
+                                input type="hidden" name="csrf" value=(csrf);
+                                button.quiet type="submit" { "Revoke" }
+                            }
+                        }
+                    }
+                }
+            }
+            form method="post" action="/account/tokens" {
+                input type="hidden" name="csrf" value=(csrf);
+                label for="token_name" { "New token name" }
+                input #token_name name="name" required maxlength=(beam_accounts::MAX_PROFILE_CHARS) placeholder="for example: Claude on my laptop";
+                button type="submit" { "Create token" }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TokenForm {
+    csrf: String,
+    name: String,
+}
+
+/// Creates a token and shows its secret once, on this response only.
+pub async fn create_token(State(state): App, headers: HeaderMap, Form(form): Form<TokenForm>) -> Response {
+    let signed = match require_signed_in(&state, &headers) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
+    if let Err(response) = check_csrf(&signed, &form.csrf) {
+        return response;
+    }
+    match state.accounts.create_token(signed.session.account.id, &form.name) {
+        Ok((_, secret)) => {
+            let body = html! {
+                h1 { "Settings" }
+                (tokens_section(&state, &signed, Some(&secret)))
+                p { a href="/account" { "Back to all settings" } }
+            };
+            page(StatusCode::OK, layout("API token created", Some(&signed), body))
+        }
+        Err(AccountError::TooManyTokens) => redirect("/account?error=tokens#tokens"),
+        Err(e) => redirect(&format!("/account?error={}#tokens", account_error_code(&e))),
+    }
+}
+
+pub async fn revoke_token(
+    State(state): App,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfOnly>,
+) -> Response {
+    let signed = match require_signed_in(&state, &headers) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
+    if let Err(response) = check_csrf(&signed, &form.csrf) {
+        return response;
+    }
+    match state.accounts.revoke_token(signed.session.account.id, id) {
+        Ok(()) => redirect("/account?ok=token-revoked#tokens"),
+        Err(_) => redirect("/account?error=not-found#tokens"),
+    }
 }
 
 #[derive(Deserialize)]

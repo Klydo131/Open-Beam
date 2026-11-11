@@ -1,6 +1,6 @@
 //! Shared state and the route table.
 
-use crate::{auth, chart, export, feed, people, review, table, uploads, web};
+use crate::{api, auth, chart, export, feed, mcp, people, review, table, uploads, web};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
 use axum::http::header::{
@@ -89,6 +89,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/odata/$metadata", get(feed::metadata))
         .route("/odata/{set}", get(feed::collection))
         .route("/odata/{set}/$count", get(feed::count))
+        .route("/api/v1", get(api::index))
+        .route("/api/v1/openapi.json", get(api::openapi))
+        .route("/api/v1/datasets", get(api::datasets))
+        .route("/api/v1/datasets/{name}", get(api::one))
+        .route("/api/v1/datasets/{name}/rows", get(api::rows_route))
+        .route("/api/v1/datasets/{name}/rows.parquet", get(api::parquet))
+        .route("/api/v1/datasets/{name}/summary", get(api::summary_route))
+        .route("/mcp", get(mcp::get).post(mcp::post))
         .layer(middleware::from_fn_with_state(state.clone(), auth::feed_guard));
 
     let pages = Router::new()
@@ -114,6 +122,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/people", get(people::people))
         .route("/people/{id}/contact", post(people::contact))
         .route("/account/mode", post(web::set_mode))
+        .route("/account/tokens", post(web::create_token))
+        .route("/account/tokens/{id}/revoke", post(web::revoke_token))
         .route("/account/profile", post(web::set_profile))
         .route("/account", get(web::account))
         .route("/account/password", post(web::change_password))

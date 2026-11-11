@@ -198,8 +198,12 @@ async fn export(
     let Ok(plan) = beam_odata::plan(set, &options, EXPORT_LIMIT) else {
         return failed();
     };
-    let Ok(rows) = feed::run(&state, plan.rows_sql, &plan.rows_params, plan.columns.len()).await else {
-        return failed();
+    let rows = match feed::run(&state, plan.rows_sql, &plan.rows_params, plan.columns.len()).await {
+        Ok(rows) => rows,
+        Err(feed::QueryFailure::TimedOut) => {
+            return message_page(StatusCode::SERVICE_UNAVAILABLE, "That took too long", feed::TOO_LONG)
+        }
+        Err(_) => return failed(),
     };
     if rows.len() as u64 > EXPORT_LIMIT {
         return message_page(

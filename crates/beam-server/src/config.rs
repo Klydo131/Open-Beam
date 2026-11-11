@@ -28,6 +28,9 @@ pub struct Config {
     /// adding data off.
     #[serde(default = "default_max_upload_mb")]
     pub max_upload_mb: usize,
+    /// Longest a single query may run before it is cancelled, in seconds.
+    #[serde(default = "default_query_timeout_seconds")]
+    pub query_timeout_seconds: u64,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
 }
@@ -61,6 +64,10 @@ fn default_accounts() -> PathBuf {
 
 fn default_uploads() -> PathBuf {
     PathBuf::from("beam-uploads")
+}
+
+fn default_query_timeout_seconds() -> u64 {
+    beam_engine::DEFAULT_QUERY_TIMEOUT.as_secs()
 }
 
 fn default_max_upload_mb() -> usize {
@@ -108,6 +115,9 @@ impl Config {
         let base = path.parent().unwrap_or(Path::new("."));
         config.accounts = base.join(&config.accounts);
         config.uploads = base.join(&config.uploads);
+        if !(1..=3600).contains(&config.query_timeout_seconds) {
+            return Err("query_timeout_seconds must be between 1 and 3600".into());
+        }
         if config.max_upload_mb > 4096 {
             return Err("max_upload_mb must be at most 4096".into());
         }

@@ -1,5 +1,6 @@
 //! `beam`: a web interface and data feed for your datasets.
 
+mod api;
 mod app;
 mod auth;
 mod catalog;
@@ -7,6 +8,7 @@ mod chart;
 mod config;
 mod export;
 mod feed;
+mod mcp;
 mod people;
 mod review;
 mod table;
@@ -140,6 +142,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let upload_dir = (config.max_upload_mb > 0).then_some(config.uploads.as_path());
     let engine =
         beam_engine::Engine::open_with_uploads(&config.dataset_specs(), upload_dir).map_err(|e| e.to_string())?;
+    engine.set_query_timeout(std::time::Duration::from_secs(config.query_timeout_seconds));
     restore_uploads(&engine, &accounts);
     review::remove_expired_drafts(&engine, &accounts, review::DRAFT_DAYS);
 

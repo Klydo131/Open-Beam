@@ -62,7 +62,7 @@ fn unknown_set() -> Response {
     error(StatusCode::NOT_FOUND, "Unknown entity set")
 }
 
-fn to_params(literals: &[Literal]) -> Vec<Param> {
+pub fn to_params(literals: &[Literal]) -> Vec<Param> {
     literals
         .iter()
         .map(|l| match l {
@@ -83,6 +83,8 @@ pub enum QueryFailure {
     /// The engine refused the statement, which at this point means one of the
     /// client's values was unusable (for example an impossible date).
     Rejected,
+    /// The query ran past the time limit and was cancelled.
+    TimedOut,
     Internal,
 }
 
@@ -90,6 +92,7 @@ impl QueryFailure {
     fn response(self) -> Response {
         match self {
             QueryFailure::Rejected => error(StatusCode::BAD_REQUEST, "The query could not be executed"),
+            QueryFailure::TimedOut => error(StatusCode::SERVICE_UNAVAILABLE, TOO_LONG),
             QueryFailure::Internal => error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
         }
     }
@@ -97,6 +100,9 @@ impl QueryFailure {
 
 /// Runs a planned statement off the async runtime. The engine's own error
 /// text goes to the server log only, never to the client.
+/// Shown wherever a query is cancelled for running too long.
+pub const TOO_LONG: &str = "That query took too long. Narrow it with a filter, choose fewer columns, or ask an administrator to raise the time limit.";
+
 pub async fn run(
     state: &Arc<AppState>,
     sql: String,
@@ -107,6 +113,7 @@ pub async fn run(
     let outcome = tokio::task::spawn_blocking(move || state.engine.query(&sql, &params, width)).await;
     match outcome {
         Ok(Ok(rows)) => Ok(rows),
+        Ok(Err(beam_engine::EngineError::TimedOut)) => Err(QueryFailure::TimedOut),
         Ok(Err(e)) => {
             eprintln!("query failed: {e}");
             Err(QueryFailure::Rejected)

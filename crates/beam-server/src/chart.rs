@@ -269,6 +269,7 @@ pub async fn chart(
                     })
                     .collect();
             }
+            Err(feed::QueryFailure::TimedOut) => problem = Some(feed::TOO_LONG),
             Err(_) => problem = Some("That chart could not be drawn. Check the filter value and try again."),
         },
         Err(_) => problem = Some("That chart could not be drawn. Check the filter value and try again."),

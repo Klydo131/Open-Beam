@@ -8,6 +8,7 @@ use crate::{quote_ident, EntitySet, Literal};
 
 const MAX_DEPTH: usize = 32;
 const MAX_FILTER_BYTES: usize = 8 * 1024;
+const MAX_IN_VALUES: usize = 1_000;
 
 /// OData function name, DuckDB function name, argument count.
 const FUNCTIONS: &[(&str, &str, usize)] = &[
@@ -37,6 +38,8 @@ pub enum FilterError {
     UnsupportedFunction(String),
     #[error("function '{0}' takes {1} argument(s)")]
     Arity(&'static str, usize),
+    #[error("'in' takes between 1 and {MAX_IN_VALUES} values")]
+    InList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +60,8 @@ pub enum Expr {
     DateTime(String),
     Call(&'static str, Vec<Expr>),
     Compare(Box<Expr>, CmpOp, Box<Expr>),
+    /// `property in (value, value, ...)`.
+    In(Box<Expr>, Vec<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
@@ -225,6 +230,26 @@ impl Parser {
 
     fn comparison(&mut self, depth: usize) -> Result<Expr, FilterError> {
         let left = self.primary(depth)?;
+        if self.eat_keyword("in") {
+            self.expect(Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                match self.primary(depth + 1)? {
+                    value @ (Expr::Value(_) | Expr::Date(_) | Expr::DateTime(_)) => values.push(value),
+                    _ => return self.syntax(),
+                }
+                if values.len() > MAX_IN_VALUES {
+                    return Err(FilterError::InList);
+                }
+                if self.peek() == Some(&Token::Comma) {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            self.expect(Token::RParen)?;
+            return Ok(Expr::In(Box::new(left), values));
+        }
         let op = match self.peek() {
             Some(Token::Ident(w)) => match w.as_str() {
                 "eq" => CmpOp::Eq,
@@ -360,6 +385,11 @@ pub fn to_sql(expr: &Expr, set: &EntitySet, params: &mut Vec<Literal>) -> Result
             let r = to_sql(right, set, params)?;
             format!("({l} {symbol} {r})")
         }
+        Expr::In(left, values) => {
+            let left = to_sql(left, set, params)?;
+            let rendered: Result<Vec<String>, FilterError> = values.iter().map(|v| to_sql(v, set, params)).collect();
+            format!("({left} IN ({}))", rendered?.join(", "))
+        }
         Expr::And(l, r) => format!("({} AND {})", to_sql(l, set, params)?, to_sql(r, set, params)?),
         Expr::Or(l, r) => format!("({} OR {})", to_sql(l, set, params)?, to_sql(r, set, params)?),
         Expr::Not(inner) => format!("(NOT {})", to_sql(inner, set, params)?),
@@ -462,5 +492,20 @@ mod tests {
         let nots = format!("{}id eq 1", "not ".repeat(100));
         assert_eq!(parse(&nots).unwrap_err(), FilterError::TooDeep);
         assert_eq!(parse(&"a".repeat(9000)).unwrap_err(), FilterError::TooLong);
+    }
+
+    #[test]
+    fn in_lists_bind_every_value_and_are_bounded() {
+        let (text, params) = sql("region in ('EU', 'US') and id in (1)");
+        assert_eq!(text, "((\"region\" IN (?, ?)) AND (\"id\" IN (?)))");
+        assert_eq!(
+            params,
+            vec![Literal::Text("EU".into()), Literal::Text("US".into()), Literal::Int(1)]
+        );
+        let fail = |f: &str| parse(f).and_then(|e| to_sql(&e, &set(), &mut Vec::new())).unwrap_err();
+        assert_eq!(fail("region in ()"), FilterError::Syntax(11));
+        assert_eq!(fail("region in (region)"), FilterError::Syntax(17));
+        let many = format!("id in ({})", vec!["1"; 1_001].join(","));
+        assert_eq!(fail(&many), FilterError::InList);
     }
 }
