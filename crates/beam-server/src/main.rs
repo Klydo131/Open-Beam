@@ -171,7 +171,21 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
         address.to_string(),
     );
     state.max_upload_bytes = config.max_upload_mb.saturating_mul(1024 * 1024);
-    axum::serve(listener, app::router(Arc::new(state)))
+    let state = Arc::new(state);
+    // Unreviewed drafts are swept hourly, not only at start-up.
+    let sweeper = state.clone();
+    tokio::spawn(async move {
+        let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            hourly.tick().await;
+            let worker = sweeper.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                review::remove_expired_drafts(&worker.engine, &worker.accounts, review::DRAFT_DAYS)
+            })
+            .await;
+        }
+    });
+    axum::serve(listener, app::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

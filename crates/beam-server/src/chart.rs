@@ -232,8 +232,8 @@ pub async fn chart(
     let filter_column = query.column.as_deref().and_then(|column| set.property(column));
     let mut filter_text = None;
     let mut carried: Vec<(&str, &str)> = Vec::new();
-    if let (Some(property), false) = (filter_column, filter_value.is_empty()) {
-        let op = query.op.as_deref().unwrap_or("");
+    let op = query.op.as_deref().unwrap_or("");
+    if let (Some(property), true) = (filter_column, !filter_value.is_empty() || !table::needs_value(op)) {
         match filter_expression(property, op, filter_value) {
             Ok(expression) => {
                 filter_text = Some(expression);

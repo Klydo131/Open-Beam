@@ -423,6 +423,7 @@ dependencies = [
  "beam-odata",
  "calamine",
  "clap",
+ "duckdb",
  "form_urlencoded",
  "getrandom 0.4.3",
  "http-body-util",

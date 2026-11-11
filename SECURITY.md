@@ -30,6 +30,13 @@ as untrusted.
   workbooks that declare more than 256 MB unpacked are refused, but a declared
   size can be falsified, so a crafted workbook can still use a lot of memory.
   Only signed-in accounts can upload.
+- **Dataset names are shared across all accounts.** Two datasets cannot
+  have the same name, so when a name is refused as "already in use", that
+  tells you some dataset by that name exists, even one you cannot see. Avoid
+  putting sensitive words in dataset names.
+- **Sign-in attempts are limited per username and in total.** Five failures
+  lock a username for five minutes, attempts in flight count towards that,
+  and at most four password checks run at once.
 - **Built-in datasets are visible to every account.** Datasets from
   `beam.toml` are shared with everyone; datasets added in the browser are
   private to their owner, the people they share with, and administrators.

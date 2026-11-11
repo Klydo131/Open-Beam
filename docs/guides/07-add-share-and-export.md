@@ -28,7 +28,8 @@ the original is always there.
 
 ![The review page: checks for empty and repeated rows, the name, and a preview](../images/screens/review.png)
 
-The first row should hold the column names. Files are limited to 50 MB by
+The first row should hold the column names. Files are limited to 1,000
+columns, and to 50 MB by
 default; an administrator can change this with `max_upload_mb` in
 `beam.toml`.
 
@@ -79,3 +80,20 @@ servers, which cannot sign in to Open Beam on your computer.
 
 In **Advanced** mode the panel also gives the address and a Power Query
 formula for exactly the view on screen.
+
+## Known limits when reading files
+
+These are on the list to improve. Until then, check the review page.
+
+- **Text encoding.** Files must be UTF-8 (the usual choice in "Save as CSV
+  UTF-8"). Files saved as Latin-1 or "Unicode text" (UTF-16) are refused.
+- **A first row of numbers** (for example `2023,2024`) is read as data, not as
+  column names, and the columns are named `column0`, `column1`.
+- **Dates such as 01/02/2024** are read as day first (1 February 2024). Use
+  `2024-02-01` to be unambiguous.
+- **Times with a time-zone offset** are kept as text.
+- **Excel formulas** are read using the value Excel last saved. A formula that
+  was never calculated arrives empty.
+- **Excel downloads** are limited by Excel itself to 16,384 columns and 32,767
+  characters per cell; Open Beam says so and suggests CSV instead.
+

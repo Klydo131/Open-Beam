@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Rows shown in the preview.
-const PREVIEW_ROWS: usize = 20;
+pub const PREVIEW_ROWS: usize = 20;
 /// Drafts nobody saves or discards are removed after this many days.
 pub const DRAFT_DAYS: u32 = 7;
 
@@ -82,10 +82,19 @@ pub async fn review(
         Ok(draft) => draft,
         Err(response) => return response,
     };
-    let worker = state.clone();
-    let file = draft.file.clone();
-    let preview =
-        tokio::task::spawn_blocking(move || worker.engine.preview(&file, format_of(&file), PREVIEW_ROWS)).await;
+    let preview = match state.remembered_preview(&draft.file) {
+        Some(preview) => Ok(Ok(preview)),
+        None => {
+            let worker = state.clone();
+            let file = draft.file.clone();
+            tokio::task::spawn_blocking(move || {
+                let preview = worker.engine.preview(&file, format_of(&file), PREVIEW_ROWS)?;
+                worker.remember_preview(&file, preview.clone());
+                Ok::<_, beam_engine::EngineError>(Arc::new(preview))
+            })
+            .await
+        }
+    };
     let Ok(Ok(preview)) = preview else {
         return message_page(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -244,7 +253,10 @@ pub async fn save(State(state): App, Path(id): Path<i64>, headers: HeaderMap, Fo
         return back("failed");
     }
     match state.accounts.save_draft(draft.id, &name, cleaning) {
-        Ok(_) => redirect(&format!("/datasets/{name}")),
+        Ok(_) => {
+            state.forget_preview(&draft.file);
+            redirect(&format!("/datasets/{name}"))
+        }
         Err(e) => {
             let _ = state.engine.remove(&name);
             back(if matches!(e, beam_accounts::AccountError::NameTaken) {
@@ -279,6 +291,7 @@ pub async fn discard(
         Err(response) => return response,
     };
     remove_draft(&state.engine, &state.accounts, &draft);
+    state.forget_preview(&draft.file);
     redirect("/?ok=discarded")
 }
 

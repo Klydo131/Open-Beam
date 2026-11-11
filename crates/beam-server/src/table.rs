@@ -36,7 +36,7 @@ const OPERATORS: &[(&str, &str, bool)] = &[
 ];
 
 /// Comparisons that need no value.
-fn needs_value(op: &str) -> bool {
+pub fn needs_value(op: &str) -> bool {
     !matches!(op, "empty" | "notempty")
 }
 

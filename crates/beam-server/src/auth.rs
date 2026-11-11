@@ -3,7 +3,7 @@
 use crate::app::AppState;
 use crate::feed;
 use axum::extract::{Request, State};
-use axum::http::header::{AUTHORIZATION, COOKIE, WWW_AUTHENTICATE};
+use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -20,15 +20,37 @@ const FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const FEED_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_TRACKED: usize = 10_000;
 
+/// Password checks that may run at once. Each Argon2 check holds about
+/// 19 MiB, so this bounds memory under a flood of sign-in attempts.
+const CONCURRENT_PASSWORD_CHECKS: usize = 4;
+
+/// Sign-in attempts for one username within the current window.
+struct Attempts {
+    failed: u32,
+    /// Checks started but not finished. They count against the limit, so a
+    /// burst of simultaneous guesses cannot all slip in before any is recorded.
+    pending: u32,
+    since: Instant,
+}
+
 /// In-memory limits and caches. Nothing here survives a restart.
-#[derive(Default)]
 pub struct Guard {
-    /// Recent failed sign-ins per username.
-    failures: Mutex<HashMap<String, (u32, Instant)>>,
+    attempts: Mutex<HashMap<String, Attempts>>,
     /// Feed clients send their password with every request. Verifying a
     /// password is deliberately slow, so a successful check is remembered
     /// briefly, keyed by a digest of the credentials.
     verified: Mutex<HashMap<[u8; 32], (i64, Instant)>>,
+    checks: tokio::sync::Semaphore,
+}
+
+impl Default for Guard {
+    fn default() -> Self {
+        Self {
+            attempts: Mutex::default(),
+            verified: Mutex::default(),
+            checks: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
+        }
+    }
 }
 
 impl Guard {
@@ -36,33 +58,45 @@ impl Guard {
         username.trim().to_ascii_lowercase().chars().take(64).collect()
     }
 
-    pub fn is_locked(&self, username: &str) -> bool {
-        let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        failures
-            .get(&Self::key(username))
-            .is_some_and(|(count, since)| *count >= MAX_FAILURES && since.elapsed() < FAILURE_WINDOW)
+    /// Reserves a sign-in attempt, or refuses when the username has used up
+    /// its attempts. Reserving and checking happen under one lock.
+    fn begin(&self, username: &str) -> bool {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        if attempts.len() >= MAX_TRACKED {
+            attempts.retain(|_, a| a.pending > 0 || a.since.elapsed() < FAILURE_WINDOW);
+        }
+        if attempts.len() >= MAX_TRACKED {
+            attempts.retain(|_, a| a.pending > 0);
+        }
+        let entry = attempts.entry(Self::key(username)).or_insert(Attempts {
+            failed: 0,
+            pending: 0,
+            since: Instant::now(),
+        });
+        if entry.since.elapsed() >= FAILURE_WINDOW && entry.pending == 0 {
+            *entry = Attempts {
+                failed: 0,
+                pending: 0,
+                since: Instant::now(),
+            };
+        }
+        if entry.failed + entry.pending >= MAX_FAILURES {
+            return false;
+        }
+        entry.pending += 1;
+        true
     }
 
-    pub fn record_failure(&self, username: &str) {
-        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        if failures.len() >= MAX_TRACKED {
-            failures.retain(|_, (_, since)| since.elapsed() < FAILURE_WINDOW);
+    fn finish(&self, username: &str, succeeded: bool) {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = attempts.get_mut(&Self::key(username)) {
+            entry.pending = entry.pending.saturating_sub(1);
+            if succeeded {
+                entry.failed = 0;
+            } else {
+                entry.failed += 1;
+            }
         }
-        if failures.len() >= MAX_TRACKED {
-            failures.clear();
-        }
-        let entry = failures.entry(Self::key(username)).or_insert((0, Instant::now()));
-        if entry.1.elapsed() >= FAILURE_WINDOW {
-            *entry = (0, Instant::now());
-        }
-        entry.0 += 1;
-    }
-
-    pub fn record_success(&self, username: &str) {
-        self.failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&Self::key(username));
     }
 
     /// Called whenever any account changes, so a disabled account or an old
@@ -111,22 +145,22 @@ pub fn expired_cookie() -> HeaderValue {
 /// Checks a username and password off the async runtime, applying the
 /// failed-attempt limit. `Err` means too many recent failures.
 pub async fn check_password(state: &Arc<AppState>, username: &str, password: &str) -> Result<Option<Account>, ()> {
-    if state.guard.is_locked(username) {
+    if !state.guard.begin(username) {
         return Err(());
     }
-    let (worker, name, secret) = (state.clone(), username.to_string(), password.to_string());
-    let verified = tokio::task::spawn_blocking(move || worker.accounts.verify(&name, &secret)).await;
-    match verified {
-        Ok(Ok(Some(account))) => {
-            state.guard.record_success(username);
-            Ok(Some(account))
+    let verified = match state.guard.checks.acquire().await {
+        Ok(_permit) => {
+            let (worker, name, secret) = (state.clone(), username.to_string(), password.to_string());
+            tokio::task::spawn_blocking(move || worker.accounts.verify(&name, &secret)).await
         }
-        Ok(Ok(None)) => {
-            state.guard.record_failure(username);
-            Ok(None)
-        }
-        _ => Ok(None),
-    }
+        Err(_) => Ok(Ok(None)),
+    };
+    let account = match verified {
+        Ok(Ok(account)) => account,
+        _ => None,
+    };
+    state.guard.finish(username, account.is_some());
+    Ok(account)
 }
 
 fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
@@ -205,14 +239,23 @@ async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Option<Acco
 /// Browsers label where a request came from. A form posted from another site
 /// is refused before it reaches a handler; the per-session token in each form
 /// is the second line of defence.
-pub async fn same_site_posts_only(request: Request, next: Next) -> Response {
-    let cross_site = request.method() == Method::POST
-        && request
-            .headers()
-            .get("sec-fetch-site")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|site| site != "same-origin" && site != "none");
-    if cross_site {
+///
+/// Browsers that do not send that label still send `Origin` on a form post;
+/// it must name this site. This also covers the sign-in form, which has no
+/// session token yet.
+pub async fn same_site_posts_only(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let labelled_cross_site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|site| site != "same-origin" && site != "none");
+    let foreign_origin = headers.get(ORIGIN).is_some_and(|origin| {
+        let origin = origin.to_str().unwrap_or("null");
+        let host = headers.get(HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+        let ours = [format!("http://{host}"), format!("https://{host}")];
+        !(ours.iter().any(|o| o == origin) || state.public_url.as_deref() == Some(origin))
+    });
+    if request.method() == Method::POST && (labelled_cross_site || foreign_origin) {
         return crate::web::message_page(
             StatusCode::FORBIDDEN,
             "Request refused",

@@ -74,14 +74,49 @@ pub fn csv_field(text: &str) -> String {
     }
 }
 
+/// Most cells, counting the empty ones, a converted sheet may expand to. A
+/// workbook can name a far corner such as XFD1048576 in a few bytes; without
+/// this bound that would become billions of empty cells.
+const MAX_SHEET_CELLS: u64 = 50_000_000;
+/// Most cells holding a value that a sheet may contain.
+const MAX_FILLED_CELLS: usize = 10_000_000;
+
+fn cell_text(cell: &calamine::DataRef<'_>) -> Option<String> {
+    use calamine::DataRef;
+    Some(match cell {
+        DataRef::Empty | DataRef::Error(_) => return None,
+        DataRef::String(s) | DataRef::DateTimeIso(s) | DataRef::DurationIso(s) => csv_field(s),
+        DataRef::SharedString(s) => csv_field(s),
+        DataRef::Int(i) => i.to_string(),
+        DataRef::Float(f) => f.to_string(),
+        DataRef::Bool(b) => b.to_string(),
+        DataRef::DateTime(dt) if dt.is_datetime() => {
+            let (y, mo, d, h, mi, s, _) = dt.to_ymd_hms_milli();
+            if dt.as_f64() < 1.0 {
+                // A time of day with no date.
+                format!("{h:02}:{mi:02}:{s:02}")
+            } else if (h, mi, s) == (0, 0, 0) {
+                format!("{y:04}-{mo:02}-{d:02}")
+            } else {
+                format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+            }
+        }
+        DataRef::DateTime(dt) => dt.as_f64().to_string(),
+    })
+}
+
 /// Converts the first sheet of a workbook to CSV for the engine to read.
+///
+/// Cells are read one at a time and only filled ones are kept, so the size
+/// of the result is known, and bounded, before it is built.
 fn excel_to_csv(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
-    use calamine::{Data, Reader, Xlsx};
+    use calamine::{Reader, Xlsx};
     let unreadable = "That workbook could not be read. Check it opens in Excel.";
+    let too_large = "That workbook is too large to add.";
     {
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| unreadable)?;
         if archive.len() > MAX_XLSX_ENTRIES {
-            return Err("That workbook is too large to add.");
+            return Err(too_large);
         }
         let mut unpacked: u64 = 0;
         for index in 0..archive.len() {
@@ -89,40 +124,55 @@ fn excel_to_csv(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
             unpacked = unpacked.saturating_add(entry.size());
         }
         if unpacked > MAX_UNPACKED_XLSX {
-            return Err("That workbook is too large to add.");
+            return Err(too_large);
         }
     }
     let mut workbook: Xlsx<_> = calamine::open_workbook_from_rs(Cursor::new(bytes)).map_err(|_| unreadable)?;
-    let range = workbook
-        .worksheet_range_at(0)
-        .ok_or("That workbook has no sheets.")?
-        .map_err(|_| unreadable)?;
-    let mut out = Vec::new();
-    for row in range.rows() {
-        let fields: Vec<String> = row
-            .iter()
-            .map(|cell| match cell {
-                Data::Empty | Data::Error(_) => String::new(),
-                Data::String(s) => csv_field(s),
-                Data::Int(i) => i.to_string(),
-                Data::Float(f) => f.to_string(),
-                Data::Bool(b) => b.to_string(),
-                Data::DateTime(dt) if dt.is_datetime() => {
-                    let (y, mo, d, h, mi, s, _) = dt.to_ymd_hms_milli();
-                    if (h, mi, s) == (0, 0, 0) {
-                        format!("{y:04}-{mo:02}-{d:02}")
-                    } else {
-                        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
-                    }
-                }
-                Data::DateTime(dt) => dt.as_f64().to_string(),
-                Data::DateTimeIso(s) | Data::DurationIso(s) => csv_field(s),
-            })
-            .collect();
-        writeln!(out, "{}", fields.join(",")).map_err(|_| unreadable)?;
+    let first = workbook
+        .sheet_names()
+        .first()
+        .cloned()
+        .ok_or("That workbook has no sheets.")?;
+    let mut reader = workbook.worksheet_cells_reader(&first).map_err(|_| unreadable)?;
+    let mut cells: Vec<(u32, u32, String)> = Vec::new();
+    while let Some(cell) = reader.next_cell().map_err(|_| unreadable)? {
+        if let Some(text) = cell_text(cell.get_value()) {
+            if cells.len() >= MAX_FILLED_CELLS {
+                return Err(too_large);
+            }
+            let (row, col) = cell.get_position();
+            cells.push((row, col, text));
+        }
     }
-    if out.iter().all(|b| matches!(b, b',' | b'\n')) {
+    drop(reader);
+    if cells.is_empty() {
         return Err("The first sheet of that workbook is empty.");
+    }
+    let (top, left) = (
+        cells.iter().map(|c| c.0).min().unwrap_or(0),
+        cells.iter().map(|c| c.1).min().unwrap_or(0),
+    );
+    let (bottom, right) = (
+        cells.iter().map(|c| c.0).max().unwrap_or(0),
+        cells.iter().map(|c| c.1).max().unwrap_or(0),
+    );
+    let width = u64::from(right - left) + 1;
+    let height = u64::from(bottom - top) + 1;
+    if width > beam_engine::MAX_UPLOAD_COLUMNS as u64 {
+        return Err("That sheet has more columns than Open Beam accepts (1,000).");
+    }
+    if width.saturating_mul(height) > MAX_SHEET_CELLS {
+        return Err(too_large);
+    }
+    cells.sort_unstable_by_key(|c| (c.0, c.1));
+    let mut out = Vec::new();
+    let mut next = cells.into_iter().peekable();
+    for row in top..=bottom {
+        let mut fields = vec![String::new(); width as usize];
+        while let Some((_, col, text)) = next.next_if(|c| c.0 == row) {
+            fields[(col - left) as usize] = text;
+        }
+        writeln!(out, "{}", fields.join(",")).map_err(|_| unreadable)?;
     }
     Ok(out)
 }
@@ -302,10 +352,22 @@ fn store_draft(
         let _ = std::fs::remove_file(&path);
         return Err("Could not store that file. Please try again.");
     }
-    if let Err(e) = state.engine.preview(&file, format_of(&file), 1) {
-        eprintln!("upload {file} not readable: {e}");
-        let _ = std::fs::remove_file(&path);
-        return Err("That file could not be read as a table. Check that its first row holds the column names.");
+    // The review page shows this same preview, so it is worked out once here.
+    match state
+        .engine
+        .preview(&file, format_of(&file), crate::review::PREVIEW_ROWS)
+    {
+        Ok(preview) => state.remember_preview(&file, preview),
+        Err(e) => {
+            eprintln!("upload {file} not readable: {e}");
+            let _ = std::fs::remove_file(&path);
+            return Err(match e {
+                beam_engine::EngineError::TooWide => {
+                    "That file has more than 1,000 columns, which Open Beam does not accept."
+                }
+                _ => "That file could not be read as a table. Check that its first row holds the column names.",
+            });
+        }
     }
     match state.accounts.create_draft(owner, &file, original_name) {
         Ok(draft) => Ok(draft.id),
@@ -471,7 +533,19 @@ pub async fn share(
         &headers,
         &name,
         &form.csrf,
-        |state, upload| state.accounts.share(upload, form.account),
+        |state, upload| {
+            // Sharing with the owner would add nothing and clutter the list.
+            let owner = state
+                .accounts
+                .uploads()?
+                .into_iter()
+                .find(|u| u.id == upload)
+                .map(|u| u.owner_id);
+            if owner == Some(form.account) {
+                return Err(AccountError::NotFound);
+            }
+            state.accounts.share(upload, form.account)
+        },
         "shared",
     )
     .await
@@ -633,5 +707,40 @@ mod tests {
         let csv = String::from_utf8(excel_to_csv(&bytes).unwrap()).unwrap();
         assert_eq!(csv, "region,units,sold on\n\"North, East\",12,2025-03-01\nSouth,4.5,\n");
         assert!(excel_to_csv(b"PK\x03\x04 not really a zip").is_err());
+    }
+
+    fn workbook(cells: &[(u32, u16, &str)]) -> Vec<u8> {
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let sheet = workbook.add_worksheet();
+        for (row, col, text) in cells {
+            sheet.write(*row, *col, *text).unwrap();
+        }
+        workbook.save_to_buffer().unwrap()
+    }
+
+    #[test]
+    fn a_far_corner_cell_is_refused_without_building_the_grid() {
+        // A few kilobytes that would expand to 16,384 x 1,048,576 cells.
+        let corner = workbook(&[(0, 0, "name"), (1, 0, "x"), (1_048_575, 16_383, "far")]);
+        assert!(corner.len() < 20_000);
+        assert!(excel_to_csv(&corner).unwrap_err().contains("more columns"));
+        let tall = workbook(&[(0, 0, "name"), (0, 999, "z"), (1_048_575, 0, "far")]);
+        assert_eq!(excel_to_csv(&tall).unwrap_err(), "That workbook is too large to add.");
+        // A sheet that starts away from A1 keeps its shape.
+        let offset = workbook(&[(2, 2, "a"), (2, 3, "b"), (3, 3, "1")]);
+        assert_eq!(String::from_utf8(excel_to_csv(&offset).unwrap()).unwrap(), "a,b\n,1\n");
+    }
+
+    #[test]
+    fn excel_time_only_cells_stay_times() {
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.write(0, 0, "starts").unwrap();
+        let time = rust_xlsxwriter::ExcelDateTime::parse_from_str("12:30:00").unwrap();
+        sheet
+            .write_with_format(1, 0, &time, &rust_xlsxwriter::Format::new().set_num_format("hh:mm"))
+            .unwrap();
+        let csv = String::from_utf8(excel_to_csv(&workbook.save_to_buffer().unwrap()).unwrap()).unwrap();
+        assert_eq!(csv, "starts\n12:30:00\n");
     }
 }
