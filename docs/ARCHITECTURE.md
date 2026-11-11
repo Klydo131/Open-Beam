@@ -86,8 +86,22 @@ with [axum](https://github.com/tokio-rs/axum).
 - **Charts** are SVG drawn on the server from a grouped summary, styled by
   the page's stylesheet, with the same figures repeated in a table for anyone
   who cannot see the drawing.
+- **Programs** sign in with personal API tokens: long random secrets of
+  which only a digest is stored. They reach a read-only REST API under
+  `/api/v1`, described by a hand-written OpenAPI document, and a read-only
+  MCP endpoint at `/mcp` for AI assistants. Both are thin layers over the
+  same planner as the feed and see exactly what the feed would.
+- **PostgreSQL access** (off unless `postgres_bind` is set) speaks the
+  PostgreSQL wire protocol directly. Each statement is parsed by DuckDB's own
+  parser into a syntax tree, and the tree is checked against short lists of
+  allowed query shapes, table references and functions before it is turned
+  back into SQL and run. Because the checked tree is what runs, the check and
+  the engine cannot disagree about what a statement means. Catalog tables
+  such as `information_schema.tables` are rebuilt for each account from the
+  datasets it can see.
 - Queries and password hashing run on a blocking thread pool so they do not
-  stall other requests.
+  stall other requests, and every query is cancelled when it outlasts the
+  configured time limit.
 
 ## Security model
 
@@ -107,8 +121,9 @@ everything arriving over the network is not.
 | Clickjacking | Pages may not be framed. |
 | Privilege escalation | Role checks run on every administrative request; the last active administrator cannot be demoted or disabled. |
 | Stale access | Disabling an account or changing its password ends its sessions and its feed access at once. |
-| Resource exhaustion | Filters are bounded in size and depth; responses are bounded by a page size; passwords are bounded in length before hashing. |
-| Information leaks in errors | Engine error text is logged on the server and never returned to the client. |
+| Resource exhaustion | Filters are bounded in size and depth; responses are bounded by a page size; every query has a time limit; passwords are bounded in length before hashing; sign-in checks are bounded in number and in queue length. |
+| Arbitrary SQL from PostgreSQL clients | Only `SELECT`; the engine's own syntax tree is checked against allow-lists of query shapes, tables and functions; datasets the account cannot see look like missing tables; account passwords are never accepted, only revocable tokens. |
+| Information leaks in errors | Engine error text is logged on the server and not returned to the client. The one exception is PostgreSQL access, which repeats the engine's explanation of a mistake in the client's own query (an unknown column, a value of the wrong type) only when it names no file. |
 | Unsafe Rust | `unsafe` is forbidden in every crate in this workspace. |
 
 Known limits are listed in [SECURITY.md](../SECURITY.md).
@@ -118,14 +133,14 @@ Known limits are listed in [SECURITY.md](../SECURITY.md).
 These are design intentions, not implemented features. Order and scope are
 tracked in the [roadmap](ROADMAP.md).
 
-- **PostgreSQL wire protocol.** A second listener that lets any
-  PostgreSQL-capable client send SQL. It will sit beside `beam-odata` and share
-  `beam-engine`.
+- **PostgreSQL catalog compatibility.** Enough of PostgreSQL's internal
+  catalog for the drivers behind Power BI's and Excel's PostgreSQL
+  connectors.
 - **Database sources.** Datasets backed by PostgreSQL and SQLite databases that
   the user operates. Open Beam will hold connection settings only.
 - **Dashboards.** Several charts arranged as panels on one page, in the style
   of monitoring tools.
-- **Assistant integrations.** An optional provider interface for language
+- **Assistant integrations.** Beyond the read-only MCP endpoint, an optional provider interface for language
   models, disabled by default. Users supply their own credentials, which stay
   on their machine. Applications built on Open Beam choose and are responsible
   for their own integrations.

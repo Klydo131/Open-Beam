@@ -51,6 +51,9 @@ pub enum EngineError {
     TimedOut,
     #[error("uploads are not enabled")]
     UploadsDisabled,
+    /// The engine's parser refused a statement. The message is safe to show.
+    #[error("{0}")]
+    Syntax(String),
     #[error(transparent)]
     Database(#[from] duckdb::Error),
 }
@@ -530,6 +533,84 @@ impl Engine {
         let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(&table)));
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    /// Parses one statement with the engine's own parser and returns its
+    /// syntax tree as JSON. Only `SELECT` statements can be parsed this way,
+    /// and checking the tree that will actually run leaves no room for two
+    /// parsers to disagree about what a statement means.
+    pub fn parse_select(&self, sql: &str) -> Result<Value, EngineError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+        let text: String = self.within_time_limit(&conn, || {
+            Ok(conn.query_row("SELECT json_serialize_sql(?::VARCHAR)", [sql], |row| row.get(0))?)
+        })?;
+        let tree: Value =
+            serde_json::from_str(&text).map_err(|_| EngineError::Syntax("unreadable syntax tree".into()))?;
+        if tree["error"] == Value::Bool(true) {
+            let message = tree["error_message"].as_str().unwrap_or("syntax error");
+            return Err(EngineError::Syntax(message.to_string()));
+        }
+        Ok(tree)
+    }
+
+    /// Turns a syntax tree from [`Engine::parse_select`] back into SQL.
+    pub fn render_select(&self, tree: &Value) -> Result<String, EngineError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+        let json = tree.to_string();
+        self.within_time_limit(&conn, || {
+            Ok(
+                conn.query_row("SELECT json_deserialize_sql(?::JSON)", [json.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?,
+            )
+        })
+    }
+
+    /// The names and engine types of the columns `sql` returns, without
+    /// running it.
+    pub fn describe_select(&self, sql: &str) -> Result<Vec<(String, String)>, EngineError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+        self.within_time_limit(&conn, || {
+            let mut describe = conn.prepare(&format!("DESCRIBE SELECT * FROM ({sql}) AS beam_result"))?;
+            let columns = describe
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<_, _>>()?;
+            Ok(columns)
+        })
+    }
+
+    /// Runs `sql` with every value turned into text, handing rows to `each`
+    /// as they are produced; `each` returns `false` to stop early. Returns
+    /// the number of rows handed over. Runs under the time limit.
+    pub fn stream_text(
+        &self,
+        sql: &str,
+        params: &[Param],
+        width: usize,
+        mut each: impl FnMut(Vec<Option<String>>) -> bool,
+    ) -> Result<u64, EngineError> {
+        let columns = (1..=width)
+            .map(|n| format!("CAST(#{n} AS VARCHAR)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wrapped = format!("SELECT {columns} FROM ({sql}) AS beam_result");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+        self.within_time_limit(&conn, || {
+            let mut statement = conn.prepare(&wrapped)?;
+            let mut rows = statement.query(params_from_iter(params.iter().map(to_duck)))?;
+            let mut sent = 0;
+            while let Some(row) = rows.next()? {
+                let mut values = Vec::with_capacity(width);
+                for index in 0..width {
+                    values.push(row.get::<_, Option<String>>(index)?);
+                }
+                sent += 1;
+                if !each(values) {
+                    break;
+                }
+            }
+            Ok(sent)
+        })
     }
 
     fn run(conn: &Connection, sql: &str, params: &[Param], width: usize) -> Result<Vec<Vec<Value>>, EngineError> {

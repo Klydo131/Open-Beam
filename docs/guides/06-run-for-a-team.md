@@ -54,6 +54,11 @@ So that the links it sends to Excel and Power BI are correct, set in
 public_url = "https://beam.example.org"
 ```
 
+This is required, not only tidy: Open Beam refuses form posts whose origin
+does not match its own address, which protects against forged requests.
+Without `public_url`, a proxy that passes on a different host name makes
+sign-in and every other form fail.
+
 ## Step 4: Keep it running
 
 Use your operating system's service manager (systemd on Linux, Task Scheduler

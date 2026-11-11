@@ -17,6 +17,14 @@ accounts = "beam-accounts.sqlite"
 # Set when Open Beam is published through an HTTPS reverse proxy.
 # public_url = "https://beam.example.org"
 
+# Longest a single query may run before it is cancelled, in seconds (1-3600).
+# query_timeout_seconds = 30
+
+# Read-only access for PostgreSQL tools such as psql or DBeaver. Off unless
+# set. Sign in with your username and a personal API token from Settings.
+# The connection is not encrypted, so keep it on this computer.
+# postgres_bind = "127.0.0.1:5433"
+
 # A dataset from a CSV or Parquet file.
 [[dataset]]
 name = "sales"

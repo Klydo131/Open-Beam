@@ -2521,3 +2521,192 @@ async fn an_assistant_reads_at_most_200_rows_per_call_whatever_it_asks() {
         .json();
     assert_eq!(api["rows"].as_array().unwrap().len(), 300);
 }
+
+// ------------------------------------------------------- PostgreSQL clients
+
+/// Starts PostgreSQL access for `site` on a free local port.
+async fn postgres_port(site: &Site) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(crate::postgres::serve(listener, site.state.clone()));
+    port
+}
+
+async fn pg_connect(port: u16, user: &str, password: &str) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+    let config = format!("host=127.0.0.1 port={port} user={user} password={password} dbname=beam sslmode=disable");
+    let (client, connection) = tokio_postgres::connect(&config, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    Ok(client)
+}
+
+fn pg_code(error: &tokio_postgres::Error) -> String {
+    error
+        .code()
+        .map(|c| c.code().to_string())
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// The text values of every row a simple query returns.
+async fn pg_text(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((0..row.len()).map(|i| row.get(i).map(str::to_string)).collect())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn postgres_clients_sign_in_with_a_token_and_see_only_their_datasets() {
+    let site = site(false, 100);
+    let cyd_id = site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap().id;
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    upload(&site, &bob, &bob_csrf, "budget.csv", BUDGET, "").await;
+    let bob_id = site
+        .state
+        .accounts
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.username == "bob")
+        .unwrap()
+        .id;
+    let (_, bob_token) = site.state.accounts.create_token(bob_id, "psql").unwrap();
+    let (_, cyd_token) = site.state.accounts.create_token(cyd_id, "psql").unwrap();
+    let port = postgres_port(&site).await;
+
+    // Only a token works as the password, and only for its own account.
+    assert!(pg_connect(port, "bob", USER_PASSWORD).await.is_err());
+    assert!(pg_connect(port, "bob", &cyd_token).await.is_err());
+    let cyd = pg_connect(port, "cyd", &cyd_token).await.unwrap();
+    let bob = pg_connect(port, "BOB", &bob_token).await.unwrap();
+
+    let tables = "SELECT table_name FROM information_schema.tables ORDER BY table_name";
+    let names = |rows: Vec<Vec<Option<String>>>| rows.into_iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>();
+    assert_eq!(names(pg_text(&cyd, tables).await), vec!["many", "sales"]);
+    assert_eq!(names(pg_text(&bob, tables).await), vec!["budget", "many", "sales"]);
+
+    // Someone else's upload looks exactly like a table that does not exist.
+    for sql in [
+        "SELECT * FROM budget",
+        "SELECT * FROM main.budget",
+        "SELECT * FROM nothing_here",
+    ] {
+        let error = cyd.simple_query(sql).await.unwrap_err();
+        assert_eq!(pg_code(&error), "42P01", "{sql}");
+    }
+    assert_eq!(
+        pg_text(&bob, "SELECT count(*) FROM budget").await,
+        vec![vec![Some("3".into())]]
+    );
+
+    // Prepared statements with parameters, results in binary as drivers ask.
+    let rows = cyd
+        .query(
+            "SELECT order_id, region FROM sales WHERE region = $1 ORDER BY order_id",
+            &[&"EU"],
+        )
+        .await
+        .unwrap();
+    let found: Vec<(i64, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(found, vec![(1, "EU".to_string()), (3, "EU".to_string())]);
+    let total: f64 = cyd
+        .query_one("SELECT sum(amount) FROM sales WHERE order_id > $1::BIGINT", &[&"1"])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(total, 90.25);
+
+    // Values in PostgreSQL's own text forms.
+    let values = pg_text(
+        &cyd,
+        "SELECT true, 2.50::DECIMAL(10,2), DATE '2024-01-05', TIMESTAMP '2024-01-06 08:30:00', 'x', NULL",
+    )
+    .await;
+    assert_eq!(
+        values,
+        vec![vec![
+            Some("t".into()),
+            Some("2.50".into()),
+            Some("2024-01-05".into()),
+            Some("2024-01-06 08:30:00".into()),
+            Some("x".into()),
+            None
+        ]]
+    );
+    let version = pg_text(&cyd, "SELECT version()").await;
+    assert!(version[0][0].as_deref().unwrap().contains("Open Beam"));
+
+    // What clients send while setting up is accepted without doing anything.
+    cyd.batch_execute("SET DateStyle = ISO; BEGIN; COMMIT").await.unwrap();
+    assert_eq!(
+        pg_text(&cyd, "SHOW transaction_read_only").await,
+        vec![vec![Some("on".into())]]
+    );
+}
+
+#[tokio::test]
+async fn postgres_clients_cannot_reach_files_settings_or_other_tables() {
+    let site = site(false, 100);
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    upload(&site, &bob, &bob_csrf, "budget.csv", BUDGET, "").await;
+    let cyd_id = site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap().id;
+    let (_, token) = site.state.accounts.create_token(cyd_id, "psql").unwrap();
+    let port = postgres_port(&site).await;
+    let cyd = pg_connect(port, "cyd", &token).await.unwrap();
+    let upload_file = site.state.accounts.uploads().unwrap()[0].file.clone();
+    let upload_dir = site.state.engine.upload_dir().unwrap().to_string_lossy().into_owned();
+
+    for sql in [
+        "INSERT INTO sales VALUES (1)".to_string(),
+        "CREATE TABLE x AS SELECT 1".to_string(),
+        "COPY sales TO 'x.csv'".to_string(),
+        "ATTACH 'x.db'".to_string(),
+        "PRAGMA version".to_string(),
+        format!("SELECT * FROM read_csv('{upload_file}')"),
+        format!("SELECT * FROM '{upload_file}'"),
+        "SELECT * FROM duckdb_tables()".to_string(),
+        // `repeat` is an allowed function, but not as a table source.
+        "SELECT * FROM repeat(1, 3)".to_string(),
+        // Lambdas are refused wherever they appear.
+        "SELECT COLUMNS(c -> c LIKE 'o%') FROM sales".to_string(),
+        "SELECT * FROM duckdb_views".to_string(),
+        "SELECT current_setting('allowed_directories')".to_string(),
+        "SELECT getvariable('x')".to_string(),
+        "SELECT * FROM pg_catalog.pg_class".to_string(),
+        "SELECT * FROM information_schema.views".to_string(),
+        "SELECT * FROM memory.main.budget".to_string(),
+        "WITH budget AS (SELECT 1) SELECT * FROM budget".to_string(),
+        "WITH x AS (SELECT * FROM budget) SELECT * FROM x".to_string(),
+        "SELECT (SELECT count(*) FROM budget)".to_string(),
+        "SELECT * FROM sales AT (VERSION => 1)".to_string(),
+        "SELECT list_transform([1], x -> x + 1)".to_string(),
+        "SELECT 1; SELECT 2".to_string(),
+        "SELECT $name".to_string(),
+    ] {
+        let error = cyd
+            .simple_query(&sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was allowed"));
+        let message = error.as_db_error().map(|e| e.message().to_string()).unwrap_or_default();
+        // Names the client typed may be repeated back; the server's own folders never are.
+        assert!(!message.contains(&upload_dir), "{sql}: {message}");
+    }
+    // A session command is ignored whole, so nothing after it runs.
+    let ignored = cyd.simple_query("SET threads = 1; SELECT * FROM budget").await.unwrap();
+    assert!(!ignored
+        .iter()
+        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))));
+    // The connection is still usable after every refusal.
+    assert_eq!(
+        pg_text(&cyd, "SELECT count(*) FROM sales").await,
+        vec![vec![Some("4".into())]]
+    );
+}

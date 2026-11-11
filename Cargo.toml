@@ -13,7 +13,7 @@ repository = "https://github.com/Klydo131/Open-Beam"
 beam-accounts = { path = "crates/beam-accounts" }
 beam-engine = { path = "crates/beam-engine" }
 beam-odata = { path = "crates/beam-odata" }
-duckdb = { version = "1", features = ["bundled", "parquet"] }
+duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 thiserror = "2"

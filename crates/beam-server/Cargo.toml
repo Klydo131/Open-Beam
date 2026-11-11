@@ -16,7 +16,7 @@ beam-accounts.workspace = true
 beam-engine.workspace = true
 beam-odata.workspace = true
 axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.9"
@@ -36,6 +36,7 @@ duckdb.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+tokio-postgres = "0.7"
 
 [lints]
 workspace = true

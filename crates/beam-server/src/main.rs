@@ -10,6 +10,8 @@ mod export;
 mod feed;
 mod mcp;
 mod people;
+mod pgsql;
+mod postgres;
 mod review;
 mod table;
 #[cfg(test)]
@@ -146,6 +148,14 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     restore_uploads(&engine, &accounts);
     review::remove_expired_drafts(&engine, &accounts, review::DRAFT_DAYS);
 
+    let postgres = match config.postgres_bind {
+        Some(bind) => Some(
+            tokio::net::TcpListener::bind(bind)
+                .await
+                .map_err(|e| format!("cannot listen for PostgreSQL clients on {bind}: {e}"))?,
+        ),
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
@@ -158,6 +168,12 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     );
     println!("  Open in your browser:        {base}/");
     println!("  Data feed (Excel, Power BI): {base}/odata/");
+    if let Some(bind) = postgres.as_ref().and_then(|l| l.local_addr().ok()) {
+        println!("  PostgreSQL clients (read-only): {bind}  (password: a personal API token)");
+        if !bind.ip().is_loopback() {
+            println!("  Warning: PostgreSQL access is unencrypted. Put it behind a TLS tunnel before using it across a network.");
+        }
+    }
     if account_count == 0 {
         println!("  No accounts yet. Open the address above to create the administrator.");
     }
@@ -188,6 +204,9 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
             .await;
         }
     });
+    if let Some(postgres) = postgres {
+        tokio::spawn(postgres::serve(postgres, state.clone()));
+    }
     axum::serve(listener, app::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

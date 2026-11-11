@@ -35,6 +35,10 @@ Milestones are ordered. Each one should leave the project usable on its own.
 - [x] Advanced: column choice, more filters, feed address and Power Query for a view
 - [x] Starts with no configuration file and opens the browser
 - [x] Release workflow building downloads for Windows, macOS and Linux
+- [x] Personal API tokens, created and revoked in Settings
+- [x] Read-only REST API with an OpenAPI description, and Parquet downloads
+- [x] Read-only MCP server for AI assistants
+- [x] A time limit on every query
 - [ ] First published release, and signed downloads
 - [ ] Combine datasets from the browser (join, de-duplicate) without SQL
 
@@ -56,14 +60,17 @@ Milestones are ordered. Each one should leave the project usable on its own.
 
 ## 0.6 — PostgreSQL wire protocol
 
-- [ ] Read-only SQL access for PostgreSQL-compatible clients
+- [x] Read-only SQL access for PostgreSQL-compatible clients (off by default)
 - [ ] Catalog compatibility for the drivers used by Power BI and Excel
-- [ ] Per-query time and memory limits
+- [ ] Built-in encryption for PostgreSQL connections
+- [x] Per-query time limits
+- [ ] Per-query memory limits
 
 ## 0.7 — Platform
 
 - [ ] Review and sign-off workflow for reported figures
 - [ ] Audit log of account and data-access events
+- [x] Read-only access for AI assistants over MCP
 - [ ] Optional assistant integrations using the user's own credentials
 - [ ] Sandboxed WebAssembly extensions
 - [ ] Stable, versioned Rust and HTTP APIs

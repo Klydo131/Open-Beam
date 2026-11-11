@@ -24,7 +24,9 @@ as untrusted.
 
 - **No built-in TLS yet.** To serve Open Beam beyond your own machine, place it
   behind an HTTPS reverse proxy and set `public_url` to the HTTPS address, so
-  that passwords and session cookies are never sent in the clear.
+  that passwords and session cookies are never sent in the clear. Setting
+  `public_url` is also what lets sign-in and other forms work when the proxy
+  passes on a different host name than the one in the browser.
 - **Uploaded files are parsed on the server.** CSV and Parquet are read by
   DuckDB and Excel workbooks by `calamine`. Uploads are limited in size, and
   workbooks that declare more than 256 MB unpacked are refused, but a declared
@@ -36,14 +38,28 @@ as untrusted.
   putting sensitive words in dataset names.
 - **Sign-in attempts are limited per username and in total.** Five failures
   lock a username for five minutes, attempts in flight count towards that,
-  and at most four password checks run at once.
+  an attempt abandoned part-way counts as a failure, at most four password
+  checks run at once, and when 32 more are already waiting the server answers
+  that it is busy instead of queueing.
 - **Built-in datasets are visible to every account.** Datasets from
   `beam.toml` are shared with everyone; datasets added in the browser are
   private to their owner, the people they share with, and administrators.
 - **Feed clients send the password with each request.** This is how HTTP Basic
   authentication works; it is the method Excel and Power BI support for OData.
-- **No query time limit yet.** A signed-in client can issue filters that are
-  expensive to evaluate on very large files.
+- **Queries are limited in time, not in memory.** Every query is cancelled
+  after `query_timeout_seconds` (30 by default), but a query that finishes
+  within that time can still use a lot of memory on very large files.
+- **PostgreSQL access is unencrypted.** It is off by default. When turned on
+  with `postgres_bind`, it accepts only personal API tokens, never account
+  passwords, but the token travels in the clear. Keep it on `127.0.0.1` or
+  reach it through an encrypted tunnel.
+- **API tokens are bearer credentials.** Anyone holding a token can read what
+  its account can read until it is revoked, the account is disabled, or the
+  account is removed. Open Beam stores only a digest of each token.
+- **AI assistants read data you let them read.** The MCP endpoint is
+  read-only and tells the assistant to treat dataset contents as data, but an
+  assistant may still be misled by text inside a dataset. Connect assistants
+  only to datasets you are willing to show them.
 - **The configuration file and the machine are trusted.** Anyone who can edit
   `beam.toml` chooses which files are served, and anyone who can run commands
   on the machine can create an administrator.

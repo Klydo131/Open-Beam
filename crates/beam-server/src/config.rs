@@ -31,6 +31,10 @@ pub struct Config {
     /// Longest a single query may run before it is cancelled, in seconds.
     #[serde(default = "default_query_timeout_seconds")]
     pub query_timeout_seconds: u64,
+    /// Address for read-only PostgreSQL wire-protocol access, for example
+    /// `127.0.0.1:5433`. Off when not set. Sign-in uses personal API tokens,
+    /// sent unencrypted, so keep it on this computer or behind a TLS tunnel.
+    pub postgres_bind: Option<SocketAddr>,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
 }

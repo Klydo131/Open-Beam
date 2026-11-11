@@ -42,6 +42,10 @@ you already use, starting with Microsoft Excel and Power BI.
   explore and share their own data. See [Manage accounts](docs/guides/05-manage-accounts.md).
 - **A data feed for Excel and Power BI.** Load any dataset with the built-in
   OData connector. No driver to install.
+- **Connect programs and AI assistants.** Personal API tokens, a read-only
+  REST API with an OpenAPI description, Parquet downloads, a read-only MCP
+  server for AI assistants, and optional read-only PostgreSQL access for SQL
+  tools. See [Connect programs and AI assistants](docs/guides/08-connect-programs-and-assistants.md).
 - **Clean data in one place.** Define summaries, joins and de-duplicated
   tables once, in SQL, and every report built on them agrees.
 
@@ -109,7 +113,7 @@ for you, and a C++ compiler. Full instructions for Windows, macOS and Linux are 
    ```
 
    ```text
-   Open Beam 0.2.0 serving 2 dataset(s)
+   Open Beam 0.3.0 serving 2 dataset(s)
      Open in your browser:        http://127.0.0.1:8787/
      Data feed (Excel, Power BI): http://127.0.0.1:8787/odata/
      No accounts yet. Open the address above to create the administrator.
@@ -134,6 +138,7 @@ Step-by-step guides, in order:
 5. [Manage accounts](docs/guides/05-manage-accounts.md)
 6. [Run Open Beam for a team](docs/guides/06-run-for-a-team.md)
 7. [Add, share and export data](docs/guides/07-add-share-and-export.md)
+8. [Connect programs and AI assistants](docs/guides/08-connect-programs-and-assistants.md)
 
 ## Architecture
 
