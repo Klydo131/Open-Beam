@@ -485,25 +485,7 @@ impl Engine {
         work: impl FnOnce() -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
         let limit = std::time::Duration::from_millis(self.query_timeout_ms.load(std::sync::atomic::Ordering::Relaxed));
-        let handle = conn.interrupt_handle();
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (done, finished) = std::sync::mpsc::channel::<()>();
-        let watchdog = {
-            let fired = fired.clone();
-            std::thread::spawn(move || {
-                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(limit) {
-                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
-                    handle.interrupt();
-                }
-            })
-        };
-        let result = work();
-        let _ = done.send(());
-        let _ = watchdog.join();
-        match result {
-            Err(_) if fired.load(std::sync::atomic::Ordering::SeqCst) => Err(EngineError::TimedOut),
-            other => other,
-        }
+        limited(conn, limit, work)
     }
 
     /// Runs a `SELECT` and returns its result as a Parquet file. The file is
@@ -635,6 +617,56 @@ impl Engine {
 /// "Repeated" means identical in every column to an earlier row with at least
 /// one value; the earliest copy is kept. Empty rows are only ever removed by
 /// `drop_empty_rows`, so the rows removed are exactly the ones counted.
+/// How often a cancellation is repeated once the time limit has passed.
+const CANCEL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Runs `work` on `conn`, cancelling it if it outlasts `limit`.
+///
+/// The engine discards a cancellation that arrives before a statement has
+/// started, so one signal is not enough: on a busy machine the limit can pass
+/// while a statement is still being prepared, and that statement would then
+/// run with nothing left to stop it. The signal is repeated until `work`
+/// returns, which also stops any later statement `work` goes on to run.
+fn limited<T>(
+    conn: &Connection,
+    limit: std::time::Duration,
+    work: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    use std::sync::mpsc::RecvTimeoutError::Timeout;
+    let handle = conn.interrupt_handle();
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = {
+        let fired = fired.clone();
+        std::thread::spawn(move || {
+            if finished.recv_timeout(limit) != Err(Timeout) {
+                return;
+            }
+            fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            loop {
+                handle.interrupt();
+                if finished.recv_timeout(CANCEL_EVERY) != Err(Timeout) {
+                    return;
+                }
+            }
+        })
+    };
+    let result = work();
+    let _ = done.send(());
+    let _ = watchdog.join();
+    match result {
+        // Only a statement the engine says it interrupted timed out. Any
+        // other failure is reported as itself, even when it took too long.
+        Err(EngineError::Database(e))
+            if fired.load(std::sync::atomic::Ordering::SeqCst)
+                && e.to_string().to_ascii_lowercase().contains("interrupt") =>
+        {
+            Err(EngineError::TimedOut)
+        }
+        other => other,
+    }
+}
+
 fn positioned_source(conn: &Connection, base: &str, cleaning: Cleaning) -> Result<String, EngineError> {
     let mut describe = conn.prepare(&format!("DESCRIBE SELECT * FROM {base}"))?;
     let names: Vec<String> = describe
@@ -1336,6 +1368,40 @@ mod tests {
             engine.query("SELECT * FROM missing", &[], 1),
             Err(EngineError::Database(_))
         ));
+    }
+
+    #[test]
+    fn the_time_limit_holds_even_when_it_passes_before_the_query_starts() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The limit has already passed by the time the statement begins, as
+        // happens on a busy machine. It must still be cancelled.
+        let started = std::time::Instant::now();
+        let slow = limited(&conn, std::time::Duration::ZERO, || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(
+                conn.query_row("SELECT count(*) FROM range(1000000000000) AS a", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
+            )
+        });
+        assert!(matches!(slow, Err(EngineError::TimedOut)), "{slow:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancelled promptly"
+        );
+
+        // A mistake in the query is reported as that mistake, however long it took.
+        let wrong = limited(&conn, std::time::Duration::ZERO, || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(conn.query_row("SELECT * FROM missing", [], |row| row.get::<_, i64>(0))?)
+        });
+        assert!(matches!(wrong, Err(EngineError::Database(_))), "{wrong:?}");
+
+        // Work that finishes is kept, and the connection is usable afterwards.
+        let fine = limited(&conn, std::time::Duration::from_secs(30), || {
+            Ok(conn.query_row("SELECT 41 + 1", [], |row| row.get::<_, i64>(0))?)
+        });
+        assert_eq!(fine.unwrap(), 42);
     }
 
     #[test]
