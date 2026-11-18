@@ -191,6 +191,10 @@ pub const MAX_NOTE_CHARS: usize = 2000;
 pub const MAX_TITLE_CHARS: usize = 200;
 /// Most verified questions, and most watches, on one dataset.
 pub const MAX_PER_DATASET: i64 = 50;
+/// Most watches across all datasets, which bounds the hourly checks.
+pub const MAX_WATCHES: i64 = 500;
+/// Longest stored settings of a question or watch, in bytes.
+pub const MAX_SETTINGS_BYTES: usize = 4096;
 
 /// A signed-in browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1175,7 +1179,7 @@ impl Store {
 
     pub fn add_question(&self, dataset: &str, question: &str, settings: &str, by: i64) -> Result<i64, AccountError> {
         let question = clean_text(question, MAX_TITLE_CHARS, false)?;
-        if question.is_empty() {
+        if question.is_empty() || settings.len() > MAX_SETTINGS_BYTES {
             return Err(AccountError::InvalidText);
         }
         let conn = self.conn();
@@ -1225,14 +1229,16 @@ impl Store {
         by: i64,
     ) -> Result<i64, AccountError> {
         let name = clean_text(name, MAX_TITLE_CHARS, false)?;
-        if name.is_empty() || !threshold.is_finite() {
+        if name.is_empty() || !threshold.is_finite() || settings.len() > MAX_SETTINGS_BYTES {
             return Err(AccountError::InvalidText);
         }
         let conn = self.conn();
-        let held: i64 = conn.query_row("SELECT count(*) FROM watches WHERE dataset = ?1", [dataset], |r| {
-            r.get(0)
-        })?;
-        if held >= MAX_PER_DATASET {
+        let (held, total): (i64, i64) = conn.query_row(
+            "SELECT count(*) FILTER (WHERE dataset = ?1), count(*) FROM watches",
+            [dataset],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if held >= MAX_PER_DATASET || total >= MAX_WATCHES {
             return Err(AccountError::TooMany("watches"));
         }
         conn.execute(
@@ -1534,6 +1540,28 @@ mod tests {
         store.save_draft(draft.id, "ledger", Cleaning::default()).unwrap();
         assert!(store.notes("ledger").unwrap().is_empty());
 
+        let huge = "keys=".to_string() + &"a,".repeat(MAX_SETTINGS_BYTES);
+        assert!(matches!(
+            store.add_watch("budget", "big", WatchKind::Repeats, &huge, 0.0, admin.id),
+            Err(AccountError::InvalidText)
+        ));
+        assert!(matches!(
+            store.add_question("budget", "big", &huge, admin.id),
+            Err(AccountError::InvalidText)
+        ));
+        for n in 0..MAX_WATCHES {
+            let dataset = format!("d{}", n / MAX_PER_DATASET);
+            store
+                .add_watch(&dataset, "w", WatchKind::Repeats, "keys=a", 0.0, admin.id)
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                store.add_watch("fresh", "one more", WatchKind::Repeats, "keys=a", 0.0, admin.id),
+                Err(AccountError::TooMany(_))
+            ),
+            "the total across datasets is capped"
+        );
         for n in 0..MAX_PER_DATASET {
             store
                 .add_question("full", &format!("q{n}"), "group=a", admin.id)

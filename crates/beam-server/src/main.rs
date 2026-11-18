@@ -196,6 +196,8 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let sweeper = state.clone();
     tokio::spawn(async move {
         let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
+        // A slow run must not make the next ones fire back to back.
+        hourly.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             hourly.tick().await;
             let worker = sweeper.clone();

@@ -377,6 +377,9 @@ fn store_draft(
             eprintln!("upload {file} not readable: {e}");
             let _ = std::fs::remove_file(&path);
             return Err(match e {
+                beam_engine::EngineError::TimedOut => {
+                    "Checking that file took longer than the time limit. Try a smaller file, or ask an administrator to raise query_timeout_seconds."
+                }
                 beam_engine::EngineError::TooWide => {
                     "That file has more than 1,000 columns, which Open Beam does not accept."
                 }

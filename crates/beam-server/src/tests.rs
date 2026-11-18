@@ -1265,6 +1265,17 @@ async fn uploads_respect_the_size_limit() {
 }
 
 #[tokio::test]
+async fn an_upload_too_slow_to_check_is_reported_as_a_timeout() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    site.state.engine.set_query_timeout(std::time::Duration::from_millis(1));
+    let rows: String = (0..200_000).map(|n| format!("{n},x{n}\n")).collect();
+    let reply = upload(&site, &bob, &csrf, "slow.csv", format!("a,b\n{rows}").as_bytes(), "").await;
+    assert!(reply.body.contains("took longer than the time limit"), "{}", reply.body);
+    assert!(!reply.body.contains("could not be read as a table"));
+}
+
+#[tokio::test]
 async fn excel_uploads_become_datasets_with_real_types() {
     let site = site(false, 100);
     let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
@@ -2935,6 +2946,32 @@ async fn watches_find_repeats_totals_and_changes_without_any_model() {
         .await,
         "/datasets/sales/about?ok=watch"
     );
+    // Each key column is stored once, and only real period codes are kept.
+    assert_eq!(
+        add(vec![
+            ("name", "Regions once"),
+            ("kind", "repeats"),
+            ("keys", "region, REGION,region"),
+            ("threshold", "0")
+        ])
+        .await,
+        "/datasets/sales/about?ok=watch"
+    );
+    assert_eq!(
+        add(vec![
+            ("name", "Odd period"),
+            ("kind", "change"),
+            ("date", "sold_on"),
+            ("bucket", "fortnight"),
+            ("threshold", "50")
+        ])
+        .await,
+        "/datasets/sales/about?ok=watch"
+    );
+    let stored = site.state.accounts.watches(Some("sales")).unwrap();
+    let settings = |name: &str| stored.iter().find(|w| w.name == name).unwrap().settings.clone();
+    assert_eq!(settings("Regions once"), "keys=region");
+    assert!(!settings("Odd period").contains("fortnight"));
     // A watch that cannot run on the data is refused.
     assert_eq!(
         add(vec![

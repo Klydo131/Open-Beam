@@ -38,6 +38,8 @@ const WATCH_KEYS: &[&str] = &[
 ];
 /// Periods read when comparing the latest one with the one before.
 const MAX_PERIODS: u64 = 100_000;
+/// Longest the hourly run of all watches may take; the rest wait an hour.
+const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Who may describe a dataset and decide its verified questions and
 /// watches: an administrator, or the person who added it.
@@ -291,8 +293,16 @@ async fn check(
 
 /// Runs every watch. Called hourly and at start-up.
 pub async fn run_all(state: &Arc<AppState>) {
-    let watches = state.accounts.watches(None).unwrap_or_default();
+    let started = std::time::Instant::now();
+    // Longest-unchecked first, so a run cut short by the budget still
+    // reaches every watch over the following hours.
+    let mut watches = state.accounts.watches(None).unwrap_or_default();
+    watches.sort_by(|a, b| a.last_run.cmp(&b.last_run));
     for watch in &watches {
+        if started.elapsed() > SWEEP_BUDGET {
+            eprintln!("watch run stopped after {SWEEP_BUDGET:?}; the rest run next hour");
+            break;
+        }
         run_watch(state, watch).await;
     }
 }
@@ -732,6 +742,17 @@ pub async fn add_watch(
         .filter(|(k, _)| used.contains(&k.as_str()))
         .cloned()
         .collect();
+    // Only real period codes, and each key column once, are stored.
+    kept.retain(|(k, v)| k != "bucket" || ["day", "month", "quarter", "year"].contains(&v.as_str()));
+    for (_, value) in kept.iter_mut().filter(|(k, _)| k == "keys") {
+        let mut seen: Vec<&str> = Vec::new();
+        for column in value.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+            if !seen.iter().any(|s| s.eq_ignore_ascii_case(column)) {
+                seen.push(column);
+            }
+        }
+        *value = seen.join(", ");
+    }
     if setting(&kept, "agg").is_none_or(|a| a == "count") {
         kept.retain(|(k, _)| k != "measure");
     }
