@@ -610,13 +610,6 @@ impl Engine {
     }
 }
 
-/// Wraps an uploaded file's source so its rows carry their file position and
-/// `cleaning` applies whenever it is read. Refuses files wider than
-/// [`MAX_UPLOAD_COLUMNS`].
-///
-/// "Repeated" means identical in every column to an earlier row with at least
-/// one value; the earliest copy is kept. Empty rows are only ever removed by
-/// `drop_empty_rows`, so the rows removed are exactly the ones counted.
 /// How often a cancellation is repeated once the time limit has passed.
 const CANCEL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -658,8 +651,7 @@ fn limited<T>(
         // Only a statement the engine says it interrupted timed out. Any
         // other failure is reported as itself, even when it took too long.
         Err(EngineError::Database(e))
-            if fired.load(std::sync::atomic::Ordering::SeqCst)
-                && e.to_string().to_ascii_lowercase().contains("interrupt") =>
+            if fired.load(std::sync::atomic::Ordering::SeqCst) && e.to_string().starts_with("INTERRUPT Error") =>
         {
             Err(EngineError::TimedOut)
         }
@@ -667,6 +659,13 @@ fn limited<T>(
     }
 }
 
+/// Wraps an uploaded file's source so its rows carry their file position and
+/// `cleaning` applies whenever it is read. Refuses files wider than
+/// [`MAX_UPLOAD_COLUMNS`].
+///
+/// "Repeated" means identical in every column to an earlier row with at least
+/// one value; the earliest copy is kept. Empty rows are only ever removed by
+/// `drop_empty_rows`, so the rows removed are exactly the ones counted.
 fn positioned_source(conn: &Connection, base: &str, cleaning: Cleaning) -> Result<String, EngineError> {
     let mut describe = conn.prepare(&format!("DESCRIBE SELECT * FROM {base}"))?;
     let names: Vec<String> = describe
