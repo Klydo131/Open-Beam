@@ -40,6 +40,12 @@ pub enum AccountError {
     UploadNotFound,
     #[error("You already have the most tokens allowed. Revoke one you no longer use.")]
     TooManyTokens,
+    #[error("Descriptions are at most {MAX_NOTE_CHARS} characters and questions and names at most {MAX_TITLE_CHARS}, without control characters other than line breaks.")]
+    InvalidText,
+    #[error("This dataset already has the most {0} allowed. Remove one you no longer need.")]
+    TooMany(&'static str),
+    #[error("No such question or watch.")]
+    ItemNotFound,
     #[error("account database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("password hashing failed")]
@@ -179,6 +185,12 @@ const UPLOAD_COLUMNS: &str = "id, name, owner_id, file, created_at, drop_empty_r
 const DRAFT_COLUMNS: &str = "id, owner_id, file, original_name, created_at";
 
 pub const MAX_PROFILE_CHARS: usize = 64;
+/// Longest description of a dataset or a column.
+pub const MAX_NOTE_CHARS: usize = 2000;
+/// Longest verified question or watch name.
+pub const MAX_TITLE_CHARS: usize = 200;
+/// Most verified questions, and most watches, on one dataset.
+pub const MAX_PER_DATASET: i64 = 50;
 
 /// A signed-in browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +280,36 @@ impl Store {
                  file          TEXT NOT NULL UNIQUE,
                  original_name TEXT NOT NULL,
                  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE IF NOT EXISTS notes (
+                 dataset     TEXT NOT NULL COLLATE NOCASE,
+                 column_name TEXT NOT NULL DEFAULT '',
+                 text        TEXT NOT NULL,
+                 updated_by  INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                 updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                 PRIMARY KEY (dataset, column_name)
+             );
+             CREATE TABLE IF NOT EXISTS questions (
+                 id          INTEGER PRIMARY KEY,
+                 dataset     TEXT NOT NULL COLLATE NOCASE,
+                 question    TEXT NOT NULL,
+                 settings    TEXT NOT NULL,
+                 approved_by INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                 approved_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE IF NOT EXISTS watches (
+                 id           INTEGER PRIMARY KEY,
+                 dataset      TEXT NOT NULL COLLATE NOCASE,
+                 name         TEXT NOT NULL,
+                 kind         TEXT NOT NULL CHECK (kind IN ('total', 'change', 'repeats')),
+                 settings     TEXT NOT NULL,
+                 threshold    REAL NOT NULL,
+                 created_by   INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                 created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_run     TEXT,
+                 last_status  TEXT CHECK (last_status IN ('ok', 'alert', 'error')),
+                 last_message TEXT,
+                 last_value   REAL
              );
              CREATE TABLE IF NOT EXISTS shares (
                  upload_id  INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
@@ -691,6 +733,9 @@ impl Store {
         }
         let id = transaction.last_insert_rowid();
         transaction.execute("DELETE FROM drafts WHERE id = ?1", [draft])?;
+        // A new dataset never inherits what was written about an older one
+        // that had the same name.
+        forget_curation(&transaction, name)?;
         let upload = transaction.query_row(
             &format!("SELECT {UPLOAD_COLUMNS} FROM uploads WHERE id = ?1"),
             [id],
@@ -719,9 +764,15 @@ impl Store {
     }
 
     pub fn delete_upload(&self, id: i64) -> Result<(), AccountError> {
-        if self.conn().execute("DELETE FROM uploads WHERE id = ?1", [id])? == 0 {
-            return Err(AccountError::UploadNotFound);
-        }
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        let name: Option<String> = transaction
+            .query_row("SELECT name FROM uploads WHERE id = ?1", [id], |row| row.get(0))
+            .optional()?;
+        let name = name.ok_or(AccountError::UploadNotFound)?;
+        transaction.execute("DELETE FROM uploads WHERE id = ?1", [id])?;
+        forget_curation(&transaction, &name)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -922,6 +973,302 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ---------------------------------------------------- what people write about data
+
+/// What a dataset's owner wrote about it or one of its columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// Empty for the dataset itself.
+    pub column: String,
+    pub text: String,
+    pub updated_by: Option<String>,
+    pub updated_at: String,
+}
+
+/// A question whose answer someone responsible for the data has checked.
+/// `settings` holds how to compute it, as URL-encoded chart options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub id: i64,
+    pub dataset: String,
+    pub question: String,
+    pub settings: String,
+    pub approved_by: Option<String>,
+    pub approved_at: String,
+}
+
+/// What a watch checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchKind {
+    /// A total goes above or below a number.
+    Total,
+    /// The latest period differs from the one before by at least a percentage.
+    Change,
+    /// More than a number of records appear more than once.
+    Repeats,
+}
+
+impl WatchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WatchKind::Total => "total",
+            WatchKind::Change => "change",
+            WatchKind::Repeats => "repeats",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "total" => Some(WatchKind::Total),
+            "change" => Some(WatchKind::Change),
+            "repeats" => Some(WatchKind::Repeats),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of a watch's latest run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStatus {
+    Ok,
+    Alert,
+    /// The check itself could not run, for example after a column was removed.
+    Error,
+}
+
+impl WatchStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WatchStatus::Ok => "ok",
+            WatchStatus::Alert => "alert",
+            WatchStatus::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Watch {
+    pub id: i64,
+    pub dataset: String,
+    pub name: String,
+    pub kind: WatchKind,
+    pub settings: String,
+    pub threshold: f64,
+    pub created_by: Option<String>,
+    pub last_run: Option<String>,
+    pub status: Option<WatchStatus>,
+    pub message: Option<String>,
+    pub value: Option<f64>,
+}
+
+fn forget_curation(conn: &Connection, dataset: &str) -> Result<(), rusqlite::Error> {
+    for table in ["notes", "questions", "watches"] {
+        conn.execute(&format!("DELETE FROM {table} WHERE dataset = ?1"), [dataset])?;
+    }
+    Ok(())
+}
+
+/// Trims `text` and checks its length; line breaks are allowed in notes.
+fn clean_text(text: &str, max: usize, multi_line: bool) -> Result<String, AccountError> {
+    let text = text.trim();
+    let bad = |c: char| c.is_control() && !(multi_line && (c == '\n' || c == '\r' || c == '\t'));
+    if text.chars().count() > max || text.chars().any(bad) {
+        return Err(AccountError::InvalidText);
+    }
+    Ok(text.replace("\r\n", "\n"))
+}
+
+const WATCH_COLUMNS: &str = "w.id, w.dataset, w.name, w.kind, w.settings, w.threshold, a.username, \
+     w.last_run, w.last_status, w.last_message, w.last_value";
+
+fn read_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<Watch> {
+    let kind: String = row.get(3)?;
+    let status: Option<String> = row.get(8)?;
+    Ok(Watch {
+        id: row.get(0)?,
+        dataset: row.get(1)?,
+        name: row.get(2)?,
+        kind: WatchKind::parse(&kind).unwrap_or(WatchKind::Total),
+        settings: row.get(4)?,
+        threshold: row.get(5)?,
+        created_by: row.get(6)?,
+        last_run: row.get(7)?,
+        status: status.as_deref().and_then(|s| match s {
+            "ok" => Some(WatchStatus::Ok),
+            "alert" => Some(WatchStatus::Alert),
+            "error" => Some(WatchStatus::Error),
+            _ => None,
+        }),
+        message: row.get(9)?,
+        value: row.get(10)?,
+    })
+}
+
+impl Store {
+    /// Everything written about `dataset`: the dataset's own note first,
+    /// then one per column.
+    pub fn notes(&self, dataset: &str) -> Result<Vec<Note>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT n.column_name, n.text, a.username, n.updated_at FROM notes n \
+             LEFT JOIN accounts a ON a.id = n.updated_by WHERE n.dataset = ?1 ORDER BY n.column_name",
+        )?;
+        let notes = statement
+            .query_map([dataset], |row| {
+                Ok(Note {
+                    column: row.get(0)?,
+                    text: row.get(1)?,
+                    updated_by: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(notes)
+    }
+
+    /// Writes the note for `dataset`, or one of its columns when `column`
+    /// is not empty. Empty text removes the note.
+    pub fn set_note(&self, dataset: &str, column: &str, text: &str, by: i64) -> Result<(), AccountError> {
+        let max = if column.is_empty() {
+            MAX_NOTE_CHARS
+        } else {
+            MAX_NOTE_CHARS / 4
+        };
+        let text = clean_text(text, max, true)?;
+        let conn = self.conn();
+        if text.is_empty() {
+            conn.execute(
+                "DELETE FROM notes WHERE dataset = ?1 AND column_name = ?2",
+                rusqlite::params![dataset, column],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO notes (dataset, column_name, text, updated_by) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (dataset, column_name) DO UPDATE SET text = excluded.text, \
+                 updated_by = excluded.updated_by, updated_at = datetime('now')",
+                rusqlite::params![dataset, column, text, by],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn questions(&self, dataset: &str) -> Result<Vec<Question>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT q.id, q.dataset, q.question, q.settings, a.username, q.approved_at FROM questions q \
+             LEFT JOIN accounts a ON a.id = q.approved_by WHERE q.dataset = ?1 ORDER BY q.id",
+        )?;
+        let questions = statement
+            .query_map([dataset], |row| {
+                Ok(Question {
+                    id: row.get(0)?,
+                    dataset: row.get(1)?,
+                    question: row.get(2)?,
+                    settings: row.get(3)?,
+                    approved_by: row.get(4)?,
+                    approved_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(questions)
+    }
+
+    pub fn add_question(&self, dataset: &str, question: &str, settings: &str, by: i64) -> Result<i64, AccountError> {
+        let question = clean_text(question, MAX_TITLE_CHARS, false)?;
+        if question.is_empty() {
+            return Err(AccountError::InvalidText);
+        }
+        let conn = self.conn();
+        let held: i64 = conn.query_row("SELECT count(*) FROM questions WHERE dataset = ?1", [dataset], |r| {
+            r.get(0)
+        })?;
+        if held >= MAX_PER_DATASET {
+            return Err(AccountError::TooMany("verified questions"));
+        }
+        conn.execute(
+            "INSERT INTO questions (dataset, question, settings, approved_by) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![dataset, question, settings, by],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Removes a question, but only from the dataset named.
+    pub fn remove_question(&self, dataset: &str, id: i64) -> Result<(), AccountError> {
+        let removed = self.conn().execute(
+            "DELETE FROM questions WHERE id = ?1 AND dataset = ?2",
+            rusqlite::params![id, dataset],
+        )?;
+        if removed == 0 {
+            return Err(AccountError::ItemNotFound);
+        }
+        Ok(())
+    }
+
+    /// Watches on one dataset, or on every dataset when `dataset` is `None`.
+    pub fn watches(&self, dataset: Option<&str>) -> Result<Vec<Watch>, AccountError> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {WATCH_COLUMNS} FROM watches w LEFT JOIN accounts a ON a.id = w.created_by \
+             WHERE ?1 IS NULL OR w.dataset = ?1 ORDER BY w.dataset, w.id"
+        ))?;
+        let watches = statement.query_map([dataset], read_watch)?.collect::<Result<_, _>>()?;
+        Ok(watches)
+    }
+
+    pub fn add_watch(
+        &self,
+        dataset: &str,
+        name: &str,
+        kind: WatchKind,
+        settings: &str,
+        threshold: f64,
+        by: i64,
+    ) -> Result<i64, AccountError> {
+        let name = clean_text(name, MAX_TITLE_CHARS, false)?;
+        if name.is_empty() || !threshold.is_finite() {
+            return Err(AccountError::InvalidText);
+        }
+        let conn = self.conn();
+        let held: i64 = conn.query_row("SELECT count(*) FROM watches WHERE dataset = ?1", [dataset], |r| {
+            r.get(0)
+        })?;
+        if held >= MAX_PER_DATASET {
+            return Err(AccountError::TooMany("watches"));
+        }
+        conn.execute(
+            "INSERT INTO watches (dataset, name, kind, settings, threshold, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![dataset, name, kind.as_str(), settings, threshold, by],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn remove_watch(&self, dataset: &str, id: i64) -> Result<(), AccountError> {
+        let removed = self.conn().execute(
+            "DELETE FROM watches WHERE id = ?1 AND dataset = ?2",
+            rusqlite::params![id, dataset],
+        )?;
+        if removed == 0 {
+            return Err(AccountError::ItemNotFound);
+        }
+        Ok(())
+    }
+
+    /// Records the outcome of a watch's latest run.
+    pub fn record_watch(
+        &self,
+        id: i64,
+        status: WatchStatus,
+        message: &str,
+        value: Option<f64>,
+    ) -> Result<(), AccountError> {
+        self.conn().execute(
+            "UPDATE watches SET last_run = datetime('now'), last_status = ?2, last_message = ?3, last_value = ?4 WHERE id = ?1",
+            rusqlite::params![id, status.as_str(), message, value.filter(|v| v.is_finite())],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1465,84 @@ mod tests {
         assert!(matches!(store.add_contact(bob.id, cy.id), Err(AccountError::NotFound)));
         store.remove_contact(bob.id, admin.id).unwrap();
         assert!(store.contacts(bob.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn notes_questions_and_watches_belong_to_one_dataset_and_go_with_it() {
+        let (store, admin) = store_with_admin();
+        let upload = store.create_upload("budget", admin.id, "a1.csv").unwrap();
+        store
+            .set_note("budget", "", "Spending per team.\r\nFrom the ledger.", admin.id)
+            .unwrap();
+        store
+            .set_note("BUDGET", "amount", "In euros, VAT included.", admin.id)
+            .unwrap();
+        let notes = store.notes("Budget").unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].column, "");
+        assert_eq!(notes[0].text, "Spending per team.\nFrom the ledger.");
+        assert_eq!(notes[1].updated_by.as_deref(), Some("ada"));
+        store.set_note("budget", "amount", "  ", admin.id).unwrap();
+        assert_eq!(store.notes("budget").unwrap().len(), 1, "empty text removes a note");
+        assert!(matches!(
+            store.set_note("budget", "", &"x".repeat(MAX_NOTE_CHARS + 1), admin.id),
+            Err(AccountError::InvalidText)
+        ));
+        assert!(matches!(
+            store.add_question("budget", "Total?\u{7}", "group=team", admin.id),
+            Err(AccountError::InvalidText)
+        ));
+
+        let question = store
+            .add_question("budget", "Spending by team", "group=team&agg=sum", admin.id)
+            .unwrap();
+        let watch = store
+            .add_watch(
+                "budget",
+                "Spending over 10,000",
+                WatchKind::Total,
+                "agg=sum&measure=amount&when=above",
+                10_000.0,
+                admin.id,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.remove_question("other", question),
+            Err(AccountError::ItemNotFound)
+        ));
+        store
+            .record_watch(watch, WatchStatus::Alert, "Sum of amount is 12,000.", Some(12_000.0))
+            .unwrap();
+        let watched = &store.watches(Some("budget")).unwrap()[0];
+        assert_eq!(
+            (watched.status, watched.value),
+            (Some(WatchStatus::Alert), Some(12_000.0))
+        );
+        assert_eq!(watched.created_by.as_deref(), Some("ada"));
+        assert_eq!(store.watches(None).unwrap().len(), 1);
+
+        // Deleting the dataset deletes what was written about it.
+        store.delete_upload(upload.id).unwrap();
+        assert!(store.notes("budget").unwrap().is_empty());
+        assert!(store.questions("budget").unwrap().is_empty());
+        assert!(store.watches(None).unwrap().is_empty());
+
+        // A new dataset that reuses a free name starts with nothing, even if
+        // notes were left behind by a built-in dataset of that name.
+        store.set_note("ledger", "", "Old built-in ledger.", admin.id).unwrap();
+        let draft = store.create_draft(admin.id, "b2.csv", "ledger.csv").unwrap();
+        store.save_draft(draft.id, "ledger", Cleaning::default()).unwrap();
+        assert!(store.notes("ledger").unwrap().is_empty());
+
+        for n in 0..MAX_PER_DATASET {
+            store
+                .add_question("full", &format!("q{n}"), "group=a", admin.id)
+                .unwrap();
+        }
+        assert!(matches!(
+            store.add_question("full", "one more", "group=a", admin.id),
+            Err(AccountError::TooMany(_))
+        ));
     }
 
     #[test]

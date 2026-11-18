@@ -6,6 +6,7 @@ mod auth;
 mod catalog;
 mod chart;
 mod config;
+mod curate;
 mod export;
 mod feed;
 mod mcp;
@@ -202,6 +203,8 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
                 review::remove_expired_drafts(&worker.engine, &worker.accounts, review::DRAFT_DAYS)
             })
             .await;
+            // Watches run at start-up and then every hour.
+            curate::run_all(&sweeper).await;
         }
     });
     if let Some(postgres) = postgres {

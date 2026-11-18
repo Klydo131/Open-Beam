@@ -290,6 +290,19 @@ pub async fn chart(
         group.name.clone()
     };
     let title = format!("{what} by {by}");
+    let curator = crate::curate::can_curate(&signed.session.account, &entry);
+    let measure_name = measure
+        .map(|m| m.name.clone())
+        .filter(|_| !counting)
+        .unwrap_or_default();
+    let mut current: Vec<(&str, &str)> = vec![
+        ("group", group.name.as_str()),
+        ("agg", aggregate.0),
+        ("measure", measure_name.as_str()),
+        ("bucket", bucket.0),
+        ("kind", if as_line { "line" } else { "bar" }),
+    ];
+    current.extend(carried.iter().copied());
 
     let body = html! {
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
@@ -344,6 +357,9 @@ pub async fn chart(
                     thead { tr { th { (by) } th.num { (what) } } }
                     tbody { @for (label, value) in &points { tr { td { (label) } td.num { (format_number(*value)) } } } }
                 }
+            }
+            @if curator && problem.is_none() {
+                (crate::curate::save_question_form(set, &signed.session.csrf, &current, &title))
             }
         }
     };

@@ -91,6 +91,15 @@ with [axum](https://github.com/tokio-rs/axum).
   `/api/v1`, described by a hand-written OpenAPI document, and a read-only
   MCP endpoint at `/mcp` for AI assistants. Both are thin layers over the
   same planner as the feed and see exactly what the feed would.
+- **Descriptions, verified questions and watches** (`curate.rs`) are
+  stored in the accounts file beside the dataset's name, and removed with
+  the dataset, so a new dataset never inherits what was written about an
+  older one of the same name. A verified question stores chart settings,
+  not a result, and is answered through the same planner every time. Watches
+  run hourly through the same planners: a total, the last two periods of a
+  grouped summary, or a count of key combinations that repeat. No model is
+  involved; an assistant reads the descriptions and verified answers through
+  the API and MCP.
 - **PostgreSQL access** (off unless `postgres_bind` is set) speaks the
   PostgreSQL wire protocol directly. Each statement is parsed by DuckDB's own
   parser into a syntax tree, and the tree is checked against short lists of

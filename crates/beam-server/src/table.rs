@@ -267,6 +267,7 @@ fn cell(value: &Value, edm: EdmType) -> Markup {
 pub enum Tab {
     Table,
     Chart,
+    About,
     Share,
 }
 
@@ -290,6 +291,7 @@ pub fn dataset_tabs(set: &EntitySet, current: Tab, filter: &[(&str, &str)], mana
         nav.tabs aria-label="Views" {
             a href=(with_query(&base, &query)) aria-current=[(current == Tab::Table).then_some("page")] { "Table" }
             a href=(with_query(&format!("{base}/chart"), &query)) aria-current=[(current == Tab::Chart).then_some("page")] { "Chart" }
+            a href={ (base) "/about" } aria-current=[(current == Tab::About).then_some("page")] { "About" }
             @if manage {
                 a href={ (base) "/share" } aria-current=[(current == Tab::Share).then_some("page")] { "Sharing" }
             }

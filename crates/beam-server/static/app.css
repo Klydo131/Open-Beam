@@ -47,7 +47,7 @@ code { background: var(--raised); border: 1px solid var(--border); border-radius
 .brand { display: flex; align-items: center; gap: 0.6rem; color: var(--text); font-weight: 600; font-size: 1.05rem; }
 .brand:hover { text-decoration: none; }
 .brand img { border-radius: 6px; display: block; }
-.topbar nav { display: flex; gap: 1.1rem; flex: 1; }
+.topbar nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.1rem; flex: 1; }
 .topbar nav a { color: var(--text); }
 .signout { display: flex; align-items: center; gap: 0.75rem; margin: 0; }
 .who { color: var(--muted); }
@@ -168,3 +168,22 @@ form.panel .hint + h2 { margin-top: 1.5rem; }
 .columns-found li { display: flex; justify-content: space-between; gap: 0.5rem; border-bottom: 1px solid var(--border); padding: 0.3rem 0; }
 .attention { border-left: 3px solid var(--accent); }
 form.panel .actions { margin-top: 1rem; }
+
+/* About view: descriptions, verified questions and watches */
+.badge.alert { color: var(--danger); border-color: var(--danger); margin-left: 0; }
+.badge.error { color: var(--accent); border-color: var(--accent); margin-left: 0; }
+.badge.ok { color: var(--ok); border-color: var(--ok); margin-left: 0; }
+form.inline { display: inline-flex; margin: 0 0 0 0.4rem; }
+ul.plain { list-style: none; padding: 0; margin: 0; }
+ul.plain li { padding: 0.45rem 0; border-top: 1px solid var(--border); }
+ul.plain li:first-child { border-top: 0; }
+.prose { white-space: pre-line; max-width: 70ch; }
+.watch { padding: 0.6rem 0; border-top: 1px solid var(--border); }
+.watch p { margin: 0.2rem 0; }
+form.stack { display: grid; gap: 0.4rem; max-width: 40rem; margin-top: 0.6rem; }
+details > summary { cursor: pointer; color: var(--link); margin-top: 0.8rem; }
+textarea { width: 100%; font: inherit; color: var(--text); background: var(--raised); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; box-sizing: border-box; }
+dl dt { font-weight: 600; margin-top: 0.5rem; }
+dl dd { margin: 0.1rem 0 0; color: var(--muted); }
+.panel td input { width: 100%; box-sizing: border-box; }
+form.stack > * { min-width: 0; max-width: 100%; box-sizing: border-box; }

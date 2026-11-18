@@ -60,6 +60,10 @@ as untrusted.
   read-only and tells the assistant to treat dataset contents as data, but an
   assistant may still be misled by text inside a dataset. Connect assistants
   only to datasets you are willing to show them.
+- **Watches run on the server's behalf.** A watch is set up by the
+  dataset's owner or an administrator and its results, including totals, are
+  shown to everyone who can see the dataset. Results are recorded only while
+  the dataset exists.
 - **The configuration file and the machine are trusted.** Anyone who can edit
   `beam.toml` chooses which files are served, and anyone who can run commands
   on the machine can create an administrator.

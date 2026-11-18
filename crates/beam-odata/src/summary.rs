@@ -52,27 +52,7 @@ pub fn plan_summary(
     let group = set.property(group_by).ok_or_else(|| unknown(group_by))?;
     let group_ident = quote_ident(&group.name);
 
-    let value = match (aggregate, measure) {
-        (Aggregate::Count, _) => "count(*)".to_string(),
-        (_, None) => return Err(QueryError::InvalidValue("measure")),
-        (_, Some(name)) => {
-            let property = set.property(name).ok_or_else(|| unknown(name))?;
-            let numeric = matches!(
-                property.edm,
-                EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
-            );
-            if !numeric {
-                return Err(QueryError::InvalidValue("measure"));
-            }
-            let function = match aggregate {
-                Aggregate::Sum => "sum",
-                Aggregate::Average => "avg",
-                Aggregate::Min => "min",
-                _ => "max",
-            };
-            format!("{function}({})", quote_ident(&property.name))
-        }
-    };
+    let value = value_sql(set, measure, aggregate)?;
 
     let label = match (group.edm, bucket) {
         (EdmType::String, _) => group_ident.clone(),
@@ -92,10 +72,7 @@ pub fn plan_summary(
     };
 
     let mut params = Vec::new();
-    let where_sql = match filter_text {
-        Some(text) => format!(" WHERE {}", filter::to_sql(&filter::parse(text)?, set, &mut params)?),
-        None => String::new(),
-    };
+    let where_sql = where_sql(set, filter_text, &mut params)?;
     let sql = format!(
         "SELECT coalesce({label}, '(empty)') AS \"label\", CAST({value} AS DOUBLE) AS \"value\" \
          FROM {}{where_sql} GROUP BY 1 ORDER BY {order} LIMIT {}",
@@ -103,6 +80,104 @@ pub fn plan_summary(
         limit.saturating_add(1),
     );
     Ok(Summary { sql, params, ordered })
+}
+
+/// The aggregate expression, after checking the measure is a number column.
+fn value_sql(set: &EntitySet, measure: Option<&str>, aggregate: Aggregate) -> Result<String, QueryError> {
+    let unknown = |name: &str| QueryError::UnknownProperty(name.to_string());
+    Ok(match (aggregate, measure) {
+        (Aggregate::Count, _) => "count(*)".to_string(),
+        (_, None) => return Err(QueryError::InvalidValue("measure")),
+        (_, Some(name)) => {
+            let property = set.property(name).ok_or_else(|| unknown(name))?;
+            let numeric = matches!(
+                property.edm,
+                EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+            );
+            if !numeric {
+                return Err(QueryError::InvalidValue("measure"));
+            }
+            let function = match aggregate {
+                Aggregate::Sum => "sum",
+                Aggregate::Average => "avg",
+                Aggregate::Min => "min",
+                _ => "max",
+            };
+            format!("{function}({})", quote_ident(&property.name))
+        }
+    })
+}
+
+fn where_sql(set: &EntitySet, filter_text: Option<&str>, params: &mut Vec<Literal>) -> Result<String, QueryError> {
+    Ok(match filter_text {
+        Some(text) => format!(" WHERE {}", filter::to_sql(&filter::parse(text)?, set, params)?),
+        None => String::new(),
+    })
+}
+
+/// One number for the whole dataset (or the filtered part of it): returns a
+/// single `(value DOUBLE)` row.
+pub fn plan_total(
+    set: &EntitySet,
+    measure: Option<&str>,
+    aggregate: Aggregate,
+    filter_text: Option<&str>,
+) -> Result<Summary, QueryError> {
+    let value = value_sql(set, measure, aggregate)?;
+    let mut params = Vec::new();
+    let where_sql = where_sql(set, filter_text, &mut params)?;
+    let sql = format!(
+        "SELECT CAST({value} AS DOUBLE) AS \"value\" FROM {}{where_sql}",
+        quote_ident(&set.name)
+    );
+    Ok(Summary {
+        sql,
+        params,
+        ordered: false,
+    })
+}
+
+/// How often records repeat: returns one row of `(groups, extra)` where
+/// `groups` counts combinations of `keys` that appear more than once, and
+/// `extra` counts the rows beyond the first of each. Rows where every key is
+/// empty are left out, because they identify nothing.
+pub fn plan_repeats(set: &EntitySet, keys: &[&str], filter_text: Option<&str>) -> Result<Summary, QueryError> {
+    if keys.is_empty() {
+        return Err(QueryError::InvalidValue("keys"));
+    }
+    let mut idents = Vec::with_capacity(keys.len());
+    for key in keys {
+        let property = set
+            .property(key)
+            .ok_or_else(|| QueryError::UnknownProperty(key.to_string()))?;
+        idents.push(quote_ident(&property.name));
+    }
+    let mut params = Vec::new();
+    let filter = where_sql(set, filter_text, &mut params)?;
+    let not_empty = format!(
+        "NOT ({})",
+        idents
+            .iter()
+            .map(|i| format!("{i} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    );
+    let where_all = if filter.is_empty() {
+        format!(" WHERE {not_empty}")
+    } else {
+        format!("{filter} AND {not_empty}")
+    };
+    let sql = format!(
+        "SELECT CAST(count(*) AS DOUBLE) AS \"groups\", CAST(coalesce(sum(n - 1), 0) AS DOUBLE) AS \"extra\" \
+         FROM (SELECT count(*) AS n FROM {}{where_all} GROUP BY {} HAVING count(*) > 1)",
+        quote_ident(&set.name),
+        idents.join(", ")
+    );
+    Ok(Summary {
+        sql,
+        params,
+        ordered: false,
+    })
 }
 
 #[cfg(test)]
@@ -211,5 +286,27 @@ mod tests {
             5,
         );
         assert!(matches!(bad_filter, Err(QueryError::Filter(_))));
+    }
+
+    #[test]
+    fn totals_and_repeats_check_names_and_bind_values() {
+        let total = plan_total(&set(), Some("units"), Aggregate::Sum, Some("region eq 'EU'")).unwrap();
+        assert_eq!(
+            total.sql,
+            "SELECT CAST(sum(\"units\") AS DOUBLE) AS \"value\" FROM \"sales\" WHERE (\"region\" = ?)"
+        );
+        assert_eq!(total.params, vec![Literal::Text("EU".into())]);
+        assert!(plan_total(&set(), Some("region"), Aggregate::Sum, None).is_err());
+        assert!(plan_total(&set(), Some("nope"), Aggregate::Sum, None).is_err());
+
+        let repeats = plan_repeats(&set(), &["region", "sold_on"], None).unwrap();
+        assert!(repeats
+            .sql
+            .contains("WHERE NOT (\"region\" IS NULL AND \"sold_on\" IS NULL)"));
+        assert!(repeats
+            .sql
+            .contains("GROUP BY \"region\", \"sold_on\" HAVING count(*) > 1"));
+        assert!(plan_repeats(&set(), &[], None).is_err());
+        assert!(plan_repeats(&set(), &["x\" OR 1=1 --"], None).is_err());
     }
 }

@@ -94,13 +94,63 @@ fn describe(state: &AppState, entry: &Entry) -> Value {
         .as_ref()
         .and_then(|u| state.accounts.get(u.owner_id).ok())
         .map(|a| a.username);
+    let mut columns: Vec<Value> = entry
+        .set
+        .properties
+        .iter()
+        .map(|p| json!({ "name": p.name, "type": type_name(p.edm) }))
+        .collect();
+    let curated = crate::curate::describe(state, entry, &mut columns);
     json!({
         "name": entry.set.name,
+        "description": curated["description"],
         "key": entry.set.key,
         "source": if entry.upload.is_some() { "uploaded" } else { "built-in" },
         "owner": owner,
-        "columns": entry.set.properties.iter().map(|p| json!({ "name": p.name, "type": type_name(p.edm) })).collect::<Vec<_>>(),
+        "columns": columns,
+        "verified_questions": curated["verified_questions"],
     })
+}
+
+/// A verified question's answer, worked out from the current data, with who
+/// verified it and how it is computed.
+pub async fn answer_question(state: &Arc<AppState>, account: &Account, name: &str, id: i64) -> Result<Value, ApiError> {
+    let entry = catalog::find(state, account, name).ok_or_else(ApiError::not_found)?;
+    let question = state
+        .accounts
+        .questions(&entry.set.name)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|q| q.id == id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "There is no verified question with that id on this dataset.",
+            )
+        })?;
+    let options = crate::curate::question_options(&entry.set, &question.settings).map_err(|message| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            format!("This question no longer fits the data: {message} Ask the dataset's owner to check it."),
+        )
+    })?;
+    let answer = summary(state, account, &entry.set.name, &options).await?;
+    Ok(json!({
+        "question": question.question,
+        "verified_by": question.approved_by,
+        "verified_at": question.approved_at,
+        "computed_with": Value::Object(options.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
+        "answer": answer,
+    }))
+}
+
+pub fn watches(state: &AppState, account: &Account) -> Value {
+    Value::Array(
+        crate::curate::visible_watches(state, account)
+            .iter()
+            .map(crate::curate::watch_json)
+            .collect(),
+    )
 }
 
 // ------------------------------------------------- shared with the AI connection
@@ -287,6 +337,21 @@ pub async fn rows_route(
     }
 }
 
+pub async fn question_route(
+    State(state): App,
+    Extension(viewer): Extension<Viewer>,
+    Path((name, id)): Path<(String, i64)>,
+) -> Response {
+    match answer_question(&state, &viewer.0, &name, id).await {
+        Ok(value) => json_response(value),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub async fn watches_route(State(state): App, Extension(viewer): Extension<Viewer>) -> Response {
+    json_response(watches(&state, &viewer.0))
+}
+
 pub async fn summary_route(
     State(state): App,
     Extension(viewer): Extension<Viewer>,
@@ -375,6 +440,8 @@ pub const DOCUMENTED_PATHS: &[&str] = &[
     "/api/v1/datasets/{name}/rows",
     "/api/v1/datasets/{name}/rows.parquet",
     "/api/v1/datasets/{name}/summary",
+    "/api/v1/datasets/{name}/questions/{id}",
+    "/api/v1/watches",
 ];
 
 fn openapi_document() -> Value {
@@ -430,6 +497,18 @@ fn openapi_document() -> Value {
                 query("bucket", "For date columns: day, month, quarter or year", json!({ "enum": ["day", "month", "quarter", "year"] })),
                 query("filter", "OData $filter expression", json!({ "type": "string" })),
             ], "responses": { "200": ok("Groups", json!({ "$ref": "#/components/schemas/Summary" })), "400": error, "404": error, "503": error } } },
+            "/api/v1/datasets/{name}/questions/{id}": { "get": { "summary": "Answer a verified question from the current data", "parameters": [
+                name,
+                json!({ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" }, "description": "Question id, from the dataset's verified_questions" }),
+            ], "responses": { "200": ok("Answer, with who verified it and how it is computed", json!({ "type": "object", "properties": {
+                "question": { "type": "string" }, "verified_by": { "type": ["string", "null"] }, "verified_at": { "type": "string" },
+                "computed_with": { "type": "object" }, "answer": { "$ref": "#/components/schemas/Summary" },
+            } })), "404": error, "409": error, "503": error } } },
+            "/api/v1/watches": { "get": { "summary": "Watches on datasets you can see, alerts first", "responses": { "200": ok("Watches", json!({ "type": "array", "items": { "type": "object", "properties": {
+                "id": { "type": "integer" }, "dataset": { "type": "string" }, "name": { "type": "string" },
+                "kind": { "enum": ["total", "change", "repeats"] }, "status": { "enum": ["ok", "alert", "error", null] },
+                "message": { "type": ["string", "null"] }, "value": { "type": ["number", "null"] }, "last_run": { "type": ["string", "null"] },
+            } } })) } } },
         },
         "components": {
             "securitySchemes": {
@@ -439,9 +518,11 @@ fn openapi_document() -> Value {
             "schemas": {
                 "Error": { "type": "object", "properties": { "error": { "type": "object", "properties": { "code": { "type": "string" }, "message": { "type": "string" } } } } },
                 "Dataset": { "type": "object", "properties": {
-                    "name": { "type": "string" }, "key": { "type": "string" },
+                    "name": { "type": "string" }, "description": { "type": ["string", "null"], "description": "Written by the dataset's owner" },
+                    "key": { "type": "string" },
+                    "verified_questions": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "integer" }, "question": { "type": "string" }, "verified_by": { "type": ["string", "null"] }, "verified_at": { "type": "string" } } } },
                     "source": { "enum": ["built-in", "uploaded"] }, "owner": { "type": ["string", "null"] },
-                    "columns": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "enum": ["boolean", "integer", "number", "decimal", "text", "date", "datetime"] } } } },
+                    "columns": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "type": { "enum": ["boolean", "integer", "number", "decimal", "text", "date", "datetime"] } } } },
                 } },
                 "Rows": { "type": "object", "properties": {
                     "rows": { "type": "array", "items": { "type": "object" } },

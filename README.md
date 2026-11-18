@@ -46,6 +46,11 @@ you already use, starting with Microsoft Excel and Power BI.
   REST API with an OpenAPI description, Parquet downloads, a read-only MCP
   server for AI assistants, and optional read-only PostgreSQL access for SQL
   tools. See [Connect programs and AI assistants](docs/guides/08-connect-programs-and-assistants.md).
+- **Answers you can rely on.** Write down what each dataset and column
+  means, save checked answers as verified questions, and add watches that
+  check every hour for records reported twice, totals out of range or sudden
+  changes. No AI model needed; assistants use the same descriptions and
+  verified answers. See [Describe, verify and watch](docs/guides/09-describe-verify-and-watch.md).
 - **Clean data in one place.** Define summaries, joins and de-duplicated
   tables once, in SQL, and every report built on them agrees.
 
@@ -139,6 +144,7 @@ Step-by-step guides, in order:
 6. [Run Open Beam for a team](docs/guides/06-run-for-a-team.md)
 7. [Add, share and export data](docs/guides/07-add-share-and-export.md)
 8. [Connect programs and AI assistants](docs/guides/08-connect-programs-and-assistants.md)
+9. [Describe, verify and watch your data](docs/guides/09-describe-verify-and-watch.md)
 
 ## Architecture
 

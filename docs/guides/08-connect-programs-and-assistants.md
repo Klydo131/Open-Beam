@@ -45,6 +45,8 @@ curl -H "Authorization: Bearer obt_your_token" http://127.0.0.1:8787/api/v1/data
 | `/api/v1/datasets/{name}` | One dataset's columns and key |
 | `/api/v1/datasets/{name}/rows` | Rows, with `filter`, `select`, `orderby`, `top`, `skip` and `count` |
 | `/api/v1/datasets/{name}/rows.parquet` | The same rows as a Parquet file, up to 5,000,000 |
+| `/api/v1/datasets/{name}/questions/{id}` | The answer to a verified question, worked out from the current data, with who verified it |
+| `/api/v1/watches` | Watches on datasets you can see, with their latest results |
 | `/api/v1/datasets/{name}/summary` | Totals grouped by a column: `group`, `aggregate` (count, sum, avg, min, max), `measure`, `bucket` (day, month, quarter, year), `filter` |
 | `/api/v1/openapi.json` | A machine-readable description of all of the above (OpenAPI 3.1) |
 
@@ -56,8 +58,9 @@ never return the wrong rows.
 ### AI assistants (MCP)
 
 Open Beam includes a read-only [Model Context Protocol](https://modelcontextprotocol.io)
-server at `/mcp`. An assistant connected to it can list datasets, describe
-their columns, read up to 200 rows at a time, and calculate totals. Totals
+server at `/mcp`. An assistant connected to it can list datasets, read
+their descriptions, answer verified questions, read up to 200 rows at a
+time, calculate totals, and list watches. Totals
 are calculated by Open Beam, not guessed by the assistant, so they match
 what you see in the browser.
 

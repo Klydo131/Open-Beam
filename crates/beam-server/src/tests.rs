@@ -2269,8 +2269,22 @@ async fn every_documented_api_address_answers() {
     let mut listed: Vec<String> = crate::api::DOCUMENTED_PATHS.iter().map(|p| p.to_string()).collect();
     listed.sort();
     assert_eq!(documented, listed);
+    let ada = site
+        .state
+        .accounts
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.username == "ada")
+        .unwrap();
+    let question = site
+        .state
+        .accounts
+        .add_question("sales", "Orders by region", "group=region", ada.id)
+        .unwrap();
     for path in crate::api::DOCUMENTED_PATHS {
-        let uri = path.replace("{name}", "sales") + if path.ends_with("summary") { "?group=region" } else { "" };
+        let uri = path.replace("{name}", "sales").replace("{id}", &question.to_string())
+            + if path.ends_with("summary") { "?group=region" } else { "" };
         let reply = bearer(&site, &uri, &token).await;
         assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.body);
     }
@@ -2360,7 +2374,14 @@ async fn ai_assistants_get_read_only_tools_over_mcp() {
         .collect();
     assert_eq!(
         names,
-        vec!["list_datasets", "describe_dataset", "query_rows", "summarize_dataset"]
+        vec![
+            "list_datasets",
+            "describe_dataset",
+            "query_rows",
+            "answer_verified_question",
+            "list_watches",
+            "summarize_dataset"
+        ]
     );
     assert!(tools["result"]["tools"]
         .as_array()
@@ -2709,4 +2730,293 @@ async fn postgres_clients_cannot_reach_files_settings_or_other_tables() {
         pg_text(&cyd, "SELECT count(*) FROM sales").await,
         vec![vec![Some("4".into())]]
     );
+}
+
+// ------------------------------------------- descriptions, questions, watches
+
+#[tokio::test]
+async fn people_responsible_for_data_describe_it_and_everyone_who_sees_it_can_read_it() {
+    let site = site(false, 100);
+    site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap();
+    let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let (cyd, _) = sign_in(&site, "cyd", CYD_PASSWORD).await;
+
+    // Built-in datasets are described by administrators.
+    let saved = submit(
+        &site,
+        &ada,
+        &ada_csrf,
+        "/datasets/sales/about",
+        &[
+            ("description", "One row per order. <script>x</script>"),
+            ("col2", "In euros, before tax."),
+        ],
+    )
+    .await;
+    assert_eq!(saved.location(), "/datasets/sales/about?ok=notes");
+    let page = get(&site, "/datasets/sales/about", Some(&bob)).await;
+    assert!(page.body.contains("One row per order. &lt;script&gt;x&lt;/script&gt;"));
+    assert!(page.body.contains("In euros, before tax."));
+    assert!(!page.body.contains("Save descriptions"), "readers get no form");
+    let refused = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/sales/about",
+        &[("description", "mine now")],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    // Uploads are described by their owner, and stay private with the data.
+    upload(&site, &bob, &bob_csrf, "budget.csv", BUDGET, "").await;
+    let mine = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/budget/about",
+        &[("description", "Team budgets")],
+    )
+    .await;
+    assert_eq!(mine.location(), "/datasets/budget/about?ok=notes");
+    assert_eq!(
+        get(&site, "/datasets/budget/about", Some(&cyd)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let too_long = "x".repeat(beam_accounts::MAX_NOTE_CHARS + 1);
+    let long = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/budget/about",
+        &[("description", &too_long)],
+    )
+    .await;
+    assert_eq!(long.location(), "/datasets/budget/about?error=text");
+
+    // Programs and assistants get the same descriptions.
+    let token = new_token(&site, &bob, &bob_csrf, "t").await;
+    let described = bearer(&site, "/api/v1/datasets/sales", &token).await.json();
+    assert_eq!(described["description"], "One row per order. <script>x</script>");
+    assert_eq!(described["columns"][2]["name"], "amount");
+    assert_eq!(described["columns"][2]["description"], "In euros, before tax.");
+}
+
+#[tokio::test]
+async fn verified_questions_are_answered_from_current_data_with_who_checked_them() {
+    let site = site(false, 100);
+    let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let question = [
+        ("question", "Sales by region"),
+        ("group", "region"),
+        ("agg", "sum"),
+        ("measure", "amount"),
+        ("kind", "bar"),
+    ];
+    let refused = submit(&site, &bob, &bob_csrf, "/datasets/sales/questions", &question).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "only people responsible for the data verify"
+    );
+    let unusable = submit(
+        &site,
+        &ada,
+        &ada_csrf,
+        "/datasets/sales/questions",
+        &[("question", "Nonsense"), ("group", "no_such_column")],
+    )
+    .await;
+    assert_eq!(unusable.location(), "/datasets/sales/about?error=failed");
+    let saved = submit(&site, &ada, &ada_csrf, "/datasets/sales/questions", &question).await;
+    assert_eq!(saved.location(), "/datasets/sales/about?ok=question");
+
+    // The chart view offers the form only to people who may verify.
+    assert!(get(&site, "/datasets/sales/chart", Some(&ada))
+        .await
+        .body
+        .contains("Save as a verified question"));
+    assert!(!get(&site, "/datasets/sales/chart", Some(&bob))
+        .await
+        .body
+        .contains("Save as a verified question"));
+    let about = get(&site, "/datasets/sales/about", Some(&bob)).await;
+    assert!(about.body.contains("Sales by region"));
+    assert!(about.body.contains("verified by ada"));
+
+    let token = new_token(&site, &bob, &bob_csrf, "t").await;
+    let listed = bearer(&site, "/api/v1/datasets/sales", &token).await.json();
+    let id = listed["verified_questions"][0]["id"].as_i64().unwrap();
+    let answer = bearer(&site, &format!("/api/v1/datasets/sales/questions/{id}"), &token)
+        .await
+        .json();
+    assert_eq!(answer["verified_by"], "ada");
+    assert_eq!(answer["computed_with"]["aggregate"], "sum");
+    let eu = answer["answer"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["label"] == "EU")
+        .unwrap()
+        .clone();
+    assert_eq!(eu["value"], json!(40.75));
+    assert_eq!(
+        bearer(&site, "/api/v1/datasets/sales/questions/999", &token)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // An assistant gets the same answer through MCP.
+    let called = mcp(
+        &site,
+        &token,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "answer_verified_question", "arguments": { "name": "sales", "id": id } } }),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(called["result"]["isError"], false, "{called}");
+    assert_eq!(called["result"]["structuredContent"]["verified_by"], "ada");
+}
+
+#[tokio::test]
+async fn watches_find_repeats_totals_and_changes_without_any_model() {
+    let site = site(false, 100);
+    site.state.accounts.create("cyd", CYD_PASSWORD, Role::User).unwrap();
+    let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let (cyd, _) = sign_in(&site, "cyd", CYD_PASSWORD).await;
+    let add = |fields: Vec<(&'static str, &'static str)>| {
+        let (site, ada, csrf) = (&site, ada.clone(), ada_csrf.clone());
+        async move {
+            submit(site, &ada, &csrf, "/datasets/sales/watches", &fields)
+                .await
+                .location()
+                .to_string()
+        }
+    };
+    // EU appears on two orders: one repeat.
+    assert_eq!(
+        add(vec![
+            ("name", "One order per region"),
+            ("kind", "repeats"),
+            ("keys", "region"),
+            ("threshold", "0")
+        ])
+        .await,
+        "/datasets/sales/about?ok=watch"
+    );
+    // Total amount is 100.75.
+    assert_eq!(
+        add(vec![
+            ("name", "Sales over 100"),
+            ("kind", "total"),
+            ("agg", "sum"),
+            ("measure", "amount"),
+            ("when", "above"),
+            ("threshold", "100")
+        ])
+        .await,
+        "/datasets/sales/about?ok=watch"
+    );
+    // One order a month: no change between the last two months.
+    assert_eq!(
+        add(vec![
+            ("name", "Orders steady"),
+            ("kind", "change"),
+            ("agg", "count"),
+            ("date", "sold_on"),
+            ("bucket", "month"),
+            ("threshold", "50")
+        ])
+        .await,
+        "/datasets/sales/about?ok=watch"
+    );
+    // A watch that cannot run on the data is refused.
+    assert_eq!(
+        add(vec![
+            ("name", "Broken"),
+            ("kind", "repeats"),
+            ("keys", "no_such_column"),
+            ("threshold", "0")
+        ])
+        .await,
+        "/datasets/sales/about?error=watch"
+    );
+    let refused = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/sales/watches",
+        &[
+            ("name", "x"),
+            ("kind", "repeats"),
+            ("keys", "region"),
+            ("threshold", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    let token = new_token(&site, &bob, &bob_csrf, "t").await;
+    let watches = bearer(&site, "/api/v1/watches", &token).await.json();
+    let by_name = |name: &str| {
+        watches
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let repeats = by_name("One order per region");
+    assert_eq!(repeats["status"], "alert");
+    assert!(
+        repeats["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 combination(s) of region"),
+        "{repeats}"
+    );
+    let total = by_name("Sales over 100");
+    assert_eq!(
+        (total["status"].clone(), total["value"].clone()),
+        (json!("alert"), json!(100.75))
+    );
+    let change = by_name("Orders steady");
+    assert_eq!(change["status"], "ok", "{change}");
+    assert!(
+        change["message"]
+            .as_str()
+            .unwrap()
+            .contains("for 2024-04 is 1, up 0% on 2024-03"),
+        "{change}"
+    );
+    assert_eq!(watches[0]["status"], "alert", "alerts come first");
+
+    // Watches on someone's private upload are seen only by those who see it.
+    upload(&site, &bob, &bob_csrf, "budget.csv", BUDGET, "").await;
+    let mine = submit(
+        &site,
+        &bob,
+        &bob_csrf,
+        "/datasets/budget/watches",
+        &[
+            ("name", "Teams once"),
+            ("kind", "repeats"),
+            ("keys", "team"),
+            ("threshold", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(mine.location(), "/datasets/budget/about?ok=watch");
+    assert!(get(&site, "/watches", Some(&bob)).await.body.contains("Teams once"));
+    assert!(!get(&site, "/watches", Some(&cyd)).await.body.contains("Teams once"));
+    assert!(get(&site, "/watches", Some(&cyd))
+        .await
+        .body
+        .contains("One order per region"));
 }

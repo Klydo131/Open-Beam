@@ -71,6 +71,10 @@ Milestones are ordered. Each one should leave the project usable on its own.
 - [ ] Review and sign-off workflow for reported figures
 - [ ] Audit log of account and data-access events
 - [x] Read-only access for AI assistants over MCP
+- [x] Descriptions of datasets and columns, verified questions, and hourly watches
+- [ ] Notifications when a watch raises an alert
+- [ ] An optional Ask page using the user's own key or a local model, limited to the same tools
+- [ ] An accuracy check kit: run your own questions against verified answers
 - [ ] Optional assistant integrations using the user's own credentials
 - [ ] Sandboxed WebAssembly extensions
 - [ ] Stable, versioned Rust and HTTP APIs
