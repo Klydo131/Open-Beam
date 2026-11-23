@@ -1017,16 +1017,16 @@ async fn uploads_are_private_until_shared() {
     assert_eq!(upload_files(&site), 1);
     let page = get(&site, "/datasets/team_budget_2025", Some(&bob)).await;
     assert!(page.body.contains("Rows 1–3 of 3") && page.body.contains(">Sharing<"));
-    assert!(get(&site, "/", Some(&bob))
-        .await
-        .body
-        .contains(">01 / Yours</span>"));
+    assert!(get(&site, "/", Some(&bob)).await.body.contains(">01 / Yours</span>"));
 
     // Nobody else can inspect it from the home page either.
     let (cyd_home, _) = sign_in(&site, "cyd", CYD_PASSWORD).await;
     let peek = get(&site, "/?pick=team_budget_2025", Some(&cyd_home)).await;
     assert_eq!(peek.status, StatusCode::OK);
-    assert!(!peek.body.contains("team_budget_2025"), "an unseen dataset is not named or inspected");
+    assert!(
+        !peek.body.contains("team_budget_2025"),
+        "an unseen dataset is not named or inspected"
+    );
     let own = get(&site, "/?pick=TEAM_BUDGET_2025", Some(&bob)).await;
     assert!(own.body.contains("id=\"inspector\"") && own.body.contains("Open table"));
 
