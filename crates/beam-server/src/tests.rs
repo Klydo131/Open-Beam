@@ -3136,6 +3136,9 @@ async fn administrators_see_how_the_server_is_doing_and_others_do_not() {
     let site = site(false, 100);
     let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
     let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    // Before any query, no speed is claimed.
+    let fresh = get(&site, "/admin/system", Some(&ada)).await;
+    assert!(!fresh.body.contains("over 30 s"), "an idle server is not slow");
     // Some work for the counters.
     get(&site, "/datasets/sales", Some(&bob)).await;
 

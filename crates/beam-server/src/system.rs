@@ -89,6 +89,9 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
     let watches = state.accounts.watches(None).unwrap_or_default();
     let count = |s: WatchStatus| watches.iter().filter(|w| w.status == Some(s)).count();
     let p = |share| {
+        if stats.queries_total == 0 {
+            return "—".to_string();
+        }
         stats.percentile_ms(share).map_or("over 30 s".to_string(), |ms| {
             format!("≤ {} ms", format_number(ms as f64))
         })
