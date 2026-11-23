@@ -32,7 +32,13 @@ pub struct Lane<'a> {
 pub struct Facts {
     watches: HashMap<String, Vec<Watch>>,
     questions: HashMap<String, usize>,
+    /// Datasets with a written description, lower case.
+    described: std::collections::HashSet<String>,
 }
+
+/// The steps a dataset climbs, like levels in a management game: each one
+/// is something a person does that makes its answers more dependable.
+const LEVELS: [&str; 4] = ["Stocked", "Labelled", "Watched", "Trusted"];
 
 impl Facts {
     pub fn read(state: &AppState, entries: &[Entry]) -> Self {
@@ -50,7 +56,40 @@ impl Facts {
                 (e.set.name.to_ascii_lowercase(), count)
             })
             .collect();
-        Self { watches, questions }
+        let described = entries
+            .iter()
+            .filter(|e| {
+                state
+                    .accounts
+                    .notes(&e.set.name)
+                    .is_ok_and(|notes| notes.iter().any(|n| n.column.is_empty()))
+            })
+            .map(|e| e.set.name.to_ascii_lowercase())
+            .collect();
+        Self {
+            watches,
+            questions,
+            described,
+        }
+    }
+
+    /// How far a dataset has climbed (1 to 4), and the next step if any.
+    /// Steps are counted in order, so the level always names the first
+    /// thing still missing.
+    fn level(&self, name: &str) -> (usize, Option<&'static str>) {
+        let done = [
+            self.described.contains(&name.to_ascii_lowercase()),
+            !self.watches(name).is_empty(),
+            self.questions(name) > 0,
+        ];
+        let reached = 1 + done.iter().take_while(|d| **d).count();
+        let next = match reached {
+            1 => Some("describe it"),
+            2 => Some("add a watch"),
+            3 => Some("verify a question"),
+            _ => None,
+        };
+        (reached, next)
     }
 
     fn watches(&self, name: &str) -> &[Watch] {
@@ -107,6 +146,12 @@ pub fn lanes(lanes: &[Lane<'_>], facts: &Facts, picked: Option<&str>) -> Markup 
                                 strong.spine-title { (name) }
                                 span.spine-meta { (entry.set.properties.len()) " columns" }
                                 span.spine-meta { (note) }
+                                @let (reached, next) = facts.level(name);
+                                span.level title={ "Level " (reached) " of 4: " (LEVELS[reached - 1]) } {
+                                    @for step in 1..=4 { span class={ "pip" @if step <= reached { " on" } } {} }
+                                    " " (LEVELS[reached - 1])
+                                }
+                                @if let Some(next) = next { span.spine-meta.next { "Next: " (next) } }
                                 span.spine-foot {
                                     (light(facts.status(name)))
                                     @if questions > 0 {
@@ -118,6 +163,33 @@ pub fn lanes(lanes: &[Lane<'_>], facts: &Facts, picked: Option<&str>) -> Markup 
                     }
                 }
             }
+        }
+    }
+}
+
+/// The counter bar along the top of the stacks: totals at a glance.
+pub fn counters(entries: &[Entry], facts: &Facts) -> Markup {
+    let names: Vec<&str> = entries.iter().map(|e| e.set.name.as_str()).collect();
+    let described = names
+        .iter()
+        .filter(|n| facts.described.contains(&n.to_ascii_lowercase()))
+        .count();
+    let watched = names.iter().filter(|n| !facts.watches(n).is_empty()).count();
+    let trusted = names.iter().filter(|n| facts.level(n).0 == 4).count();
+    let verified: usize = names.iter().map(|n| facts.questions(n)).sum();
+    let alerts = names
+        .iter()
+        .flat_map(|n| facts.watches(n))
+        .filter(|w| w.status == Some(WatchStatus::Alert))
+        .count();
+    html! {
+        dl.counters aria-label="Your stacks at a glance" {
+            div { dt { "Datasets" } dd { (names.len()) } }
+            div { dt { "Labelled" } dd { (described) } }
+            div { dt { "Watched" } dd { (watched) } }
+            div { dt { "Trusted" } dd { (trusted) } }
+            div { dt { "Verified answers" } dd { (verified) } }
+            div class={ @if alerts > 0 { "alerting" } } { dt { "Alerts" } dd { (alerts) } }
         }
     }
 }

@@ -3071,3 +3071,53 @@ async fn watches_find_repeats_totals_and_changes_without_any_model() {
         .body
         .contains("One order per region"));
 }
+
+#[tokio::test]
+async fn datasets_climb_levels_as_people_describe_watch_and_verify_them() {
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let level = |body: &str| {
+        let start = body.find("title=\"Level ").expect("a level on the sales spine");
+        body[start + 13..start + 14].to_string()
+    };
+    let home = || async { get(&site, "/?pick=sales", Some(&ada)).await.body };
+    assert_eq!(level(&home().await), "1");
+    assert!(home().await.contains("Next: describe it"));
+
+    submit(
+        &site,
+        &ada,
+        &csrf,
+        "/datasets/sales/about",
+        &[("description", "One row per order.")],
+    )
+    .await;
+    assert_eq!(level(&home().await), "2");
+    submit(
+        &site,
+        &ada,
+        &csrf,
+        "/datasets/sales/watches",
+        &[
+            ("name", "Orders once"),
+            ("kind", "repeats"),
+            ("keys", "order_id"),
+            ("threshold", "0"),
+        ],
+    )
+    .await;
+    assert_eq!(level(&home().await), "3");
+    submit(
+        &site,
+        &ada,
+        &csrf,
+        "/datasets/sales/questions",
+        &[("question", "Orders by region"), ("group", "region")],
+    )
+    .await;
+    let done = home().await;
+    assert_eq!(level(&done), "4");
+    // Only the other dataset, `many`, still has a next step.
+    assert_eq!(done.matches("Next:").count(), 1, "a trusted dataset has no next step");
+    assert!(done.contains("<dt>Trusted</dt><dd>1</dd>"), "the counter bar counts it");
+}

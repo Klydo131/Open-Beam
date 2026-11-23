@@ -473,6 +473,7 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
             div.actions { a.button href="/data/new" { "Add data" } a.button.quiet href="/watches" { "Watches" } }
         }
         (notice(&query))
+        @if !entries.is_empty() { (stacks::counters(&entries, &facts)) }
         @if !drafts.is_empty() {
             section.panel.attention {
                 h2 { "Waiting for your review" }
