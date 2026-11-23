@@ -21,7 +21,7 @@ jobs:
   create:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,7 +45,7 @@ jobs:
             label: linux-x64
             binary: beam
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo test --workspace --release --locked

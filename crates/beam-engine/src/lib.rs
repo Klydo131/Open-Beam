@@ -273,7 +273,9 @@ impl Engine {
         };
         conn.execute_batch(&format!(
             "SET allowed_paths = [{}]; SET allowed_directories = [{allowed_directories}]; \
-             SET enable_external_access = false; SET lock_configuration = true;",
+             SET enable_external_access = false; \
+             SET autoinstall_known_extensions = false; SET autoload_known_extensions = false; \
+             SET allow_community_extensions = false; SET lock_configuration = true;",
             allowed_paths.join(", ")
         ))?;
         // A query that reads a file which is not itself a configured dataset
@@ -1273,6 +1275,14 @@ mod tests {
         assert!(engine.query(&copy, &[], 0).is_err());
         assert!(engine.query("SET enable_external_access = true", &[], 0).is_err());
         assert!(engine.query("INSTALL httpfs", &[], 0).is_err());
+        // No extension can be loaded, even one already on disk, and the
+        // switches that would allow it are locked off.
+        for name in ["autoload_known_extensions", "autoinstall_known_extensions", "allow_community_extensions"] {
+            let value = engine.query(&format!("SELECT current_setting('{name}')"), &[], 1).unwrap();
+            assert_eq!(value, vec![vec![json!(false)]], "{name}");
+            assert!(engine.query(&format!("SET {name} = true"), &[], 0).is_err(), "{name} is locked");
+        }
+        assert!(engine.query("LOAD aws", &[], 0).is_err());
         // The configured dataset itself still reads.
         assert_eq!(
             engine.query("SELECT count(*) FROM sales", &[], 1).unwrap(),
