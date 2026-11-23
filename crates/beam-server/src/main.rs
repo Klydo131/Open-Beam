@@ -14,6 +14,7 @@ mod people;
 mod pgsql;
 mod postgres;
 mod review;
+mod stacks;
 mod table;
 #[cfg(test)]
 mod tests;

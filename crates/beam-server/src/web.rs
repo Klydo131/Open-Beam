@@ -11,6 +11,7 @@ use crate::app::AppState;
 use crate::auth::{self, Signed};
 use crate::catalog;
 use crate::feed;
+use crate::stacks;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
@@ -414,26 +415,62 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
         .collect();
     let built_in: Vec<&catalog::Entry> = entries.iter().filter(|e| e.upload.is_none()).collect();
     let feed_url = format!("{}/odata/", feed::base_url(&state, &headers));
-    let card = |entry: &catalog::Entry, note: String| {
-        html! {
-            li {
-                a.card href={ "/datasets/" (entry.set.name) } {
-                    strong { (entry.set.name) }
-                    span { (entry.set.properties.len()) " columns · " (note) }
-                }
-            }
-        }
-    };
     let others_heading = if me.role == Role::Admin {
         "Added by others"
     } else {
         "Shared with you"
     };
+    let added = |e: &catalog::Entry| {
+        format!(
+            "added {}",
+            e.upload.as_ref().map_or("", |u| u.created_at.get(..10).unwrap_or(""))
+        )
+    };
+    let from = |e: &catalog::Entry| {
+        format!(
+            "from {}",
+            e.upload
+                .as_ref()
+                .map_or("someone".to_string(), |u| owner_name(u.owner_id))
+        )
+    };
+    let lanes = [
+        stacks::Lane {
+            number: "01",
+            title: "Yours",
+            tone: "lane-mine",
+            entries: mine.iter().map(|e| (*e, added(e))).collect(),
+        },
+        stacks::Lane {
+            number: "02",
+            title: others_heading,
+            tone: "lane-shared",
+            entries: others.iter().map(|e| (*e, from(e))).collect(),
+        },
+        stacks::Lane {
+            number: "03",
+            title: "For everyone",
+            tone: "lane-everyone",
+            entries: built_in
+                .iter()
+                .map(|e| (*e, "set up by your administrator".to_string()))
+                .collect(),
+        },
+    ];
+    let facts = stacks::Facts::read(&state, &entries);
+    // Only a dataset this account can see can be picked.
+    let picked = query
+        .get("pick")
+        .and_then(|name| entries.iter().find(|e| e.set.name.eq_ignore_ascii_case(name)));
 
     let body = html! {
-        div.titlebar {
-            h1 { "Datasets" }
-            div.actions { a.button href="/data/new" { "Add data" } }
+        div.intro {
+            div {
+                p.eyebrow { "OPEN BEAM / YOUR STACKS" }
+                h1 { "Your data, shelved and checked." }
+                p.lede { "Pick a dataset to see what it means, its verified answers and its watches. Open it to explore, chart or download." }
+            }
+            div.actions { a.button href="/data/new" { "Add data" } a.button.quiet href="/watches" { "Watches" } }
         }
         (notice(&query))
         @if !drafts.is_empty() {
@@ -457,20 +494,12 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
                 a.button href="/data/new" { "Add data" }
             }
         }
-        @if !mine.is_empty() {
-            h2.section { "Yours" }
-            ul.cards { @for entry in &mine { (card(entry, format!("added {}", entry.upload.as_ref().map_or("", |u| u.created_at.get(..10).unwrap_or(""))))) } }
+        div class={ "stacks" @if picked.is_some() { " with-inspector" } } {
+            div.lanes { (stacks::lanes(&lanes, &facts, picked.map(|e| e.set.name.as_str()))) }
+            @if let Some(entry) = picked { (stacks::inspector(&state, entry, &facts)) }
         }
-        @if !others.is_empty() {
-            h2.section { (others_heading) }
-            ul.cards { @for entry in &others { (card(entry, format!("from {}", entry.upload.as_ref().map_or("someone".to_string(), |u| owner_name(u.owner_id))))) } }
-        }
-        @if !built_in.is_empty() {
-            h2.section { "Shared with everyone" }
-            ul.cards { @for entry in &built_in { (card(entry, "set up by your administrator".to_string())) } }
-        }
-        section.panel {
-            h2 { "Use this data in Excel or Power BI" }
+        details.panel {
+            summary { "Use this data in Excel or Power BI" }
             ol {
                 li { "In Excel choose Data → Get Data → From Other Sources → From OData Feed. In Power BI Desktop choose Get Data → OData feed." }
                 li { "Enter this address: " code { (feed_url) } }

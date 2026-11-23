@@ -371,7 +371,7 @@ async fn users_read_data_but_cannot_manage_accounts() {
     let site = site(false, 100);
     let (cookie, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
     let home = get(&site, "/", Some(&cookie)).await;
-    assert!(home.body.contains("href=\"/datasets/sales\""));
+    assert!(home.body.contains("href=\"/?pick=sales#inspector\""));
     assert!(
         !home.body.contains("/admin/accounts"),
         "the menu hides what the role cannot use"
@@ -1020,7 +1020,15 @@ async fn uploads_are_private_until_shared() {
     assert!(get(&site, "/", Some(&bob))
         .await
         .body
-        .contains("<h2 class=\"section\">Yours</h2>"));
+        .contains(">01 / Yours</span>"));
+
+    // Nobody else can inspect it from the home page either.
+    let (cyd_home, _) = sign_in(&site, "cyd", CYD_PASSWORD).await;
+    let peek = get(&site, "/?pick=team_budget_2025", Some(&cyd_home)).await;
+    assert_eq!(peek.status, StatusCode::OK);
+    assert!(!peek.body.contains("team_budget_2025"), "an unseen dataset is not named or inspected");
+    let own = get(&site, "/?pick=TEAM_BUDGET_2025", Some(&bob)).await;
+    assert!(own.body.contains("id=\"inspector\"") && own.body.contains("Open table"));
 
     // Nobody else sees it: not on pages, downloads, charts or the feed.
     for uri in [
