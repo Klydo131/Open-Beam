@@ -3303,6 +3303,16 @@ async fn one_address_spraying_passwords_across_usernames_is_stopped() {
     let bot: std::net::IpAddr = "203.0.113.9".parse().unwrap();
     let mut refused_at = None;
     for n in 0..=crate::auth::MAX_ADDRESS_FAILURES {
+        // Halfway, someone at the same address signs in correctly. That
+        // must not wipe out the bot's failures.
+        if n == crate::auth::MAX_ADDRESS_FAILURES / 2 {
+            assert!(
+                crate::auth::check_password(&site.state, "ada", ADMIN_PASSWORD, Some(bot))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
         // A different username each time, so no single username locks.
         let name = format!("user{n}");
         match crate::auth::check_password(&site.state, &name, "Summer2026!", Some(bot)).await {
@@ -3315,12 +3325,15 @@ async fn one_address_spraying_passwords_across_usernames_is_stopped() {
         }
     }
     assert_eq!(refused_at, Some(crate::auth::MAX_ADDRESS_FAILURES));
-    // Even the right password is refused from that address for now...
-    assert!(matches!(
-        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(bot)).await,
-        Err(crate::auth::Refused::Locked)
-    ));
-    // ...the refusal did not count against bob himself...
+    // Every attempt from that address is refused for now, however often
+    // it is tried...
+    for _ in 0..6 {
+        assert!(matches!(
+            crate::auth::check_password(&site.state, "bob", "a wrong guess", Some(bot)).await,
+            Err(crate::auth::Refused::Locked)
+        ));
+    }
+    // ...and those refusals did not count against bob himself...
     assert!(crate::auth::check_password(&site.state, "bob", USER_PASSWORD, None)
         .await
         .unwrap()

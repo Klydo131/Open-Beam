@@ -1277,10 +1277,19 @@ mod tests {
         assert!(engine.query("INSTALL httpfs", &[], 0).is_err());
         // No extension can be loaded, even one already on disk, and the
         // switches that would allow it are locked off.
-        for name in ["autoload_known_extensions", "autoinstall_known_extensions", "allow_community_extensions"] {
-            let value = engine.query(&format!("SELECT current_setting('{name}')"), &[], 1).unwrap();
+        for name in [
+            "autoload_known_extensions",
+            "autoinstall_known_extensions",
+            "allow_community_extensions",
+        ] {
+            let value = engine
+                .query(&format!("SELECT current_setting('{name}')"), &[], 1)
+                .unwrap();
             assert_eq!(value, vec![vec![json!(false)]], "{name}");
-            assert!(engine.query(&format!("SET {name} = true"), &[], 0).is_err(), "{name} is locked");
+            assert!(
+                engine.query(&format!("SET {name} = true"), &[], 0).is_err(),
+                "{name} is locked"
+            );
         }
         assert!(engine.query("LOAD aws", &[], 0).is_err());
         // The configured dataset itself still reads.
