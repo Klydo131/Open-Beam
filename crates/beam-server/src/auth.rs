@@ -70,7 +70,7 @@ impl Refused {
 /// One reserved attempt. It is released when dropped, so a request that is
 /// abandoned part-way (the client disconnects) still gives its place back.
 /// An attempt that never reported a result counts as a failure.
-struct Reservation<'a> {
+pub(crate) struct Reservation<'a> {
     guard: &'a Guard,
     key: String,
     succeeded: Option<bool>,
@@ -149,6 +149,13 @@ impl Guard {
                 entry.failed += 1;
             }
         }
+    }
+
+    /// Reserves an attempt for `username` as a sign-in in flight would,
+    /// and holds it until dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_attempt(&self, username: &str) -> Option<Reservation<'_>> {
+        self.begin(username)
     }
 
     /// Attempts for `username` still marked as in flight.

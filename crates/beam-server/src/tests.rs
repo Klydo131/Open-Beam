@@ -1828,15 +1828,14 @@ async fn a_new_window_starts_even_while_an_attempt_is_in_flight() {
         let password = format!("wrong {n}");
         post(&site, "/login", None, &[("username", "bob"), ("password", &password)]).await;
     }
-    // A fifth attempt started and still running fills the allowance.
-    let mut held = Box::pin(crate::auth::check_password(&site.state, "bob", "still checking"));
-    // Polled exactly once and never again: it has reserved its place and
-    // cannot finish, on any machine, however fast or coarse its timers.
-    std::future::poll_fn(|cx| {
-        let _ = std::future::Future::poll(held.as_mut(), cx);
-        std::task::Poll::Ready(())
-    })
-    .await;
+    // A fifth attempt still in flight fills the allowance. It is reserved
+    // directly, so it holds its place on any machine, however its threads
+    // and timers are scheduled.
+    let held = site
+        .state
+        .guard
+        .hold_attempt("bob")
+        .expect("a fifth attempt is allowed");
     assert_eq!(site.state.guard.pending("bob"), 1);
     site.state.guard.age_attempts(crate::auth::FAILURE_WINDOW);
     let signed = post(
