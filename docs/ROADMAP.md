@@ -64,7 +64,9 @@ Milestones are ordered. Each one should leave the project usable on its own.
 - [ ] Catalog compatibility for the drivers used by Power BI and Excel
 - [ ] Built-in encryption for PostgreSQL connections
 - [x] Per-query time limits
-- [ ] Per-query memory limits
+- [x] Engine memory limit with capped spill to disk, and a cap on queries running at once
+- [x] Column-store copies of file datasets for fast queries
+- [x] System page and Prometheus metrics for administrators
 
 ## 0.7 — Platform
 

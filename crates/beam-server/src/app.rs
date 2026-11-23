@@ -1,6 +1,6 @@
 //! Shared state and the route table.
 
-use crate::{api, auth, chart, curate, export, feed, mcp, people, review, table, uploads, web};
+use crate::{api, auth, chart, curate, export, feed, mcp, people, review, system, table, uploads, web};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
 use axum::http::header::{
@@ -99,6 +99,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/datasets/{name}/questions/{id}", get(api::question_route))
         .route("/api/v1/watches", get(api::watches_route))
         .route("/mcp", get(mcp::get).post(mcp::post))
+        .route("/metrics", get(system::metrics_route))
         .layer(middleware::from_fn_with_state(state.clone(), auth::feed_guard));
 
     let pages = Router::new()
@@ -115,6 +116,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/{name}/watches/{id}/run", post(curate::run_watch_now))
         .route("/datasets/{name}/watches/{id}/remove", post(curate::remove_watch))
         .route("/watches", get(curate::overview))
+        .route("/admin/system", get(system::page_route))
         .route("/datasets/{name}/export.csv", get(export::csv))
         .route("/datasets/{name}/export.xlsx", get(export::excel))
         .route("/datasets/{name}/share", get(uploads::sharing).post(uploads::share))

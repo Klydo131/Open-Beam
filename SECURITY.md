@@ -46,9 +46,20 @@ as untrusted.
   private to their owner, the people they share with, and administrators.
 - **Feed clients send the password with each request.** This is how HTTP Basic
   authentication works; it is the method Excel and Power BI support for OData.
-- **Queries are limited in time, not in memory.** Every query is cancelled
-  after `query_timeout_seconds` (30 by default), but a query that finishes
-  within that time can still use a lot of memory on very large files.
+- **Queries are limited in time and memory.** Every query is cancelled after
+  `query_timeout_seconds` (30 by default). The engine may use
+  `memory_limit_mb` (half the computer's memory by default); a query needing
+  more spills to temporary files in the upload folder, capped by
+  `spill_limit_mb`, and past that stops with a clear message. At most
+  `max_concurrent_queries` run at once. Some engine operations cannot spill,
+  so a single very large query can still fail rather than finish.
+- **Fast copies of datasets live in the upload folder.** Each file dataset
+  is kept as a compressed column-store copy in `.cache` inside the upload
+  folder; it holds the same data as the original, so protect that folder as
+  you protect the data files.
+- **Metrics are for administrators.** `/admin/system` and `/metrics` need an
+  administrator. The slow-query log keeps statements with quoted values
+  replaced, but table and column names remain visible.
 - **PostgreSQL access is unencrypted.** It is off by default. When turned on
   with `postgres_bind`, it accepts only personal API tokens, never account
   passwords, but the token travels in the clear. Keep it on `127.0.0.1` or

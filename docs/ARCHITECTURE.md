@@ -91,6 +91,18 @@ with [axum](https://github.com/tokio-rs/axum).
   `/api/v1`, described by a hand-written OpenAPI document, and a read-only
   MCP endpoint at `/mcp` for AI assistants. Both are thin layers over the
   same planner as the feed and see exactly what the feed would.
+- **Speed and memory.** With an upload folder, every file dataset is copied
+  once into a compressed column-store file (Parquet) in its `.cache` folder,
+  keyed by the source file's path, size and change time, so a changed file
+  gets a fresh copy and stale ones are pruned. Queries scan that copy instead
+  of re-parsing the original. The engine runs under a memory limit (half the
+  computer's memory by default), spills to a capped `.spill` folder when a
+  query needs more, and admits a fixed number of queries at once through a
+  gate; the rest wait their turn within the time limit. Blocking work runs on
+  a fixed pool of threads.
+- **Monitoring.** Fixed-size counters, a latency histogram and a 20-entry
+  slow-query log (quoted values replaced) feed the administrator's System
+  page and `/metrics` in Prometheus' text format.
 - **Descriptions, verified questions and watches** (`curate.rs`) are
   stored in the accounts file beside the dataset's name, and removed with
   the dataset, so a new dataset never inherits what was written about an

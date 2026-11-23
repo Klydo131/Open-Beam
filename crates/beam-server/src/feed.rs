@@ -85,6 +85,10 @@ pub enum QueryFailure {
     Rejected,
     /// The query ran past the time limit and was cancelled.
     TimedOut,
+    /// The query needed more memory than the engine is allowed.
+    OutOfMemory,
+    /// Every place for a running query stayed taken for the whole time limit.
+    Busy,
     Internal,
 }
 
@@ -93,6 +97,8 @@ impl QueryFailure {
         match self {
             QueryFailure::Rejected => error(StatusCode::BAD_REQUEST, "The query could not be executed"),
             QueryFailure::TimedOut => error(StatusCode::SERVICE_UNAVAILABLE, TOO_LONG),
+            QueryFailure::OutOfMemory => error(StatusCode::SERVICE_UNAVAILABLE, TOO_BIG),
+            QueryFailure::Busy => error(StatusCode::SERVICE_UNAVAILABLE, BUSY),
             QueryFailure::Internal => error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
         }
     }
@@ -101,6 +107,11 @@ impl QueryFailure {
 /// Runs a planned statement off the async runtime. The engine's own error
 /// text goes to the server log only, never to the client.
 /// Shown wherever a query is cancelled for running too long.
+/// Shown when a query needs more memory than the engine may use.
+pub const TOO_BIG: &str = "That query needs more memory than Open Beam is allowed to use. Narrow it with a filter or choose fewer columns, or ask an administrator to raise memory_limit_mb.";
+/// Shown when the server is too busy to start another query in time.
+pub const BUSY: &str = "Open Beam is busy with other queries. Try again in a moment.";
+
 pub const TOO_LONG: &str = "That query took too long. Narrow it with a filter, choose fewer columns, or ask an administrator to raise the time limit.";
 
 pub async fn run(
@@ -114,6 +125,8 @@ pub async fn run(
     match outcome {
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(beam_engine::EngineError::TimedOut)) => Err(QueryFailure::TimedOut),
+        Ok(Err(beam_engine::EngineError::OutOfMemory)) => Err(QueryFailure::OutOfMemory),
+        Ok(Err(beam_engine::EngineError::Busy)) => Err(QueryFailure::Busy),
         Ok(Err(e)) => {
             eprintln!("query failed: {e}");
             Err(QueryFailure::Rejected)

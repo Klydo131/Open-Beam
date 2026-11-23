@@ -52,6 +52,8 @@ impl From<QueryFailure> for ApiError {
     fn from(failure: QueryFailure) -> Self {
         match failure {
             QueryFailure::TimedOut => Self::new(StatusCode::SERVICE_UNAVAILABLE, feed::TOO_LONG),
+            QueryFailure::OutOfMemory => Self::new(StatusCode::SERVICE_UNAVAILABLE, feed::TOO_BIG),
+            QueryFailure::Busy => Self::new(StatusCode::SERVICE_UNAVAILABLE, feed::BUSY),
             QueryFailure::Rejected => Self::new(
                 StatusCode::BAD_REQUEST,
                 "The query could not be run. Check the filter values.",
@@ -397,6 +399,8 @@ pub async fn parquet(
         match tokio::task::spawn_blocking(move || worker.engine.query_to_parquet(&sql, &params)).await {
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(beam_engine::EngineError::TimedOut)) => Err(QueryFailure::TimedOut.into()),
+            Ok(Err(beam_engine::EngineError::OutOfMemory)) => Err(QueryFailure::OutOfMemory.into()),
+            Ok(Err(beam_engine::EngineError::Busy)) => Err(QueryFailure::Busy.into()),
             Ok(Err(beam_engine::EngineError::UploadsDisabled)) => Err(ApiError::new(
                 StatusCode::NOT_IMPLEMENTED,
                 "Parquet downloads need the uploads folder, which is turned off on this server.",

@@ -35,6 +35,16 @@ pub struct Config {
     /// `127.0.0.1:5433`. Off when not set. Sign-in uses personal API tokens,
     /// sent unencrypted, so keep it on this computer or behind a TLS tunnel.
     pub postgres_bind: Option<SocketAddr>,
+    /// Memory the query engine may use, in megabytes. Unset means half of
+    /// this computer's memory.
+    pub memory_limit_mb: Option<u64>,
+    /// Largest total of temporary files for queries too large for memory,
+    /// in megabytes.
+    #[serde(default = "default_spill_limit_mb")]
+    pub spill_limit_mb: u64,
+    /// Queries that may run at once; others wait their turn.
+    #[serde(default = "default_max_concurrent_queries")]
+    pub max_concurrent_queries: usize,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
 }
@@ -58,6 +68,17 @@ pub enum FormatConfig {
     Parquet,
 }
 
+impl Config {
+    /// The engine limits these settings ask for.
+    pub fn limits(&self) -> beam_engine::Limits {
+        beam_engine::Limits {
+            memory_limit_bytes: self.memory_limit_mb.map(|mb| mb * 1024 * 1024),
+            spill_limit_bytes: self.spill_limit_mb * 1024 * 1024,
+            max_concurrent: self.max_concurrent_queries,
+        }
+    }
+}
+
 fn default_bind() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8787))
 }
@@ -68,6 +89,14 @@ fn default_accounts() -> PathBuf {
 
 fn default_uploads() -> PathBuf {
     PathBuf::from("beam-uploads")
+}
+
+fn default_spill_limit_mb() -> u64 {
+    10 * 1024
+}
+
+fn default_max_concurrent_queries() -> usize {
+    4
 }
 
 fn default_query_timeout_seconds() -> u64 {
@@ -121,6 +150,15 @@ impl Config {
         config.uploads = base.join(&config.uploads);
         if !(1..=3600).contains(&config.query_timeout_seconds) {
             return Err("query_timeout_seconds must be between 1 and 3600".into());
+        }
+        if config.memory_limit_mb.is_some_and(|mb| !(64..=4_194_304).contains(&mb)) {
+            return Err("memory_limit_mb must be between 64 and 4194304".into());
+        }
+        if config.spill_limit_mb > 16_777_216 {
+            return Err("spill_limit_mb must be at most 16777216".into());
+        }
+        if !(1..=64).contains(&config.max_concurrent_queries) {
+            return Err("max_concurrent_queries must be between 1 and 64".into());
         }
         if config.max_upload_mb > 4096 {
             return Err("max_upload_mb must be at most 4096".into());

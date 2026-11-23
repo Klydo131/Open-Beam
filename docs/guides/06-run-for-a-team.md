@@ -69,6 +69,39 @@ or a service wrapper on Windows) to start Open Beam at boot.
 Sign in at your public address and add an account for each person. See
 [Manage accounts](05-manage-accounts.md).
 
+## Keep an eye on it
+
+Administrators get a **System** page: how much memory the query engine
+uses against its limit, temporary spill files, how fast queries are, how
+many timed out or ran out of memory, and the slowest recent ones.
+
+Monitoring tools such as Prometheus and Grafana can read the same figures
+at `/metrics`, signed in as an administrator, for example with a personal
+API token:
+
+```text
+scrape_configs:
+  - job_name: open-beam
+    authorization: { credentials: "obt_your_admin_token" }
+    static_configs: [{ targets: ["127.0.0.1:8787"] }]
+```
+
+To change the limits, see `memory_limit_mb`, `spill_limit_mb` and
+`max_concurrent_queries` in `beam.example.toml`.
+
+On Linux, start the server with `MALLOC_ARENA_MAX=2` set. The system's
+memory allocator otherwise keeps a separate pool for each thread that has
+run a query, and holds on to freed memory there. In a test of 4,000 mixed
+requests over a 2-million-row file, eight at a time, the whole process
+settled near 600 MiB without the setting and stayed between 204 and
+245 MiB with it, at the same speed. The query engine's own memory was back
+to zero after every request either way. For a systemd service:
+
+```text
+[Service]
+Environment=MALLOC_ARENA_MAX=2
+```
+
 ## Back up
 
 Two things are yours to keep safe: `beam.toml` and the accounts file

@@ -20,6 +20,17 @@ accounts = "beam-accounts.sqlite"
 # Longest a single query may run before it is cancelled, in seconds (1-3600).
 # query_timeout_seconds = 30
 
+# Memory the query engine may use, in megabytes. Unset: half this computer's
+# memory. A query needing more spills to temporary files, then stops with a
+# clear message instead of exhausting the computer.
+# memory_limit_mb = 4096
+
+# Most space temporary files may take, in megabytes (default 10240).
+# spill_limit_mb = 10240
+
+# Queries that may run at once; others wait their turn (1-64, default 4).
+# max_concurrent_queries = 4
+
 # Read-only access for PostgreSQL tools such as psql or DBeaver. Off unless
 # set. Sign in with your username and a personal API token from Settings.
 # The connection is not encrypted, so keep it on this computer.

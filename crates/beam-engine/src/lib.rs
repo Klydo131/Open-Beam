@@ -12,6 +12,18 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
+mod runtime;
+use runtime::{parse_size, Gate, Metrics};
+pub use runtime::{Limits, Outcome, SlowQuery, Stats, LATENCY_BUCKETS_MS};
+
+/// Bumped whenever the shape of cached files changes, so old ones are rebuilt.
+const CACHE_VERSION: u32 = 1;
+/// Folder inside the upload directory for column-store copies of datasets.
+const CACHE_DIR: &str = ".cache";
+/// Folder inside the upload directory for temporary files of queries too
+/// large for memory.
+const SPILL_DIR: &str = ".spill";
+
 /// Most columns an uploaded file may have. Wider files are refused: every
 /// check on the review page and every tidying rule scales with the width.
 pub const MAX_UPLOAD_COLUMNS: usize = 1_000;
@@ -51,6 +63,12 @@ pub enum EngineError {
     TimedOut,
     #[error("uploads are not enabled")]
     UploadsDisabled,
+    /// The query needed more memory than the engine is allowed.
+    #[error("the query needed more memory than allowed")]
+    OutOfMemory,
+    /// Every place for a running query stayed taken for the whole time limit.
+    #[error("too many queries are running")]
+    Busy,
     /// The engine's parser refused a statement. The message is safe to show.
     #[error("{0}")]
     Syntax(String),
@@ -153,6 +171,12 @@ pub struct Engine {
     /// Longest a single query may run before it is cancelled, in milliseconds.
     query_timeout_ms: std::sync::atomic::AtomicU64,
     datasets: RwLock<Vec<Dataset>>,
+    /// Column-store copies of file datasets, by dataset name.
+    cache: Mutex<std::collections::HashMap<String, PathBuf>>,
+    gate: Gate,
+    metrics: Metrics,
+    memory_limit_bytes: u64,
+    spill_limit_bytes: u64,
     /// Where files added at run time live. The only directory the sealed
     /// database may read besides the configured files.
     upload_dir: Option<PathBuf>,
@@ -166,6 +190,20 @@ impl Engine {
     /// Like [`Engine::open`], and also allows datasets to be added later from
     /// files placed in `upload_dir`, which is created if needed.
     pub fn open_with_uploads(specs: &[DatasetSpec], upload_dir: Option<&Path>) -> Result<Self, EngineError> {
+        Self::open_with_options(specs, upload_dir, &Limits::default())
+    }
+
+    /// Like [`Engine::open_with_uploads`], within `limits`.
+    ///
+    /// With an upload directory, every file dataset is also kept as a
+    /// column-store copy there, built once: queries then scan compressed
+    /// columns instead of parsing the original file each time. Queries too
+    /// large for memory spill to a capped folder beside it.
+    pub fn open_with_options(
+        specs: &[DatasetSpec],
+        upload_dir: Option<&Path>,
+        limits: &Limits,
+    ) -> Result<Self, EngineError> {
         let upload_dir = match upload_dir {
             Some(dir) => {
                 let unusable = |_| EngineError::UploadDir(dir.to_path_buf());
@@ -175,6 +213,8 @@ impl Engine {
             None => None,
         };
         let conn = Connection::open_in_memory()?;
+        let (memory_limit_bytes, spill_limit_bytes) = apply_limits(&conn, upload_dir.as_deref(), limits)?;
+        let mut cache = std::collections::HashMap::new();
         let mut datasets = Vec::new();
         let mut allowed_paths = Vec::new();
         let mut names = HashSet::new();
@@ -209,6 +249,15 @@ impl Engine {
                 },
                 (_, e) => e,
             })?;
+            if let (Some(dir), Source::File { path, format }) = (upload_dir.as_deref(), &spec.source) {
+                let key = cache_key(path, &format!("{format:?}|{:?}", spec.key));
+                match key.and_then(|key| materialize(&conn, dir, &dataset, key).ok()) {
+                    Some(file) => {
+                        cache.insert(dataset.name.clone(), file);
+                    }
+                    None => eprintln!("beam: dataset '{}' is read from its file directly", dataset.name),
+                }
+            }
             datasets.push(dataset);
         }
 
@@ -242,6 +291,11 @@ impl Engine {
             conn: Mutex::new(conn),
             adding: Mutex::new(()),
             datasets: RwLock::new(datasets),
+            cache: Mutex::new(cache),
+            gate: Gate::new(limits.max_concurrent),
+            metrics: Metrics::new(),
+            memory_limit_bytes,
+            spill_limit_bytes,
             upload_dir,
         })
     }
@@ -312,6 +366,22 @@ impl Engine {
         match created {
             Ok(mut dataset) => {
                 dataset.uploaded = true;
+                // A column-store copy makes later reads fast; without one the
+                // file is still read directly, so a failure here only costs speed.
+                let flags = format!("upload|{format:?}|{cleaning:?}");
+                let dir = self.upload_dir.as_deref();
+                let key = spec_path(&spec).and_then(|path| cache_key(path, &flags));
+                if let (Some(dir), Some(key)) = (dir, key) {
+                    match materialize(&conn, dir, &dataset, key) {
+                        Ok(file) => {
+                            self.cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(dataset.name.clone(), file);
+                        }
+                        Err(e) => eprintln!("beam: dataset '{name}' is read from its file directly: {e}"),
+                    }
+                }
                 self.datasets
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
@@ -458,7 +528,83 @@ impl Engine {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)))?;
         datasets.retain(|d| d.name != name);
+        if let Some(file) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(name) {
+            let _ = std::fs::remove_file(file);
+        }
         Ok(())
+    }
+
+    /// Deletes column-store copies that no dataset uses any more: left by a
+    /// removed dataset, or by a file that has since changed. Call once every
+    /// dataset, uploads included, has been added.
+    pub fn prune_cache(&self) -> usize {
+        let Some(dir) = self.upload_dir.as_ref().map(|d| d.join(CACHE_DIR)) else {
+            return 0;
+        };
+        let keep: HashSet<PathBuf> = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if !keep.contains(&path) && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// How the engine is doing right now. Cheap: counters, the engine's own
+    /// memory report, and the sizes of the cache files.
+    pub fn stats(&self) -> Stats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (memory_used_bytes, spill_used_bytes) = self
+            .conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_clone()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT CAST(coalesce(sum(memory_usage_bytes), 0) AS BIGINT), \
+                     CAST(coalesce(sum(temporary_storage_bytes), 0) AS BIGINT) FROM duckdb_memory()",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .ok()
+            })
+            .map_or((0, 0), |(m, s)| (m.max(0) as u64, s.max(0) as u64));
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache_bytes = cache
+            .values()
+            .filter_map(|file| std::fs::metadata(file).ok())
+            .map(|m| m.len())
+            .sum();
+        let m = &self.metrics;
+        Stats {
+            uptime: m.uptime(),
+            datasets: self.datasets.read().unwrap_or_else(|e| e.into_inner()).len(),
+            cached_datasets: cache.len(),
+            cache_bytes,
+            memory_limit_bytes: self.memory_limit_bytes,
+            memory_used_bytes,
+            spill_used_bytes,
+            spill_limit_bytes: self.spill_limit_bytes,
+            queries_running: self.gate.running(),
+            max_concurrent: self.gate.max(),
+            queries_total: m.total.load(Relaxed),
+            queries_failed: m.failed.load(Relaxed),
+            queries_timed_out: m.timed_out.load(Relaxed),
+            queries_out_of_memory: m.out_of_memory.load(Relaxed),
+            queries_busy: m.busy.load(Relaxed),
+            query_seconds_total: m.micros.load(Relaxed) as f64 / 1e6,
+            latency_buckets: m.buckets.iter().map(|b| b.load(Relaxed)).collect(),
+            slow: m.slow(),
+        }
     }
 
     /// Sets the longest a single query may run before it is cancelled.
@@ -475,17 +621,41 @@ impl Engine {
         // Each query gets its own connection so slow queries do not queue
         // behind the lock; the lock only guards the clone itself.
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        self.within_time_limit(&conn, || Self::run(&conn, sql, params, width))
+        self.within_time_limit(&conn, sql, || Self::run(&conn, sql, params, width))
     }
 
-    /// Runs `work` on `conn`, cancelling it if it outlasts the time limit.
+    /// Runs `work` on `conn` once a place among the running queries is
+    /// free, cancelling it if the wait and the work together outlast the
+    /// time limit. `label` is the statement, for the counters and the
+    /// slow-query log; housekeeping passes an empty label and is not counted.
     fn within_time_limit<T>(
         &self,
         conn: &Connection,
+        label: &str,
         work: impl FnOnce() -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
         let limit = std::time::Duration::from_millis(self.query_timeout_ms.load(std::sync::atomic::Ordering::Relaxed));
-        limited(conn, limit, work)
+        let started = std::time::Instant::now();
+        let record = |outcome: Outcome| {
+            if !label.is_empty() {
+                self.metrics.record(label, started.elapsed(), outcome);
+            }
+        };
+        let Some(_slot) = self.gate.enter(limit) else {
+            record(Outcome::Busy);
+            return Err(EngineError::Busy);
+        };
+        let left = limit
+            .saturating_sub(started.elapsed())
+            .max(std::time::Duration::from_millis(1));
+        let result = limited(conn, left, work);
+        record(match &result {
+            Ok(_) => Outcome::Ok,
+            Err(EngineError::TimedOut) => Outcome::TimedOut,
+            Err(EngineError::OutOfMemory) => Outcome::OutOfMemory,
+            Err(_) => Outcome::Failed,
+        });
+        result
     }
 
     /// Runs a `SELECT` and returns its result as a Parquet file. The file is
@@ -499,7 +669,7 @@ impl Engine {
         let path_text = path.to_str().ok_or(EngineError::UploadsDisabled)?.to_string();
         let table = format!("__export_{n}");
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        let result = self.within_time_limit(&conn, || {
+        let result = self.within_time_limit(&conn, sql, || {
             let bound: Vec<DuckValue> = params.iter().map(to_duck).collect();
             conn.execute(
                 &format!("CREATE TEMP TABLE {} AS {sql}", quote_ident(&table)),
@@ -523,7 +693,7 @@ impl Engine {
     /// parsers to disagree about what a statement means.
     pub fn parse_select(&self, sql: &str) -> Result<Value, EngineError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        let text: String = self.within_time_limit(&conn, || {
+        let text: String = self.within_time_limit(&conn, "", || {
             Ok(conn.query_row("SELECT json_serialize_sql(?::VARCHAR)", [sql], |row| row.get(0))?)
         })?;
         let tree: Value =
@@ -539,7 +709,7 @@ impl Engine {
     pub fn render_select(&self, tree: &Value) -> Result<String, EngineError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
         let json = tree.to_string();
-        self.within_time_limit(&conn, || {
+        self.within_time_limit(&conn, "", || {
             Ok(
                 conn.query_row("SELECT json_deserialize_sql(?::JSON)", [json.as_str()], |row| {
                     row.get::<_, String>(0)
@@ -552,7 +722,7 @@ impl Engine {
     /// running it.
     pub fn describe_select(&self, sql: &str) -> Result<Vec<(String, String)>, EngineError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        self.within_time_limit(&conn, || {
+        self.within_time_limit(&conn, "", || {
             let mut describe = conn.prepare(&format!("DESCRIBE SELECT * FROM ({sql}) AS beam_result"))?;
             let columns = describe
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
@@ -577,7 +747,7 @@ impl Engine {
             .join(", ");
         let wrapped = format!("SELECT {columns} FROM ({sql}) AS beam_result");
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        self.within_time_limit(&conn, || {
+        self.within_time_limit(&conn, sql, || {
             let mut statement = conn.prepare(&wrapped)?;
             let mut rows = statement.query(params_from_iter(params.iter().map(to_duck)))?;
             let mut sent = 0;
@@ -608,6 +778,123 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// Sets the memory limit and where and how much a query too large for
+/// memory may spill; returns the limits in force, in bytes.
+fn apply_limits(conn: &Connection, upload_dir: Option<&Path>, limits: &Limits) -> Result<(u64, u64), EngineError> {
+    // DuckDB's own default is 80% of the computer's memory. A server shares
+    // the machine, so half is the default here, as DuckDB's guide suggests.
+    let current = |conn: &Connection| {
+        conn.query_row("SELECT current_setting('memory_limit')", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|text| parse_size(&text))
+    };
+    let wanted = limits
+        .memory_limit_bytes
+        .or_else(|| current(conn).map(|default| default / 8 * 5))
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+        .max(64 * 1024 * 1024);
+    conn.execute_batch(&format!("SET memory_limit = '{}KiB'", wanted / 1024))?;
+    // Hand freed memory back to the operating system after each task larger
+    // than 16 MB, in the background, rather than keeping up to 128 MB of it.
+    conn.execute_batch("SET allocator_flush_threshold = '16MB'; SET allocator_background_threads = true;")?;
+    let spill = match upload_dir {
+        Some(dir) => {
+            let spill = dir.join(SPILL_DIR);
+            std::fs::create_dir_all(&spill).map_err(|_| EngineError::UploadDir(spill.clone()))?;
+            // Left over from a previous run that stopped mid-query.
+            for entry in std::fs::read_dir(&spill).into_iter().flatten().flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            let text = spill.to_str().ok_or_else(|| EngineError::UploadDir(spill.clone()))?;
+            conn.execute_batch(&format!(
+                "SET temp_directory = {}; SET max_temp_directory_size = '{}KiB';",
+                quote_literal(text),
+                limits.spill_limit_bytes / 1024
+            ))?;
+            limits.spill_limit_bytes
+        }
+        // Nowhere safe to spill: a query too large for memory fails instead.
+        None => {
+            conn.execute_batch("SET temp_directory = '';")?;
+            0
+        }
+    };
+    Ok((current(conn).unwrap_or(wanted), spill))
+}
+
+fn spec_path(spec: &DatasetSpec) -> Option<&Path> {
+    match &spec.source {
+        Source::File { path, .. } => Some(path),
+        Source::Query(_) => None,
+    }
+}
+
+/// Identifies one version of a source file: its path, size and time of
+/// last change, with `extra` for anything else that changes the result. A
+/// changed file gets a new key, so a stale copy is never read.
+fn cache_key(path: &Path, extra: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).ok()?;
+    let changed = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        CACHE_VERSION,
+        path.canonicalize().ok()?,
+        meta.len(),
+        changed.as_nanos(),
+        extra,
+    )
+        .hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Writes a column-store copy of `dataset` (as its view now reads it) into
+/// the cache folder, unless one for this exact source already exists, and
+/// points the view at it. The copy is written under a temporary name and
+/// renamed, so a half-written file is never read.
+fn materialize(conn: &Connection, dir: &Path, dataset: &Dataset, key: u64) -> Result<PathBuf, EngineError> {
+    let folder = dir.join(CACHE_DIR);
+    std::fs::create_dir_all(&folder).map_err(|_| EngineError::UploadDir(folder.clone()))?;
+    let file = folder.join(format!("{}-{key:016x}.parquet", dataset.name.to_ascii_lowercase()));
+    let text = |p: &Path| {
+        p.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| EngineError::UploadDir(p.to_path_buf()))
+    };
+    if !file.exists() {
+        let partial = folder.join(format!(
+            "{}-{key:016x}.{}.partial",
+            dataset.name.to_ascii_lowercase(),
+            std::process::id()
+        ));
+        let order = if dataset.key == ROW_KEY {
+            format!(" ORDER BY {}", quote_ident(ROW_KEY))
+        } else {
+            String::new()
+        };
+        let written = conn.execute_batch(&format!(
+            "COPY (SELECT * FROM {}{order}) TO {} (FORMAT parquet, COMPRESSION zstd)",
+            quote_ident(&dataset.name),
+            quote_literal(&text(&partial)?)
+        ));
+        if let Err(e) = written
+            .map_err(EngineError::from)
+            .and_then(|()| std::fs::rename(&partial, &file).map_err(|_| EngineError::UploadDir(file.clone())))
+        {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+    }
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE VIEW {} AS SELECT * FROM read_parquet({})",
+        quote_ident(&dataset.name),
+        quote_literal(&text(&file)?)
+    ))?;
+    Ok(file)
 }
 
 /// How often a cancellation is repeated once the time limit has passed.
@@ -654,6 +941,9 @@ fn limited<T>(
             if fired.load(std::sync::atomic::Ordering::SeqCst) && e.to_string().starts_with("INTERRUPT Error") =>
         {
             Err(EngineError::TimedOut)
+        }
+        Err(EngineError::Database(e)) if e.to_string().starts_with("Out of Memory Error") => {
+            Err(EngineError::OutOfMemory)
         }
         other => other,
     }
@@ -1415,11 +1705,11 @@ mod tests {
             )
             .unwrap();
         assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
-        assert_eq!(
-            fs::read_dir(&uploads).unwrap().count(),
-            0,
-            "the temporary file is removed"
-        );
+        let exports = fs::read_dir(&uploads)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("export-"))
+            .count();
+        assert_eq!(exports, 0, "the temporary file is removed");
         // Read it back with a separate DuckDB to prove it is what was asked for.
         let copy = dir.path().join("check.parquet");
         fs::write(&copy, &bytes).unwrap();
@@ -1475,5 +1765,94 @@ mod tests {
                 "a small query waited {waited:?} behind a {alone:?} file read"
             );
         }
+    }
+
+    #[test]
+    fn file_datasets_are_kept_as_column_store_copies_with_identical_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = sample(dir.path());
+        let uploads = dir.path().join("uploads");
+        let plain = Engine::open(&[spec("sales", &data, None)]).unwrap();
+        let cached = Engine::open_with_uploads(&[spec("sales", &data, None)], Some(&uploads)).unwrap();
+        let sql = "SELECT * FROM sales ORDER BY _row";
+        let width = plain.dataset("sales").unwrap().columns.len();
+        assert_eq!(
+            plain.query(sql, &[], width).unwrap(),
+            cached.query(sql, &[], width).unwrap()
+        );
+        assert_eq!(
+            plain.dataset("sales"),
+            cached.dataset("sales"),
+            "same columns and types"
+        );
+        assert_eq!(cached.stats().cached_datasets, 1);
+        let view: String = cached
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT sql FROM duckdb_views() WHERE view_name = 'sales'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(view.contains("read_parquet"), "the view reads the copy: {view}");
+
+        // A changed file gets a fresh copy; the stale one is pruned.
+        drop(cached);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut text = fs::read_to_string(&data).unwrap();
+        text.push_str("4,EU,7,1.00,2024-04-01,d,true\n");
+        fs::write(&data, text).unwrap();
+        let again = Engine::open_with_uploads(&[spec("sales", &data, None)], Some(&uploads)).unwrap();
+        assert_eq!(
+            again.query("SELECT count(*) FROM sales", &[], 1).unwrap(),
+            vec![vec![json!(4)]]
+        );
+        assert_eq!(fs::read_dir(uploads.join(".cache")).unwrap().count(), 2, "old and new");
+        assert_eq!(again.prune_cache(), 1);
+        assert_eq!(fs::read_dir(uploads.join(".cache")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn memory_is_capped_and_a_query_past_the_cap_says_so() {
+        let limits = Limits {
+            memory_limit_bytes: Some(64 * 1024 * 1024),
+            ..Limits::default()
+        };
+        // No upload folder: nowhere to spill, so a query past the cap fails.
+        let engine = Engine::open_with_options(&[], None, &limits).unwrap();
+        let stats = engine.stats();
+        assert!(
+            (60 * 1024 * 1024..=68 * 1024 * 1024).contains(&stats.memory_limit_bytes),
+            "{}",
+            stats.memory_limit_bytes
+        );
+        let greedy = engine.query(
+            "SELECT count(DISTINCT s) FROM (SELECT repeat('x', 200) || i AS s FROM range(3000000) t(i))",
+            &[],
+            1,
+        );
+        assert!(matches!(greedy, Err(EngineError::OutOfMemory)), "{greedy:?}");
+        assert_eq!(engine.stats().queries_out_of_memory, 1);
+        // The engine is fine afterwards.
+        assert_eq!(engine.query("SELECT 1", &[], 1).unwrap(), vec![vec![json!(1)]]);
+    }
+
+    #[test]
+    fn queries_wait_their_turn_and_are_turned_away_when_none_comes() {
+        let limits = Limits {
+            max_concurrent: 1,
+            ..Limits::default()
+        };
+        let engine = Engine::open_with_options(&[], None, &limits).unwrap();
+        engine.set_query_timeout(std::time::Duration::from_millis(100));
+        let held = engine.gate.enter(std::time::Duration::ZERO).unwrap();
+        assert!(matches!(engine.query("SELECT 1", &[], 1), Err(EngineError::Busy)));
+        drop(held);
+        assert!(engine.query("SELECT 1", &[], 1).is_ok(), "a freed place is used");
+        let stats = engine.stats();
+        assert_eq!(
+            (stats.queries_busy, stats.queries_total, stats.queries_running),
+            (1, 2, 0)
+        );
     }
 }

@@ -147,6 +147,8 @@ pub fn engine_error(error: EngineError) -> PgError {
     match error {
         EngineError::Syntax(message) => PgError::new("42601", message),
         EngineError::TimedOut => PgError::new("57014", crate::feed::TOO_LONG),
+        EngineError::OutOfMemory => PgError::new("53200", crate::feed::TOO_BIG),
+        EngineError::Busy => PgError::new("53300", crate::feed::BUSY),
         other => {
             let text = other.to_string();
             let first = text.lines().next().unwrap_or_default();

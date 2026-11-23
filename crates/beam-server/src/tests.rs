@@ -993,10 +993,18 @@ async fn upload_draft(site: &Site, cookie: &str, csrf: &str, file_name: &str, by
     }
 }
 
+/// Uploaded files on disk. The engine's own folders (cache and spill)
+/// start with a dot, as no upload can.
 fn upload_files(site: &Site) -> usize {
     std::fs::read_dir(site.state.engine.upload_dir().unwrap())
         .unwrap()
+        .filter(|e| !e.as_ref().unwrap().file_name().to_string_lossy().starts_with('.'))
         .count()
+}
+
+/// Column-store copies the engine keeps of datasets.
+fn cache_files(site: &Site) -> usize {
+    std::fs::read_dir(site.state.engine.upload_dir().unwrap().join(".cache")).map_or(0, |dir| dir.count())
 }
 
 const BUDGET: &[u8] = b"team,amount,due\nOps,1200.5,2025-04-01\nSales,=CMD|' /C calc'!A0,2025-05-01\nOps,300,\n";
@@ -1177,6 +1185,10 @@ async fn uploads_are_private_until_shared() {
     );
 
     // Deleting needs the confirmation, then removes the data and the file.
+    // The upload has a column-store copy; the built-in datasets have none
+    // in this test site, which has no shared upload folder for them.
+    let copies = cache_files(&site);
+    assert!(copies >= 1, "an upload is kept as a column-store copy");
     let unconfirmed = submit(&site, &bob, &bob_csrf, "/datasets/team_budget_2025/delete", &[]).await;
     assert_eq!(unconfirmed.location(), "/datasets/team_budget_2025/share?error=confirm");
     let deleted = submit(
@@ -1193,6 +1205,7 @@ async fn uploads_are_private_until_shared() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(upload_files(&site), 0);
+    assert_eq!(cache_files(&site), copies - 1, "its copy is deleted with it");
     assert!(site.state.accounts.uploads().unwrap().is_empty());
 }
 
@@ -1242,6 +1255,9 @@ async fn uploads_reject_bad_files_and_forged_forms() {
     );
     for entry in std::fs::read_dir(site.state.engine.upload_dir().unwrap()).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
+        if name.starts_with('.') {
+            continue; // the engine's own cache and spill folders
+        }
         assert!(
             name.len() == 36 && name.ends_with(".csv"),
             "server-chosen file name, got {name}"
@@ -2274,13 +2290,7 @@ async fn parquet_downloads_are_real_filtered_and_typed() {
         ],
         "dates stay dates"
     );
-    assert_eq!(
-        std::fs::read_dir(site.state.engine.upload_dir().unwrap())
-            .unwrap()
-            .count(),
-        0,
-        "no export file is left behind"
-    );
+    assert_eq!(upload_files(&site), 0, "no export file is left behind");
 }
 
 #[tokio::test]
@@ -3119,4 +3129,40 @@ async fn datasets_climb_levels_as_people_describe_watch_and_verify_them() {
     // Only the other dataset, `many`, still has a next step.
     assert_eq!(done.matches("Next:").count(), 1, "a trusted dataset has no next step");
     assert!(done.contains("<dt>Trusted</dt><dd>1</dd>"), "the counter bar counts it");
+}
+
+#[tokio::test]
+async fn administrators_see_how_the_server_is_doing_and_others_do_not() {
+    let site = site(false, 100);
+    let (ada, ada_csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let (bob, bob_csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    // Some work for the counters.
+    get(&site, "/datasets/sales", Some(&bob)).await;
+
+    let page = get(&site, "/admin/system", Some(&ada)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("How the server is doing.") && page.body.contains("Query engine"));
+    assert_eq!(
+        get(&site, "/admin/system", Some(&bob)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(get(&site, "/admin/system", None).await.status, StatusCode::SEE_OTHER);
+
+    let ada_token = new_token(&site, &ada, &ada_csrf, "monitoring").await;
+    let bob_token = new_token(&site, &bob, &bob_csrf, "t").await;
+    let metrics = bearer(&site, "/metrics", &ada_token).await;
+    assert_eq!(metrics.status, StatusCode::OK);
+    for line in [
+        "beam_queries_total{outcome=\"ok\"}",
+        "beam_query_duration_seconds_bucket{le=\"+Inf\"}",
+        "beam_engine_memory_limit_bytes",
+        "beam_watches{status=\"alert\"} 0",
+    ] {
+        assert!(metrics.body.contains(line), "{line} in\n{}", metrics.body);
+    }
+    assert_eq!(
+        bearer(&site, "/metrics", &bob_token).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(get(&site, "/metrics", None).await.status, StatusCode::UNAUTHORIZED);
 }

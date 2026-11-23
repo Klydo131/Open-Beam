@@ -377,6 +377,10 @@ fn store_draft(
             eprintln!("upload {file} not readable: {e}");
             let _ = std::fs::remove_file(&path);
             return Err(match e {
+                beam_engine::EngineError::OutOfMemory => {
+                    "Checking that file needs more memory than Open Beam is allowed to use. Try a smaller file, or ask an administrator to raise memory_limit_mb."
+                }
+                beam_engine::EngineError::Busy => "Open Beam is busy with other work. Try again in a moment.",
                 beam_engine::EngineError::TimedOut => {
                     "Checking that file took longer than the time limit. Try a smaller file, or ask an administrator to raise query_timeout_seconds."
                 }

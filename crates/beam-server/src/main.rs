@@ -15,6 +15,7 @@ mod pgsql;
 mod postgres;
 mod review;
 mod stacks;
+mod system;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -54,8 +55,26 @@ enum Command {
     CreateAdmin { username: String },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Threads that run blocking work (queries, password checks) at once. Each
+/// can hold its own memory pool, so a fixed number keeps memory bounded under
+/// load; the engine's own gate already limits how many queries run.
+const BLOCKING_THREADS: usize = 32;
+
+fn main() -> ExitCode {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(BLOCKING_THREADS)
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(run()),
+        Err(e) => {
+            eprintln!("beam: cannot start: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match load_config(cli.config.as_deref()) {
         Err(message) => Err(message),
@@ -144,10 +163,12 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let account_count = accounts.count().map_err(|e| e.to_string())?;
     config::check_exposure(&config, account_count)?;
     let upload_dir = (config.max_upload_mb > 0).then_some(config.uploads.as_path());
-    let engine =
-        beam_engine::Engine::open_with_uploads(&config.dataset_specs(), upload_dir).map_err(|e| e.to_string())?;
+    let engine = beam_engine::Engine::open_with_options(&config.dataset_specs(), upload_dir, &config.limits())
+        .map_err(|e| e.to_string())?;
     engine.set_query_timeout(std::time::Duration::from_secs(config.query_timeout_seconds));
     restore_uploads(&engine, &accounts);
+    // Copies left by datasets that no longer exist, or whose files changed.
+    engine.prune_cache();
     review::remove_expired_drafts(&engine, &accounts, review::DRAFT_DAYS);
 
     let postgres = match config.postgres_bind {
