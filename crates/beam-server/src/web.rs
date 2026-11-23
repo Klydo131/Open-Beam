@@ -181,6 +181,7 @@ fn account_error_code(error: &AccountError) -> &'static str {
     match error {
         AccountError::InvalidUsername => "username",
         AccountError::InvalidPassword => "password",
+        AccountError::WeakPassword => "weak",
         AccountError::UsernameTaken => "taken",
         AccountError::LastAdministrator => "last-admin",
         AccountError::NotFound => "not-found",
@@ -211,6 +212,7 @@ pub fn notice(query: &HashMap<String, String>) -> Markup {
     let error = match query.get("error").map(String::as_str) {
         Some("username") => Some(AccountError::InvalidUsername.to_string()),
         Some("password") => Some(AccountError::InvalidPassword.to_string()),
+        Some("weak") => Some(AccountError::WeakPassword.to_string()),
         Some("taken") => Some(AccountError::UsernameTaken.to_string()),
         Some("last-admin") => Some(AccountError::LastAdministrator.to_string()),
         Some("not-found") => Some(AccountError::NotFound.to_string()),
@@ -359,8 +361,13 @@ pub async fn login_form(State(state): App, headers: HeaderMap) -> Response {
     }
 }
 
-pub async fn login(State(state): App, Form(form): Form<LoginForm>) -> Response {
-    match auth::check_password(&state, &form.username, &form.password).await {
+pub async fn login(
+    State(state): App,
+    peer: Option<axum::extract::Extension<crate::net::Peer>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let from = peer.map(|p| p.0 .0);
+    match auth::check_password(&state, &form.username, &form.password, from).await {
         Ok(Some(account)) => start_session(&state, &account, "/"),
         // One message for every failure, so the page does not reveal which usernames exist.
         Ok(None) => login_page(
@@ -737,7 +744,7 @@ pub async fn change_password(State(state): App, headers: HeaderMap, Form(form): 
         return redirect("/account?error=mismatch");
     }
     let me = signed.session.account.clone();
-    match auth::check_password(&state, &me.username, &form.current).await {
+    match auth::check_password(&state, &me.username, &form.current, None).await {
         Ok(Some(_)) => {}
         _ => return redirect("/account?error=current"),
     }

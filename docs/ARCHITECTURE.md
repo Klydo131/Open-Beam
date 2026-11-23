@@ -135,11 +135,14 @@ everything arriving over the network is not.
 | Reading files that were not shared | After start-up DuckDB's file access is restricted to the configured dataset files, external access is disabled and the configuration is locked. |
 | Modifying or deleting data | The database is in-memory, datasets are views, and only `SELECT` statements are issued. |
 | Unintended network exposure | The default bind address is loopback. Open Beam refuses to listen elsewhere, or behind a public address, until an administrator exists. |
-| Password guessing | Argon2id hashing; five failures lock a username for five minutes; one message for every failed sign-in. |
+| Password guessing | Argon2id hashing; five failures lock a username and 30 lock an address for five minutes, so one password cannot be sprayed across every username; common and keyboard-run passwords are refused when set; one message for every failed sign-in. |
 | Stolen account file | It contains password hashes and session digests, not passwords or tokens. |
 | Forged requests from other sites | Session cookies are `SameSite=Strict` and `HttpOnly`; every form carries a per-session token; posts that the browser labels as cross-site are refused. |
 | Script injection through data | Pages escape all values, contain no scripts, and are served with a content policy that allows none. |
-| Clickjacking | Pages may not be framed. |
+| Clickjacking and cross-site leaks | Pages may not be framed; requests another site makes the browser send (scripts, images, frames, background fetches) are refused by their `Sec-Fetch-*` labels, links still work; `Cross-Origin-Opener-Policy` and `Cross-Origin-Resource-Policy` are `same-origin`. |
+| Slow and flooding clients | Headers must arrive within 10 s, idle connections close after 10 s, requests end after 10 min; at most 1,024 connections, 64 per address. |
+| Crawlers and AI bots | `robots.txt` disallows everything and `X-Robots-Tag` asks for no indexing or AI use; the sign-in stands behind both. |
+| Vulnerable dependencies | RustSec audit on every dependency change and weekly; weekly update proposals. |
 | Privilege escalation | Role checks run on every administrative request; the last active administrator cannot be demoted or disabled. |
 | Stale access | Disabling an account or changing its password ends its sessions and its feed access at once. |
 | Resource exhaustion | Filters are bounded in size and depth; responses are bounded by a page size; every query has a time limit; passwords are bounded in length before hashing; sign-in checks are bounded in number and in queue length. |

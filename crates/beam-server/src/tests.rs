@@ -1791,7 +1791,7 @@ async fn abandoned_sign_ins_do_not_lock_an_account_for_good() {
     // client that disconnects does.
     for n in 0..5 {
         let password = format!("abandoned {n}");
-        let attempt = crate::auth::check_password(&site.state, "bob", &password);
+        let attempt = crate::auth::check_password(&site.state, "bob", &password, None);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(1), attempt).await;
     }
     assert_eq!(
@@ -1880,7 +1880,7 @@ async fn a_flood_of_sign_ins_is_turned_away_instead_of_queued() {
             } else {
                 ("bob".to_string(), USER_PASSWORD)
             };
-            crate::auth::check_password(&state, &name, password).await
+            crate::auth::check_password(&state, &name, password, None).await
         }
     });
     let outcomes = futures_join(attempts).await;
@@ -3165,4 +3165,248 @@ async fn administrators_see_how_the_server_is_doing_and_others_do_not() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(get(&site, "/metrics", None).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn every_response_carries_the_hardening_headers_and_crawlers_are_turned_away() {
+    let site = site(false, 50);
+    let page = get(&site, "/login", None).await;
+    for (name, value) in [
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("x-permitted-cross-domain-policies", "none"),
+    ] {
+        assert_eq!(page.headers.get(name).unwrap(), value, "{name}");
+    }
+    assert!(page
+        .headers
+        .get("permissions-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("camera=()"));
+    assert!(page
+        .headers
+        .get("x-robots-tag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("noindex"));
+    // Plain HTTP on this machine: no HSTS, which would break the next visit.
+    assert!(page.headers.get("strict-transport-security").is_none());
+
+    let robots = get(&site, "/robots.txt", None).await;
+    assert_eq!(robots.status, StatusCode::OK);
+    assert_eq!(robots.body, "User-agent: *\nDisallow: /\n");
+
+    let report = get(&site, "/.well-known/security.txt", None).await;
+    assert_eq!(report.status, StatusCode::OK);
+    assert!(report.body.starts_with("Contact: https://"), "{}", report.body);
+    let expires = report.body.lines().find_map(|l| l.strip_prefix("Expires: ")).unwrap();
+    assert!(expires.ends_with('Z') && expires.as_bytes()[4] == b'-', "{expires}");
+}
+
+#[tokio::test]
+async fn sites_published_over_https_are_pinned_to_https() {
+    let plain = site(false, 50);
+    let state = AppState::new(
+        Engine::open_with_uploads(&[], None).unwrap(),
+        Store::open_in_memory().unwrap(),
+        50,
+        Some("https://beam.example.org".into()),
+        "127.0.0.1:8787".into(),
+    );
+    let secure = Site {
+        app: router(Arc::new(state)),
+        state: plain.state.clone(),
+        _dir: tempfile::tempdir().unwrap(),
+    };
+    let page = get(&secure, "/login", None).await;
+    assert_eq!(
+        page.headers.get("strict-transport-security").unwrap(),
+        "max-age=31536000"
+    );
+    let policy = page.headers.get("content-security-policy").unwrap().to_str().unwrap();
+    assert!(policy.contains("upgrade-insecure-requests"), "{policy}");
+}
+
+/// Sends a GET labelled the way a browser labels it.
+async fn labelled(site: &Site, uri: &str, labels: &[(&str, &str)], cookie: Option<&str>) -> Reply {
+    let mut request = Request::builder().uri(uri).header(HOST, "beam.test:9000");
+    for (name, value) in labels {
+        request = request.header(*name, *value);
+    }
+    if let Some(cookie) = cookie {
+        request = request.header(COOKIE, cookie);
+    }
+    let response = site
+        .app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    Reply {
+        status: parts.status,
+        headers: parts.headers,
+        body: String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn other_websites_can_link_to_pages_but_cannot_load_or_frame_them() {
+    let site = site(false, 50);
+    let (cookie, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let link = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+    assert_eq!(
+        labelled(&site, "/datasets/sales", &link, Some(&cookie)).await.status,
+        StatusCode::OK
+    );
+    for (mode, dest) in [
+        ("no-cors", "script"),
+        ("no-cors", "image"),
+        ("cors", "empty"),
+        ("navigate", "iframe"),
+    ] {
+        let attempt = [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", mode),
+            ("sec-fetch-dest", dest),
+        ];
+        let reply = labelled(&site, "/api/v1/datasets", &attempt, Some(&cookie)).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{mode} {dest}");
+        assert!(!reply.body.contains("sales"), "nothing about the data leaks");
+    }
+    // Our own pages, typed addresses and clients that are not browsers.
+    for labels in [
+        &[("sec-fetch-site", "same-origin")][..],
+        &[("sec-fetch-site", "none")][..],
+        &[][..],
+    ] {
+        assert_eq!(
+            labelled(&site, "/datasets/sales", labels, Some(&cookie)).await.status,
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_address_spraying_passwords_across_usernames_is_stopped() {
+    let site = site(false, 50);
+    let bot: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    let mut refused_at = None;
+    for n in 0..=crate::auth::MAX_ADDRESS_FAILURES {
+        // A different username each time, so no single username locks.
+        let name = format!("user{n}");
+        match crate::auth::check_password(&site.state, &name, "Summer2026!", Some(bot)).await {
+            Ok(None) => {}
+            Err(crate::auth::Refused::Locked) => {
+                refused_at = Some(n);
+                break;
+            }
+            other => panic!("unexpected {:?}", other.map(|a| a.map(|a| a.username))),
+        }
+    }
+    assert_eq!(refused_at, Some(crate::auth::MAX_ADDRESS_FAILURES));
+    // Even the right password is refused from that address for now...
+    assert!(matches!(
+        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(bot)).await,
+        Err(crate::auth::Refused::Locked)
+    ));
+    // ...the refusal did not count against bob himself...
+    assert!(crate::auth::check_password(&site.state, "bob", USER_PASSWORD, None)
+        .await
+        .unwrap()
+        .is_some());
+    // ...and everyone else, and this machine, still sign in.
+    let elsewhere: std::net::IpAddr = "198.51.100.4".parse().unwrap();
+    assert!(
+        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(elsewhere))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    assert!(
+        crate::auth::check_password(&site.state, "ada", ADMIN_PASSWORD, Some(local))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    site.state.guard.age_attempts(crate::auth::FAILURE_WINDOW);
+    assert!(
+        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(bot))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn common_passwords_are_refused_when_accounts_are_made() {
+    let site = site(false, 50);
+    let (cookie, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let reply = post(
+        &site,
+        "/admin/accounts",
+        Some(&cookie),
+        &[
+            ("csrf", &csrf),
+            ("username", "carol"),
+            ("password", "Password123!"),
+            ("role", "user"),
+        ],
+    )
+    .await;
+    assert!(reply.location().contains("error=weak"), "{}", reply.location());
+    let page = get(&site, reply.location(), Some(&cookie)).await;
+    assert!(page.body.contains("too easy to guess"), "{}", page.body);
+    assert!(site
+        .state
+        .accounts
+        .list()
+        .unwrap()
+        .iter()
+        .all(|a| a.username != "carol"));
+}
+
+#[tokio::test]
+async fn a_client_that_never_finishes_its_headers_is_disconnected() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let site = site(false, 50);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let connections = site.state.connections.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(crate::net::serve(
+        listener,
+        site.app.clone(),
+        connections.clone(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+    slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    let started = std::time::Instant::now();
+    let mut buffer = Vec::new();
+    let closed = tokio::time::timeout(crate::net::HEADER_TIME * 2, slow.read_to_end(&mut buffer)).await;
+    assert!(closed.is_ok(), "still open after {:?}", started.elapsed());
+    assert!(started.elapsed() >= crate::net::HEADER_TIME - std::time::Duration::from_secs(1));
+    // A normal request on a new connection is answered.
+    let mut normal = tokio::net::TcpStream::connect(address).await.unwrap();
+    normal
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = String::new();
+    normal.read_to_string(&mut answer).await.unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200") && answer.ends_with("ok"), "{answer}");
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    assert_eq!(connections.count(), 0, "every place was given back");
 }

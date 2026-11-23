@@ -20,7 +20,40 @@ service is read-only, listens only on your own machine by default, requires
 sign-in, reads only the files you configure, and treats every network request
 as untrusted.
 
+Against attacks that need no account:
+
+- **Slow and flooding clients.** A client must send a request's headers
+  within 10 seconds, an idle connection is closed after 10 seconds, and a
+  request must be answered within 10 minutes. At most 1,024 connections are
+  open at once and 64 from any one address; more are closed at once.
+- **Password guessing.** Five failures lock a username for five minutes;
+  30 failures from one address, across any usernames, lock that address,
+  so one common password cannot be tried against every account. New
+  passwords that guessing tools try first (common passwords with digits
+  added, keyboard runs, one repeated character) are refused.
+- **Other websites.** A page on another site cannot post forms here, load
+  our data as a script or image, frame our pages, or time our answers to
+  learn about a visitor: browsers label such requests and they are refused.
+  Following a link from another site still works. Pages share no window
+  with other sites (`Cross-Origin-Opener-Policy`), nothing here may be
+  embedded elsewhere (`Cross-Origin-Resource-Policy`), and no page may ask
+  for the camera, microphone, location or other devices.
+- **Crawlers and AI bots.** `robots.txt` and an `X-Robots-Tag` header ask
+  every crawler, search engine and AI training bot to keep nothing; those
+  that ignore the request still meet the sign-in.
+- **HTTPS.** When `public_url` is an `https://` address, browsers are told
+  to use only HTTPS for a year (HSTS) and to upgrade any plain link.
+- **Dependencies.** Every dependency is checked against the RustSec
+  advisory database on each change and weekly, and updates are proposed
+  weekly. Reports can also be sent as described in
+  `/.well-known/security.txt` (RFC 9116).
+
 ## Known limits
+
+- **Behind a reverse proxy, limits per address see the proxy.** Every
+  visitor then arrives from the proxy's address, so the per-address
+  connection and sign-in limits do not apply to it (the per-username and
+  overall limits still do). Rate-limit by visitor address in the proxy.
 
 - **No built-in TLS yet.** To serve Open Beam beyond your own machine, place it
   behind an HTTPS reverse proxy and set `public_url` to the HTTPS address, so
@@ -36,8 +69,9 @@ as untrusted.
   have the same name, so when a name is refused as "already in use", that
   tells you some dataset by that name exists, even one you cannot see. Avoid
   putting sensitive words in dataset names.
-- **Sign-in attempts are limited per username and in total.** Five failures
-  lock a username for five minutes, attempts in flight count towards that,
+- **Sign-in attempts are limited per username, per address and in total.**
+  Five failures lock a username for five minutes, 30 lock an address,
+  attempts in flight count towards that,
   an attempt abandoned part-way counts as a failure, at most four password
   checks run at once, and when 32 more are already waiting the server answers
   that it is busy instead of queueing.

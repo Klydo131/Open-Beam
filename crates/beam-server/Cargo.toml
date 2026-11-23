@@ -30,10 +30,12 @@ zip = { version = "9", default-features = false }
 getrandom = "0.4"
 rust_xlsxwriter = { version = "0.102", default-features = false }
 sha2 = "0.11"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-graceful"] }
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 duckdb.workspace = true
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 tokio-postgres = "0.7"

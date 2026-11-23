@@ -16,6 +16,12 @@ use std::time::{Duration, Instant};
 
 pub const SESSION_COOKIE: &str = "beam_session";
 const MAX_FAILURES: u32 = 5;
+/// Failed sign-ins allowed from one network address per window, across
+/// every username. Stops a bot from trying one common password against many
+/// usernames, which the per-username limit alone would let through.
+/// Addresses on this machine are exempt: behind a reverse proxy every
+/// visitor arrives from it, and one person's typos must not lock everyone out.
+pub const MAX_ADDRESS_FAILURES: u32 = 30;
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const FEED_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_TRACKED: usize = 10_000;
@@ -74,11 +80,15 @@ pub(crate) struct Reservation<'a> {
     guard: &'a Guard,
     key: String,
     succeeded: Option<bool>,
+    /// Given back without counting, because the attempt was refused before
+    /// any password was checked.
+    cancelled: bool,
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.guard.finish(&self.key, self.succeeded.unwrap_or(false));
+        let outcome = (!self.cancelled).then(|| self.succeeded.unwrap_or(false));
+        self.guard.finish(&self.key, outcome);
     }
 }
 
@@ -107,9 +117,14 @@ impl Guard {
         username.trim().to_ascii_lowercase().chars().take(64).collect()
     }
 
-    /// Reserves a sign-in attempt, or refuses when the username has used up
-    /// its attempts. Reserving and checking happen under one lock.
-    fn begin(&self, username: &str) -> Option<Reservation<'_>> {
+    fn address_key(from: std::net::IpAddr) -> String {
+        // A NUL cannot appear in a username, so the two kinds never collide.
+        format!("\0{from}")
+    }
+
+    /// Reserves a sign-in attempt for `key`, or refuses when it has used up
+    /// `limit` attempts. Reserving and checking happen under one lock.
+    fn begin(&self, key: String, limit: u32) -> Option<Reservation<'_>> {
         let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         if attempts.len() >= MAX_TRACKED {
             attempts.retain(|_, a| a.pending > 0 || a.since.elapsed() < FAILURE_WINDOW);
@@ -117,7 +132,7 @@ impl Guard {
         if attempts.len() >= MAX_TRACKED {
             attempts.retain(|_, a| a.pending > 0);
         }
-        let entry = attempts.entry(Self::key(username)).or_insert(Attempts {
+        let entry = attempts.entry(key.clone()).or_insert(Attempts {
             failed: 0,
             pending: 0,
             since: Instant::now(),
@@ -128,25 +143,27 @@ impl Guard {
             entry.failed = 0;
             entry.since = Instant::now();
         }
-        if entry.failed + entry.pending >= MAX_FAILURES {
+        if entry.failed + entry.pending >= limit {
             return None;
         }
         entry.pending += 1;
         Some(Reservation {
             guard: self,
-            key: Self::key(username),
+            key,
             succeeded: None,
+            cancelled: false,
         })
     }
 
-    fn finish(&self, key: &str, succeeded: bool) {
+    /// Ends an attempt; `None` gives the place back without counting it.
+    fn finish(&self, key: &str, succeeded: Option<bool>) {
         let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = attempts.get_mut(key) {
             entry.pending = entry.pending.saturating_sub(1);
-            if succeeded {
-                entry.failed = 0;
-            } else {
-                entry.failed += 1;
+            match succeeded {
+                Some(true) => entry.failed = 0,
+                Some(false) => entry.failed += 1,
+                None => {}
             }
         }
     }
@@ -155,7 +172,7 @@ impl Guard {
     /// and holds it until dropped.
     #[cfg(test)]
     pub(crate) fn hold_attempt(&self, username: &str) -> Option<Reservation<'_>> {
-        self.begin(username)
+        self.begin(Self::key(username), MAX_FAILURES)
     }
 
     /// Attempts for `username` still marked as in flight.
@@ -218,8 +235,14 @@ pub fn expired_cookie() -> HeaderValue {
 }
 
 /// Checks a username and password off the async runtime, applying the
-/// failed-attempt limit and the bound on waiting attempts.
-pub async fn check_password(state: &Arc<AppState>, username: &str, password: &str) -> Result<Option<Account>, Refused> {
+/// failed-attempt limits (per username, and per address when `from` is
+/// known) and the bound on waiting attempts.
+pub async fn check_password(
+    state: &Arc<AppState>,
+    username: &str,
+    password: &str,
+    from: Option<std::net::IpAddr>,
+) -> Result<Option<Account>, Refused> {
     use std::sync::atomic::Ordering;
     // Counted before anything else, and undone when this attempt ends or
     // is abandoned.
@@ -227,7 +250,20 @@ pub async fn check_password(state: &Arc<AppState>, username: &str, password: &st
     if state.guard.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING_CHECKS {
         return Err(Refused::Busy);
     }
-    let mut reservation = state.guard.begin(username).ok_or(Refused::Locked)?;
+    let mut reservation = state
+        .guard
+        .begin(Guard::key(username), MAX_FAILURES)
+        .ok_or(Refused::Locked)?;
+    let mut by_address = match from.filter(|ip| !ip.is_loopback()) {
+        Some(ip) => match state.guard.begin(Guard::address_key(ip), MAX_ADDRESS_FAILURES) {
+            Some(place) => Some(place),
+            None => {
+                reservation.cancelled = true;
+                return Err(Refused::Locked);
+            }
+        },
+        None => None,
+    };
     let verified = match state.guard.checks.acquire().await {
         Ok(_permit) => {
             drop(waiting);
@@ -241,6 +277,15 @@ pub async fn check_password(state: &Arc<AppState>, username: &str, password: &st
         _ => None,
     };
     reservation.succeeded = Some(account.is_some());
+    if let Some(place) = by_address.as_mut() {
+        // One person signing in correctly does not clear the failures
+        // others made from the same address.
+        if account.is_some() {
+            place.cancelled = true;
+        } else {
+            place.succeeded = Some(false);
+        }
+    }
     Ok(account)
 }
 
@@ -264,7 +309,8 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 /// Admits a feed request that carries either a browser session or HTTP Basic
 /// credentials for an active account.
 pub async fn feed_guard(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
-    let mut response = match admit(&state, request.headers()).await {
+    let from = request.extensions().get::<crate::net::Peer>().map(|p| p.0);
+    let mut response = match admit(&state, request.headers(), from).await {
         Ok(Some(account)) => {
             request.extensions_mut().insert(Viewer(account));
             next.run(request).await
@@ -291,7 +337,11 @@ pub async fn feed_guard(State(state): State<Arc<AppState>>, mut request: Request
 #[derive(Clone)]
 pub struct Viewer(pub Account);
 
-async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Option<Account>, Refused> {
+async fn admit(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    from: Option<std::net::IpAddr>,
+) -> Result<Option<Account>, Refused> {
     if let Some(signed) = signed_in(state, headers) {
         return Ok(Some(signed.session.account));
     }
@@ -317,7 +367,7 @@ async fn admit(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Option<Acco
             return Ok(state.accounts.get(*id).ok().filter(|account| account.active));
         }
     }
-    let Some(account) = check_password(state, &username, &password).await? else {
+    let Some(account) = check_password(state, &username, &password, from).await? else {
         return Ok(None);
     };
     let mut verified = state.guard.verified.lock().unwrap_or_else(|e| e.into_inner());

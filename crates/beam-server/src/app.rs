@@ -3,12 +3,14 @@
 use crate::{api, auth, chart, curate, export, feed, mcp, people, review, system, table, uploads, web};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
+use axum::extract::State;
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY,
+    X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
-use axum::http::HeaderValue;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use beam_accounts::Store;
@@ -24,6 +26,8 @@ pub struct AppState {
     pub fallback_host: String,
     pub accounts: Store,
     pub guard: auth::Guard,
+    /// Open connections, for the limits in [`crate::net`].
+    pub connections: Arc<crate::net::Connections>,
     /// Review-page previews, worked out once per draft and kept while the
     /// draft waits. Bounded; anything evicted is simply worked out again.
     previews: std::sync::Mutex<std::collections::HashMap<String, Arc<beam_engine::Preview>>>,
@@ -45,6 +49,7 @@ impl AppState {
             fallback_host,
             accounts,
             guard: auth::Guard::default(),
+            connections: Arc::default(),
             previews: std::sync::Mutex::default(),
         }
     }
@@ -153,15 +158,47 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/static/app.css", get(web::stylesheet))
         .route("/static/logo.svg", get(web::logo))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/robots.txt", get(robots))
+        .route("/.well-known/security.txt", get(security_txt))
         .fallback(web::not_found)
-        .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(crate::net::request_time_limit))
+        .layer(middleware::from_fn_with_state(state.clone(), security_headers))
         .with_state(state)
+}
+
+/// True for a request another website made the browser send, other than
+/// following a link to one of our pages. Such requests are refused before
+/// they reach a handler: a hostile page cannot load our data as a script
+/// or image, frame it, or time how long our answers take to learn about a
+/// visitor (cross-site leaks). Browsers label every request with
+/// `Sec-Fetch-Site`; clients that are not browsers (Excel, Power BI,
+/// scripts) send no label and are unaffected.
+pub fn cross_site_fetch(method: &Method, headers: &HeaderMap) -> bool {
+    let label = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
+    match label("sec-fetch-site") {
+        "" | "same-origin" | "same-site" | "none" => false,
+        _ => {
+            let link = (method == Method::GET || method == Method::HEAD)
+                && label("sec-fetch-mode") == "navigate"
+                && matches!(label("sec-fetch-dest"), "" | "document");
+            !link
+        }
+    }
 }
 
 /// Headers every response carries. Pages load nothing from other origins and
 /// run no scripts, and the policy says so.
-async fn security_headers(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
+async fn security_headers(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let mut response = if cross_site_fetch(request.method(), request.headers()) {
+        (
+            StatusCode::FORBIDDEN,
+            "Requests from other websites are not accepted.\n",
+        )
+            .into_response()
+    } else {
+        next.run(request).await
+    };
+    let secure = state.secure_cookies();
     let headers = response.headers_mut();
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
@@ -172,13 +209,67 @@ async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
+        HeaderValue::from_static(if secure {
             "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; \
-             frame-ancestors 'none'; base-uri 'none'",
+             frame-ancestors 'none'; base-uri 'none'; upgrade-insecure-requests"
+        } else {
+            "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; \
+             frame-ancestors 'none'; base-uri 'none'"
+        }),
+    );
+    // Our pages share no window with other sites, and other sites may not
+    // embed anything we serve.
+    headers.insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
+    headers.insert("cross-origin-resource-policy", HeaderValue::from_static("same-origin"));
+    headers.insert("x-permitted-cross-domain-policies", HeaderValue::from_static("none"));
+    // No page here needs a camera, a microphone, the visitor's location or
+    // any other device, so none may ask.
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static(
+            "accelerometer=(), bluetooth=(), browsing-topics=(), camera=(), display-capture=(), \
+             geolocation=(), gyroscope=(), hid=(), magnetometer=(), microphone=(), midi=(), \
+             payment=(), serial=(), usb=()",
         ),
     );
+    // Private data: search engines and AI crawlers that honour these labels
+    // keep nothing. Those that do not still meet the sign-in.
+    headers.insert(
+        "x-robots-tag",
+        HeaderValue::from_static("noindex, nofollow, noarchive, nosnippet, noimageindex, noai, noimageai"),
+    );
+    if secure {
+        // Browsers then refuse plain HTTP to this site for a year, so a
+        // network attacker cannot downgrade a visit to read the session.
+        headers.insert(STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
+    }
     headers
         .entry(CACHE_CONTROL)
         .or_insert(HeaderValue::from_static("no-store"));
     response
+}
+
+/// Every crawler, search engine and AI training bot is asked to stay out.
+async fn robots() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "User-agent: *\nDisallow: /\n",
+    )
+}
+
+/// Where to report a security problem (RFC 9116). The expiry moves with the
+/// server's clock, so the file never goes stale.
+async fn security_txt() -> impl IntoResponse {
+    let expires = std::time::SystemTime::now() + std::time::Duration::from_secs(180 * 24 * 3600);
+    let seconds = expires.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    (
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(
+            "Contact: https://github.com/Klydo131/Open-Beam/security/advisories/new\n\
+             Expires: {}\n\
+             Policy: https://github.com/Klydo131/Open-Beam/blob/main/SECURITY.md\n\
+             Preferred-Languages: en\n",
+            crate::net::rfc3339(seconds)
+        ),
+    )
 }

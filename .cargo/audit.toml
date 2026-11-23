@@ -1,0 +1,8 @@
+# Advisories accepted after review. Each needs a reason and is revisited
+# whenever the audit runs; remove an entry as soon as a fix exists.
+[advisories]
+ignore = [
+    # chrono is unmaintained (not a vulnerability; no fixed version). It is
+    # used by DuckDB's Arrow interface for date conversion, not by our code.
+    "RUSTSEC-2026-0543",
+]

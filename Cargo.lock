@@ -438,6 +438,8 @@ dependencies = [
  "form_urlencoded",
  "getrandom 0.4.3",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "maud",
  "rust_xlsxwriter",
  "serde",

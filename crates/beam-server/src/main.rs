@@ -10,6 +10,7 @@ mod curate;
 mod export;
 mod feed;
 mod mcp;
+mod net;
 mod people;
 mod pgsql;
 mod postgres;
@@ -234,10 +235,10 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     if let Some(postgres) = postgres {
         tokio::spawn(postgres::serve(postgres, state.clone()));
     }
-    axum::serve(listener, app::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .map_err(|e| e.to_string())
+    let connections = state.connections.clone();
+    net::serve(listener, app::router(state), connections, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+    .map_err(|e| e.to_string())
 }

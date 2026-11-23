@@ -24,6 +24,8 @@ pub enum AccountError {
     InvalidUsername,
     #[error("Passwords must be between {MIN_PASSWORD_CHARS} characters and {MAX_PASSWORD_BYTES} bytes long.")]
     InvalidPassword,
+    #[error("That password is too easy to guess: it is a common password, a keyboard or number run, or mostly one character. Try a few unrelated words.")]
+    WeakPassword,
     #[error("That username is already in use.")]
     UsernameTaken,
     #[error("There must always be at least one active administrator.")]
@@ -944,11 +946,115 @@ fn normalise_username(username: &str) -> Result<String, AccountError> {
 }
 
 fn check_password(password: &str) -> Result<(), AccountError> {
-    if password.chars().count() >= MIN_PASSWORD_CHARS && password.len() <= MAX_PASSWORD_BYTES {
-        Ok(())
-    } else {
-        Err(AccountError::InvalidPassword)
+    if password.chars().count() < MIN_PASSWORD_CHARS || password.len() > MAX_PASSWORD_BYTES {
+        return Err(AccountError::InvalidPassword);
     }
+    if easy_to_guess(password) {
+        return Err(AccountError::WeakPassword);
+    }
+    Ok(())
+}
+
+/// Words and runs at the top of every leaked-password list. Guessing tools
+/// try these first, with digits and symbols added at the end.
+const COMMON: &[&str] = &[
+    "password",
+    "passw0rd",
+    "p@ssw0rd",
+    "p@ssword",
+    "qwerty",
+    "qwertyuiop",
+    "asdfghjkl",
+    "zxcvbnm",
+    "1q2w3e4r",
+    "1q2w3e4r5t",
+    "q1w2e3r4",
+    "zaq12wsx",
+    "abc123",
+    "letmein",
+    "welcome",
+    "admin",
+    "administrator",
+    "iloveyou",
+    "football",
+    "baseball",
+    "basketball",
+    "dragon",
+    "monkey",
+    "sunshine",
+    "princess",
+    "master",
+    "shadow",
+    "superman",
+    "batman",
+    "trustno1",
+    "changeme",
+    "default",
+    "secret",
+    "login",
+    "starwars",
+    "whatever",
+    "freedom",
+    "michael",
+    "jennifer",
+    "computer",
+    "internet",
+    "openbeam",
+    "open beam",
+    "beam",
+    "excel",
+    "powerbi",
+    "database",
+    "analytics",
+    "summer",
+    "winter",
+    "spring",
+    "autumn",
+    "christmas",
+    "hello",
+    "hellothere",
+    "loveyou",
+    "mypassword",
+    "yourpassword",
+    "newpassword",
+    "temppassword",
+    "useruser",
+    "testtest",
+    "test",
+    "guest",
+    "root",
+    "toor",
+    "user",
+];
+
+/// Letters and digits in the orders people type them without thinking.
+const RUNS: &[&str] = &[
+    "0123456789012345678901234567890",
+    "9876543210987654321098765432109",
+    "abcdefghijklmnopqrstuvwxyz",
+    "zyxwvutsrqponmlkjihgfedcba",
+    "qwertyuiopasdfghjklzxcvbnm",
+    "mnbvcxzlkjhgfdsapoiuytrewq",
+    "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik9ol0p",
+];
+
+/// True for a password that guessing tools find in their first few million
+/// tries, however long it is: a common password with digits or symbols
+/// around it, a run along the keyboard or the alphabet, or one that is
+/// mostly a single character.
+fn easy_to_guess(password: &str) -> bool {
+    let lower = password.to_lowercase();
+    let mut distinct: Vec<char> = lower.chars().collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() < 4 {
+        return true;
+    }
+    if RUNS.iter().any(|run| run.contains(lower.as_str())) {
+        return true;
+    }
+    let core = lower.trim_matches(|c: char| !c.is_alphabetic());
+    COMMON.contains(&core)
 }
 
 fn hash_password(password: &str) -> Result<String, AccountError> {
@@ -1277,6 +1383,37 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guessable_passwords_are_refused_and_ordinary_phrases_are_not() {
+        for weak in [
+            "Password123!",
+            "password2026",
+            "1234567890",
+            "0987654321",
+            "qwertyuiop",
+            "Summer2026!",
+            "aaaaaaaaaaaa",
+            "abababababab",
+            "!!admin2024!!",
+            "abcdefghijk",
+        ] {
+            assert!(super::easy_to_guess(weak), "{weak} should be refused");
+        }
+        for fine in [
+            "correct horse battery",
+            "meadow lantern orbit",
+            "a brand new password",
+            "8392017465",
+            "Kx7#pQ2vLm",
+        ] {
+            assert!(!super::easy_to_guess(fine), "{fine} should be accepted");
+        }
+        assert!(matches!(
+            super::check_password("Password123!"),
+            Err(super::AccountError::WeakPassword)
+        ));
+    }
+
     use super::*;
 
     const PASSWORD: &str = "correct horse battery";

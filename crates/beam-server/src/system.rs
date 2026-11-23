@@ -118,6 +118,7 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
             div class={ @if stats.queries_out_of_memory > 0 { "alerting" } } { dt { "Out of memory" } dd { (stats.queries_out_of_memory) } }
             div class={ @if stats.queries_busy > 0 { "alerting" } } { dt { "Turned away busy" } dd { (stats.queries_busy) } }
             div { dt { "Failed" } dd { (stats.queries_failed) } }
+            div { dt { "Connections" } dd { (state.connections.count()) " / " (crate::net::MAX_CONNECTIONS) } }
         }
         div.system-grid {
             section.panel {
@@ -193,12 +194,17 @@ pub async fn metrics_route(State(state): App, Extension(viewer): Extension<Viewe
     let watches = state.accounts.watches(None).unwrap_or_default();
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        prometheus(&stats, process_memory(), &watches),
+        prometheus(&stats, process_memory(), &watches, state.connections.count()),
     )
         .into_response()
 }
 
-pub fn prometheus(stats: &Stats, process: Option<(u64, u64)>, watches: &[beam_accounts::Watch]) -> String {
+pub fn prometheus(
+    stats: &Stats,
+    process: Option<(u64, u64)>,
+    watches: &[beam_accounts::Watch],
+    connections: usize,
+) -> String {
     let mut out = String::new();
     let mut gauge = |name: &str, help: &str, value: String| {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}");
@@ -237,6 +243,11 @@ pub fn prometheus(stats: &Stats, process: Option<(u64, u64)>, watches: &[beam_ac
         "beam_queries_max_concurrent",
         "Queries that may run at once.",
         stats.max_concurrent.to_string(),
+    );
+    gauge(
+        "beam_connections_open",
+        "Browser and client connections open now.",
+        connections.to_string(),
     );
     gauge("beam_datasets", "Datasets loaded.", stats.datasets.to_string());
     gauge(
