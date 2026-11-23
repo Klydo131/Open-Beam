@@ -119,7 +119,7 @@ impl Guard {
 
     fn address_key(from: std::net::IpAddr) -> String {
         // A NUL cannot appear in a username, so the two kinds never collide.
-        format!("\0{from}")
+        format!("\0{}", crate::net::client(from))
     }
 
     /// Reserves a sign-in attempt for `key`, or refuses when it has used up

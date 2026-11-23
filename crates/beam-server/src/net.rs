@@ -40,6 +40,24 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug)]
 pub struct Peer(pub IpAddr);
 
+/// The address limits apply to. One IPv6 network (a /64) usually belongs
+/// to one household or machine, which can pick any address inside it, so
+/// the whole network counts as one; an IPv4 address written as IPv6 counts
+/// as itself.
+pub fn client(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None if v6.is_loopback() => ip,
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
+}
+
 /// Open connections, in total and per address.
 #[derive(Default)]
 pub struct Connections {
@@ -56,6 +74,7 @@ impl Connections {
     /// Admits a connection from `from`, or refuses it when the server or
     /// that address already has as many as allowed.
     pub fn admit(self: &Arc<Self>, from: IpAddr) -> Option<Place> {
+        let from = client(from);
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let mine = open.1.get(&from).copied().unwrap_or(0);
         if open.0 >= MAX_CONNECTIONS || (mine >= MAX_PER_ADDRESS && !from.is_loopback()) {
@@ -116,7 +135,7 @@ pub async fn serve(
         };
         let _ = stream.set_nodelay(true);
         let app = app.clone();
-        let peer = Peer(address.ip());
+        let peer = Peer(client(address.ip()));
         let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
             request.extensions_mut().insert(peer);
             app.clone().oneshot(request.map(Body::new))
@@ -177,6 +196,31 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_798_761_599), "2026-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn an_ipv6_network_counts_as_one_address() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:1234:5678:9abc".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(client(a), client(b));
+        assert_ne!(client(a), client(other));
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(client(mapped), "203.0.113.7".parse::<IpAddr>().unwrap());
+        assert!(client("::1".parse().unwrap()).is_loopback());
+        let table = Arc::new(Connections::default());
+        let held: Vec<Place> = (0..MAX_PER_ADDRESS as u16)
+            .map(|n| {
+                table
+                    .admit(IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, n)))
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            table.admit(b).is_none(),
+            "rotating addresses inside one network does not help"
+        );
+        drop(held);
     }
 
     #[test]
