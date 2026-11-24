@@ -3531,3 +3531,39 @@ async fn the_about_page_profiles_number_columns_with_control_totals_and_far_out_
         "the row count includes the row with no score"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_form_whose_body_drips_in_is_turned_away_after_a_short_wait() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let site = site(false, 50);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(crate::net::serve(
+        listener,
+        site.app.clone(),
+        site.state.connections.clone(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    // Promises 100 bytes, sends 10, then waits: the clock runs on while idle.
+    let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+    slow.write_all(
+        b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n\r\nusername=a",
+    )
+    .await
+    .unwrap();
+    let started = tokio::time::Instant::now();
+    let mut answer = vec![0; 64];
+    let read = slow.read(&mut answer).await.unwrap();
+    let answer = String::from_utf8_lossy(&answer[..read]).to_string();
+    assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+    assert!(started.elapsed() >= crate::net::BODY_TIME);
+    assert!(
+        started.elapsed() < crate::net::REQUEST_TIME,
+        "well before the full request time"
+    );
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+}

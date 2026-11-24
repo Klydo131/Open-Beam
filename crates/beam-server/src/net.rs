@@ -207,9 +207,28 @@ pub async fn serve(
     Ok(())
 }
 
-/// Ends any request that takes longer than [`REQUEST_TIME`], including one
-/// whose body is being sent very slowly.
+/// Time to send the body of anything but a file upload: forms and API
+/// messages are small, so a body still arriving after this is being dripped.
+pub const BODY_TIME: Duration = Duration::from_secs(30);
+/// Largest body read up front for requests other than file uploads; each
+/// handler applies its own, smaller limit.
+const SMALL_BODY: usize = 4 * 1024 * 1024;
+
+/// Ends any request that takes longer than [`REQUEST_TIME`]. The body of
+/// anything but a file upload must arrive within [`BODY_TIME`], so slowly
+/// dripped form posts cannot hold connections for the full request time.
 pub async fn request_time_limit(request: Request, next: Next) -> Response {
+    let upload = request.method() == axum::http::Method::POST && request.uri().path() == "/data";
+    let request = if upload {
+        request
+    } else {
+        let (parts, body) = request.into_parts();
+        match tokio::time::timeout(BODY_TIME, axum::body::to_bytes(body, SMALL_BODY)).await {
+            Ok(Ok(bytes)) => Request::from_parts(parts, Body::from(bytes)),
+            Ok(Err(_)) => return (StatusCode::PAYLOAD_TOO_LARGE, "The request is too large.\n").into_response(),
+            Err(_) => return (StatusCode::REQUEST_TIMEOUT, "The request took too long to arrive.\n").into_response(),
+        }
+    };
     match tokio::time::timeout(REQUEST_TIME, next.run(request)).await {
         Ok(response) => response,
         Err(_) => (StatusCode::REQUEST_TIMEOUT, "The request took too long.\n").into_response(),

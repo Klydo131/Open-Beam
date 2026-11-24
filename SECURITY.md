@@ -35,7 +35,9 @@ Against attacks that need no account:
 - **Other websites.** A page on another site cannot post forms here, load
   our data as a script or image, frame our pages, or time our answers to
   learn about a visitor: browsers label such requests and they are refused.
-  Following a link from another site still works. Pages share no window
+  Following a link from another site still works. Pages on other
+  subdomains of the same site (`same-site`) count as ours, as they do for
+  cookies, so do not run untrusted sites on sibling subdomains. Pages share no window
   with other sites (`Cross-Origin-Opener-Policy`), nothing here may be
   embedded elsewhere (`Cross-Origin-Resource-Policy`), and no page may ask
   for the camera, microphone, location or other devices.
@@ -56,7 +58,13 @@ Against attacks that need no account:
   does not apply (the per-username and overall limits still do). Once
   listed, the proxy's `X-Forwarded-For` names the visitor, read from the
   right; the header is ignored from every other address. Connection limits
-  per address still see the proxy, which has only the overall limit.
+  per address still see the proxy, which has only the overall limit, so
+  limit connections per visitor in the proxy itself.
+- **PostgreSQL clients that read slowly** hold one of two places kept for
+  streamed results, apart from the places every other query uses, so they
+  can delay each other but not the website or the data feed.
+- **File uploads may take up to 10 minutes to arrive;** every other
+  request's body must arrive within 30 seconds.
 
 - **No built-in TLS yet.** To serve Open Beam beyond your own machine, place it
   behind an HTTPS reverse proxy and set `public_url` to the HTTPS address, so

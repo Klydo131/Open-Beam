@@ -17,7 +17,9 @@ use runtime::{parse_size, Gate, Metrics};
 pub use runtime::{Limits, Outcome, SlowQuery, Stats, LATENCY_BUCKETS_MS};
 
 /// Bumped whenever the shape of cached files changes, so old ones are rebuilt.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
+/// Streamed queries that may run at once, apart from the others.
+const STREAMS_AT_ONCE: usize = 2;
 /// Folder inside the upload directory for column-store copies of datasets.
 const CACHE_DIR: &str = ".cache";
 /// Folder inside the upload directory for temporary files of queries too
@@ -174,6 +176,10 @@ pub struct Engine {
     /// Column-store copies of file datasets, by dataset name.
     cache: Mutex<std::collections::HashMap<String, PathBuf>>,
     gate: Gate,
+    /// Places for queries streamed to a client (PostgreSQL access). A
+    /// streaming query keeps its place while the client reads, so slow
+    /// readers get places of their own and cannot hold everyone else's.
+    stream_gate: Gate,
     metrics: Metrics,
     memory_limit_bytes: u64,
     spill_limit_bytes: u64,
@@ -295,6 +301,7 @@ impl Engine {
             datasets: RwLock::new(datasets),
             cache: Mutex::new(cache),
             gate: Gate::new(limits.max_concurrent),
+            stream_gate: Gate::new(STREAMS_AT_ONCE.min(limits.max_concurrent)),
             metrics: Metrics::new(),
             memory_limit_bytes,
             spill_limit_bytes,
@@ -596,8 +603,8 @@ impl Engine {
             memory_used_bytes,
             spill_used_bytes,
             spill_limit_bytes: self.spill_limit_bytes,
-            queries_running: self.gate.running(),
-            max_concurrent: self.gate.max(),
+            queries_running: self.gate.running() + self.stream_gate.running(),
+            max_concurrent: self.gate.max() + self.stream_gate.max(),
             queries_total: m.total.load(Relaxed),
             queries_failed: m.failed.load(Relaxed),
             queries_timed_out: m.timed_out.load(Relaxed),
@@ -636,6 +643,16 @@ impl Engine {
         label: &str,
         work: impl FnOnce() -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
+        self.within_time_limit_on(&self.gate, conn, label, work)
+    }
+
+    fn within_time_limit_on<T>(
+        &self,
+        gate: &Gate,
+        conn: &Connection,
+        label: &str,
+        work: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
         let limit = std::time::Duration::from_millis(self.query_timeout_ms.load(std::sync::atomic::Ordering::Relaxed));
         let started = std::time::Instant::now();
         let record = |outcome: Outcome| {
@@ -643,7 +660,7 @@ impl Engine {
                 self.metrics.record(label, started.elapsed(), outcome);
             }
         };
-        let Some(_slot) = self.gate.enter(limit) else {
+        let Some(_slot) = gate.enter(limit) else {
             record(Outcome::Busy);
             return Err(EngineError::Busy);
         };
@@ -749,7 +766,7 @@ impl Engine {
             .join(", ");
         let wrapped = format!("SELECT {columns} FROM ({sql}) AS beam_result");
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
-        self.within_time_limit(&conn, sql, || {
+        self.within_time_limit_on(&self.stream_gate, &conn, sql, || {
             let mut statement = conn.prepare(&wrapped)?;
             let mut rows = statement.query(params_from_iter(params.iter().map(to_duck)))?;
             let mut sent = 0;
@@ -838,6 +855,21 @@ fn spec_path(spec: &DatasetSpec) -> Option<&Path> {
 /// Identifies one version of a source file: its path, size and time of
 /// last change, with `extra` for anything else that changes the result. A
 /// changed file gets a new key, so a stale copy is never read.
+/// The first and last megabyte of a file (all of it, if smaller).
+fn edges(path: &Path, len: u64) -> Option<[Vec<u8>; 2]> {
+    use std::io::{Read, Seek, SeekFrom};
+    const EDGE: u64 = 1024 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    (&mut file).take(EDGE).read_to_end(&mut head).ok()?;
+    let mut tail = Vec::new();
+    if len > EDGE {
+        file.seek(SeekFrom::Start(len.saturating_sub(EDGE).max(EDGE))).ok()?;
+        file.take(EDGE).read_to_end(&mut tail).ok()?;
+    }
+    Some([head, tail])
+}
+
 fn cache_key(path: &Path, extra: &str) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let meta = std::fs::metadata(path).ok()?;
@@ -851,6 +883,12 @@ fn cache_key(path: &Path, extra: &str) -> Option<u64> {
         extra,
     )
         .hash(&mut hasher);
+    // Some filesystems keep times to the second, and copying tools can set
+    // them back, so a file rewritten at the same size could look unchanged.
+    // Its first and last megabyte are part of the key too.
+    for chunk in edges(path, meta.len())? {
+        chunk.hash(&mut hasher);
+    }
     Some(hasher.finish())
 }
 
@@ -1829,6 +1867,25 @@ mod tests {
         assert_eq!(fs::read_dir(uploads.join(".cache")).unwrap().count(), 2, "old and new");
         assert_eq!(again.prune_cache(), 1);
         assert_eq!(fs::read_dir(uploads.join(".cache")).unwrap().count(), 1);
+        drop(again);
+
+        // Rewritten at the same size with its time set back, as copying
+        // tools and coarse filesystems can leave it: still a fresh copy.
+        let when = fs::metadata(&data).unwrap().modified().unwrap();
+        let text = fs::read_to_string(&data).unwrap().replace("4,EU,7,", "4,EU,9,");
+        fs::write(&data, &text).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&data)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        assert_eq!(fs::metadata(&data).unwrap().modified().unwrap(), when);
+        let third = Engine::open_with_uploads(&[spec("sales", &data, None)], Some(&uploads)).unwrap();
+        assert_eq!(
+            third.query("SELECT max(amount) FROM sales", &[], 1).unwrap(),
+            vec![vec![json!(9)]]
+        );
     }
 
     #[test]
@@ -1873,5 +1930,23 @@ mod tests {
             (stats.queries_busy, stats.queries_total, stats.queries_running),
             (1, 2, 0)
         );
+    }
+
+    #[test]
+    fn slow_streamed_readers_cannot_hold_the_places_other_queries_need() {
+        let engine = Engine::open_with_options(&[], None, &Limits::default()).unwrap();
+        engine.set_query_timeout(std::time::Duration::from_millis(100));
+        // Every streaming place is taken, as by clients that stopped reading.
+        let held: Vec<_> = (0..STREAMS_AT_ONCE)
+            .map(|_| engine.stream_gate.enter(std::time::Duration::ZERO).unwrap())
+            .collect();
+        assert!(matches!(
+            engine.stream_text("SELECT 1", &[], 1, |_| true),
+            Err(EngineError::Busy)
+        ));
+        // Everyone else is unaffected.
+        assert_eq!(engine.query("SELECT 1", &[], 1).unwrap(), vec![vec![json!(1)]]);
+        drop(held);
+        assert_eq!(engine.stream_text("SELECT 1", &[], 1, |_| true).unwrap(), 1);
     }
 }
