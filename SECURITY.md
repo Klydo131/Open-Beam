@@ -51,10 +51,12 @@ Against attacks that need no account:
 
 ## Known limits
 
-- **Behind a reverse proxy, limits per address see the proxy.** Every
-  visitor then arrives from the proxy's address, so the per-address
-  connection and sign-in limits do not apply to it (the per-username and
-  overall limits still do). Rate-limit by visitor address in the proxy.
+- **Behind a reverse proxy, list it in `trusted_proxies`.** Otherwise every
+  visitor arrives from the proxy's address and the per-address sign-in limit
+  does not apply (the per-username and overall limits still do). Once
+  listed, the proxy's `X-Forwarded-For` names the visitor, read from the
+  right; the header is ignored from every other address. Connection limits
+  per address still see the proxy, which has only the overall limit.
 
 - **No built-in TLS yet.** To serve Open Beam beyond your own machine, place it
   behind an HTTPS reverse proxy and set `public_url` to the HTTPS address, so

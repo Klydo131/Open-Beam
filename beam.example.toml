@@ -17,6 +17,13 @@ accounts = "beam-accounts.sqlite"
 # Set when Open Beam is published through an HTTPS reverse proxy.
 # public_url = "https://beam.example.org"
 
+# The reverse proxy's own address, when there is one. Requests from it may
+# name the visitor's real address in X-Forwarded-For, so per-address limits
+# apply to visitors rather than to the proxy. The header is ignored from
+# every other address. Configure the proxy to replace, not append to, any
+# X-Forwarded-For the visitor sends.
+# trusted_proxies = ["127.0.0.1"]
+
 # Longest a single query may run before it is cancelled, in seconds (1-3600).
 # query_timeout_seconds = 30
 

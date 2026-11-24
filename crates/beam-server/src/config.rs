@@ -45,6 +45,12 @@ pub struct Config {
     /// Queries that may run at once; others wait their turn.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    /// Addresses of reverse proxies in front of Open Beam. Only requests
+    /// arriving from one of these may say, in `X-Forwarded-For`, which
+    /// address the visitor really has; from anywhere else the header is
+    /// ignored, so it cannot be used to dodge the per-address limits.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
 }
@@ -159,6 +165,9 @@ impl Config {
         }
         if !(1..=64).contains(&config.max_concurrent_queries) {
             return Err("max_concurrent_queries must be between 1 and 64".into());
+        }
+        if config.trusted_proxies.len() > 32 {
+            return Err("trusted_proxies may list at most 32 addresses".into());
         }
         if config.max_upload_mb > 4096 {
             return Err("max_upload_mb must be at most 4096".into());

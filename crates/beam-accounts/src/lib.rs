@@ -237,6 +237,10 @@ impl Store {
             // Best effort: the file holds password hashes, so keep it private.
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
+        // Wait for another process (such as `beam create-admin` while the
+        // server runs) instead of failing at once, and make every committed
+        // change reach the disk before it is reported as saved.
+        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;")?;
         Self::prepare(conn)
     }
 

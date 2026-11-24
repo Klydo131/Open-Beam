@@ -58,10 +58,46 @@ pub fn client(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Open connections, in total and per address.
+/// Open connections, in total and per address, and the reverse proxies
+/// trusted to name the visitor's address.
 #[derive(Default)]
 pub struct Connections {
     open: Mutex<(usize, HashMap<IpAddr, usize>)>,
+    trusted: Vec<IpAddr>,
+}
+
+/// True when `peer` is one of the configured reverse proxies.
+fn is_trusted(trusted: &[IpAddr], peer: IpAddr) -> bool {
+    let peer = peer.to_canonical();
+    trusted.iter().any(|t| t.to_canonical() == peer)
+}
+
+/// The visitor's address. A request from a trusted reverse proxy names it
+/// in `X-Forwarded-For`; the list is read from the right, skipping the
+/// trusted proxies themselves, because only the entries our own proxies
+/// appended can be believed: a client can put anything at the left. From
+/// any other peer the header is ignored.
+pub fn visitor(peer: IpAddr, headers: &axum::http::HeaderMap, trusted: &[IpAddr]) -> IpAddr {
+    if !is_trusted(trusted, peer) {
+        return peer;
+    }
+    let mut hops = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    while let Some(hop) = hops.pop() {
+        match hop.parse::<IpAddr>() {
+            Ok(ip) if is_trusted(trusted, ip) => continue,
+            Ok(ip) => return ip,
+            // Something unreadable where an address should be: the chain
+            // cannot be trusted past this point.
+            Err(_) => return peer,
+        }
+    }
+    peer
 }
 
 /// One admitted connection; gives its place back when dropped.
@@ -71,13 +107,23 @@ pub struct Place {
 }
 
 impl Connections {
+    pub fn with_trusted_proxies(trusted: Vec<IpAddr>) -> Self {
+        Self {
+            open: Mutex::default(),
+            trusted,
+        }
+    }
+
     /// Admits a connection from `from`, or refuses it when the server or
     /// that address already has as many as allowed.
     pub fn admit(self: &Arc<Self>, from: IpAddr) -> Option<Place> {
+        // A reverse proxy carries everyone's connections, so like this
+        // machine it has only the overall limit.
+        let exempt = from.is_loopback() || is_trusted(&self.trusted, from);
         let from = client(from);
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let mine = open.1.get(&from).copied().unwrap_or(0);
-        if open.0 >= MAX_CONNECTIONS || (mine >= MAX_PER_ADDRESS && !from.is_loopback()) {
+        if open.0 >= MAX_CONNECTIONS || (mine >= MAX_PER_ADDRESS && !exempt) {
             return None;
         }
         open.0 += 1;
@@ -135,9 +181,15 @@ pub async fn serve(
         };
         let _ = stream.set_nodelay(true);
         let app = app.clone();
-        let peer = Peer(client(address.ip()));
+        let table = connections.clone();
         let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
-            request.extensions_mut().insert(peer);
+            let from = visitor(address.ip(), request.headers(), &table.trusted);
+            // A proxy that did not say who it is forwarding for is not
+            // the visitor; counting it would let a few failures lock
+            // everyone out, so such a request carries no address.
+            if !is_trusted(&table.trusted, from) {
+                request.extensions_mut().insert(Peer(client(from)));
+            }
             app.clone().oneshot(request.map(Body::new))
         });
         let connection = hyper::server::conn::http1::Builder::new()
@@ -196,6 +248,52 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_798_761_599), "2026-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn forwarded_addresses_are_believed_only_from_trusted_proxies() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let trusted = [proxy];
+        let mut headers = HeaderMap::new();
+        // The client claims to be 1.1.1.1; the proxy appended the real one.
+        headers.insert("x-forwarded-for", HeaderValue::from_static("1.1.1.1, 203.0.113.9"));
+        assert_eq!(
+            visitor(proxy, &headers, &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // From anyone else the header is ignored.
+        let stranger: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(visitor(stranger, &headers, &trusted), stranger);
+        assert_eq!(
+            visitor(proxy, &headers, &[]),
+            proxy,
+            "no proxies configured: header ignored"
+        );
+        // A chain of our own proxies is skipped from the right.
+        let inner: IpAddr = "10.0.0.6".parse().unwrap();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9, 10.0.0.6"));
+        assert_eq!(
+            visitor(proxy, &headers, &[proxy, inner]),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // Garbage stops the walk instead of trusting what lies beyond it.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, not-an-address"),
+        );
+        assert_eq!(visitor(proxy, &headers, &trusted), proxy);
+        // An IPv4-mapped peer still matches its IPv4 entry.
+        let mapped: IpAddr = "::ffff:10.0.0.5".parse().unwrap();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        assert_eq!(
+            visitor(mapped, &headers, &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // A trusted proxy is not capped per address.
+        let table = Arc::new(Connections::with_trusted_proxies(vec![proxy]));
+        let held: Vec<Place> = (0..MAX_PER_ADDRESS * 2).map(|_| table.admit(proxy).unwrap()).collect();
+        assert_eq!(held.len(), MAX_PER_ADDRESS * 2);
     }
 
     #[test]

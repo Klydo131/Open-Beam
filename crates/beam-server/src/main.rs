@@ -214,6 +214,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
         address.to_string(),
     );
     state.max_upload_bytes = config.max_upload_mb.saturating_mul(1024 * 1024);
+    state.connections = Arc::new(net::Connections::with_trusted_proxies(config.trusted_proxies.clone()));
     let state = Arc::new(state);
     // Unreviewed drafts are swept hourly, not only at start-up.
     let sweeper = state.clone();
