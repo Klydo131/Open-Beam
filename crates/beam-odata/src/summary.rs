@@ -242,8 +242,9 @@ pub fn plan_link_check(from: &EntitySet, column: &str, to: &EntitySet, key: &str
 pub enum RuleCheck {
     /// Never empty.
     Present,
-    /// Numbers no lower than `min` and no higher than `max`.
-    Between { min: Option<f64>, max: Option<f64> },
+    /// Numbers no lower than `min` and no higher than `max`: whole numbers
+    /// as [`Literal::Int`], so large ones compare exactly.
+    Between { min: Option<Literal>, max: Option<Literal> },
     /// Text, when given, is one of these.
     OneOf(Vec<String>),
     /// No value appears twice.
@@ -270,13 +271,15 @@ pub fn plan_rule(set: &EntitySet, column: &str, check: &RuleCheck) -> Result<Sum
                 return Err(QueryError::InvalidValue("between"));
             }
             let mut sides = Vec::new();
-            if let Some(min) = min {
-                params.push(Literal::Float(*min));
-                sides.push(format!("{c} < ?"));
-            }
-            if let Some(max) = max {
-                params.push(Literal::Float(*max));
-                sides.push(format!("{c} > ?"));
+            for (bound, side) in [(min, "<"), (max, ">")] {
+                match bound {
+                    None => {}
+                    Some(value @ (Literal::Int(_) | Literal::Float(_))) => {
+                        params.push(value.clone());
+                        sides.push(format!("{c} {side} ?"));
+                    }
+                    Some(_) => return Err(QueryError::InvalidValue("between")),
+                }
             }
             format!("count(*) FILTER (WHERE {})", sides.join(" OR "))
         }

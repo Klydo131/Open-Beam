@@ -3929,7 +3929,7 @@ async fn rules_say_what_correct_data_looks_like_and_count_the_rows_that_break_th
     let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
     let page = get(&site, "/model", Some(&ada)).await;
     for expected in [
-        "Every Sale's amount is between 15 and 35",
+        "Every Sale's amount, when given, is between 15 and 35",
         "2 rows break it",    // 10.5 and 40
         "1 row breaks it",    // the markup region; and the missing shipped_at
         "All 4 rows keep it", // order ids are unique
@@ -3981,13 +3981,14 @@ async fn each_kind_of_rule_counts_exactly_the_rows_that_break_it() {
         (4.0, 1.0)
     );
     assert_eq!(breaking("id", Unique).await, (4.0, 1.0));
+    use beam_odata::Literal::{Float, Int};
     // 50 is above the maximum; an empty amount breaks no bound.
     assert_eq!(
         breaking(
             "amount",
             Between {
-                min: Some(1.0),
-                max: Some(10.0)
+                min: Some(Float(1.0)),
+                max: Some(Float(10.0))
             }
         )
         .await,
@@ -3997,11 +3998,33 @@ async fn each_kind_of_rule_counts_exactly_the_rows_that_break_it() {
         breaking(
             "amount",
             Between {
-                min: Some(6.0),
+                min: Some(Float(6.0)),
                 max: None
             }
         )
         .await,
         (4.0, 1.0)
     );
+    // Whole numbers beyond 2^53 compare exactly against a whole bound.
+    let engine = Engine::open(&[DatasetSpec {
+        name: "big".into(),
+        source: Source::Query("SELECT * FROM (VALUES (9007199254740992), (9007199254740993)) v(n)".into()),
+        key: None,
+    }])
+    .unwrap();
+    let state = Arc::new(AppState::new(
+        engine,
+        Store::open_in_memory().unwrap(),
+        50,
+        None,
+        "x".into(),
+    ));
+    let set = crate::catalog::entity_set(&state.engine.dataset("big").unwrap());
+    let exact = Between {
+        min: None,
+        max: Some(Int(9007199254740992)),
+    };
+    let planned = beam_odata::plan_rule(&set, "n", &exact).unwrap();
+    let rows = crate::feed::run(&state, planned.sql, &planned.params, 2).await.unwrap();
+    assert_eq!(rows[0][1].as_f64(), Some(1.0), "9007199254740993 is above the bound");
 }

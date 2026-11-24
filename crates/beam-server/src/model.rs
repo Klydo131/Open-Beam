@@ -58,11 +58,45 @@ pub struct Rule {
     pub object: String,
     pub column: String,
     pub check: String,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
+    pub min: Option<Bound>,
+    pub max: Option<Bound>,
     #[serde(default)]
     pub values: Vec<String>,
     pub description: Option<String>,
+}
+
+/// A limit as written in the file. Whole numbers stay whole, so a bound
+/// beyond 2^53 is neither rounded when read nor compared inexactly.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Bound {
+    Whole(i64),
+    Fraction(f64),
+}
+
+impl Bound {
+    fn literal(self) -> beam_odata::Literal {
+        match self {
+            Bound::Whole(v) => beam_odata::Literal::Int(v),
+            Bound::Fraction(v) => beam_odata::Literal::Float(v),
+        }
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            Bound::Whole(v) => v as f64,
+            Bound::Fraction(v) => v,
+        }
+    }
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bound::Whole(v) => write!(f, "{v}"),
+            Bound::Fraction(v) => write!(f, "{v}"),
+        }
+    }
 }
 
 impl Rule {
@@ -70,8 +104,8 @@ impl Rule {
         use beam_odata::RuleCheck::*;
         match self.check.as_str() {
             "between" => Between {
-                min: self.min,
-                max: self.max,
+                min: self.min.map(Bound::literal),
+                max: self.max.map(Bound::literal),
             },
             "one_of" => OneOf(self.values.clone()),
             "unique" => Unique,
@@ -82,25 +116,19 @@ impl Rule {
     /// The rule in words.
     pub fn meaning(&self) -> String {
         let (object, column) = (&self.object, &self.column);
-        let number = |v: f64| format_number(v);
+        // Bounds as written: rounding 0.001 for display would misstate the rule.
         match self.check.as_str() {
             "between" => match (self.min, self.max) {
-                (Some(min), Some(max)) => {
-                    format!(
-                        "Every {object}'s {column} is between {} and {}",
-                        number(min),
-                        number(max)
-                    )
-                }
-                (Some(min), None) => format!("Every {object}'s {column} is at least {}", number(min)),
-                (_, Some(max)) => format!("Every {object}'s {column} is at most {}", number(max)),
+                (Some(min), Some(max)) => format!("Every {object}'s {column}, when given, is between {min} and {max}"),
+                (Some(min), None) => format!("Every {object}'s {column}, when given, is at least {min}"),
+                (_, Some(max)) => format!("Every {object}'s {column}, when given, is at most {max}"),
                 _ => String::new(),
             },
             "one_of" => format!(
                 "Every {object}'s {column}, when given, is one of {}",
                 self.values.join(", ")
             ),
-            "unique" => format!("No two {object} rows share a {column}"),
+            "unique" => format!("No two {object} rows have the same {column}"),
             _ => format!("Every {object} has a {column}"),
         }
     }
@@ -480,10 +508,18 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
             "between" if !numeric => Some("between needs a number column"),
             "between" if extra_values => Some("between takes no values"),
             "between" if !extra_bounds => Some("between needs min, max or both"),
-            "between" if rule.min.into_iter().chain(rule.max).any(|v| !v.is_finite()) => {
+            "between" if rule.min.into_iter().chain(rule.max).any(|v| !v.as_f64().is_finite()) => {
                 Some("min and max must be ordinary numbers")
             }
-            "between" if rule.min.zip(rule.max).is_some_and(|(a, b)| a > b) => Some("min must not be above max"),
+            "between"
+                if match (rule.min, rule.max) {
+                    (Some(Bound::Whole(a)), Some(Bound::Whole(b))) => a > b,
+                    (Some(a), Some(b)) => a.as_f64() > b.as_f64(),
+                    _ => false,
+                } =>
+            {
+                Some("min must not be above max")
+            }
             "between" => None,
             "one_of" if property.edm != EdmType::String => Some("one_of needs a text column"),
             "one_of" if extra_bounds => Some("one_of takes no min or max"),
@@ -492,6 +528,9 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
             }
             "one_of" if rule.values.iter().any(|v| !is_text(v, MAX_LABEL_CHARS)) => {
                 Some("one_of values must be plain text")
+            }
+            "one_of" if rule.values.iter().collect::<HashSet<_>>().len() != rule.values.len() => {
+                Some("one_of lists a value twice")
             }
             "one_of" => None,
             _ => Some("check is one of present, between, one_of, unique"),
@@ -968,6 +1007,20 @@ mod tests {
             let problems = parse(&text, &sets()).unwrap_err().join("\n");
             assert!(problems.contains(expected), "{metric}: {problems}");
         }
+        // Bounds read and shown exactly as written; whole numbers stay whole.
+        let tiny = format!("{GOOD}\n[[rule]]\nname = \"r\"\nobject = \"Customer\"\ncolumn = \"customer_id\"\ncheck = \"between\"\nmin = 0.001\nmax = 9007199254740993\n");
+        let model = parse(&tiny, &sets()).unwrap();
+        assert_eq!(model.rules[0].max, Some(Bound::Whole(9007199254740993)));
+        assert_eq!(
+            model.rules[0].meaning(),
+            "Every Customer's customer_id, when given, is between 0.001 and 9007199254740993"
+        );
+        let unique = GOOD.to_string()
+            + "\n[[rule]]\nname = \"u\"\nobject = \"Order\"\ncolumn = \"order_id\"\ncheck = \"unique\"\n";
+        assert_eq!(
+            parse(&unique, &sets()).unwrap().rules[0].meaning(),
+            "No two Order rows have the same order_id"
+        );
         // Anything beyond the closed grammar, such as an expression, is refused.
         let expression =
             format!("{GOOD}\n[[metric]]\nname = \"m\"\nobject = \"Customer\"\naggregate = \"count\"\nsql = \"1/0\"\n");
@@ -1002,6 +1055,10 @@ mod tests {
                 "takes no min, max or values",
             ),
             ("check = \"pattern\"\ncolumn = \"name\"", "check is one of"),
+            (
+                "check = \"one_of\"\ncolumn = \"name\"\nvalues = [\"a\", \"a\"]",
+                "one_of lists a value twice",
+            ),
             ("check = \"present\"\ncolumn = \"nope\"", "has no column nope"),
         ] {
             let text = format!("{GOOD}\n[[rule]]\nname = \"r\"\nobject = \"Customer\"\n{rule}\n");
