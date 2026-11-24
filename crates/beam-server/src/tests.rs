@@ -2421,6 +2421,7 @@ async fn ai_assistants_get_read_only_tools_over_mcp() {
             "query_rows",
             "answer_verified_question",
             "describe_model",
+            "get_metric",
             "list_watches",
             "summarize_dataset"
         ]
@@ -3826,4 +3827,63 @@ async fn a_configured_or_joined_name_never_takes_over_an_upload() {
     assert!(message.contains("sales_with_many (uploaded by bob)"), "{message}");
     // With no clash it starts.
     assert!(crate::refuse_names_taken_by_uploads(&restarted.state.engine, &restarted.state.accounts).is_ok());
+}
+
+#[tokio::test]
+async fn metrics_give_everyone_the_same_number_by_their_definition() {
+    let model = r#"
+        [[object]]
+        name = "Sale"
+        dataset = "sales"
+        key = "order_id"
+
+        [[metric]]
+        name = "revenue"
+        object = "Sale"
+        aggregate = "sum"
+        column = "amount"
+        label = "Revenue"
+        description = "All sales, before refunds."
+
+        [[metric]]
+        name = "sales_count"
+        object = "Sale"
+        aggregate = "count"
+    "#;
+    let site = site_with_model(false, 50, Some(model));
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    // 10.5 + 20 + 30.25 + 40
+    let page = get(&site, "/model", Some(&bob)).await;
+    assert!(
+        page.body.contains("Sum of amount over every Sale") && page.body.contains(">100.75<"),
+        "{}",
+        page.body
+    );
+    let token = new_token(&site, &bob, &csrf, "t").await;
+    let total = mcp_call(&site, &token, "get_metric", json!({ "name": "revenue" })).await;
+    assert_eq!(
+        (total["label"].clone(), total["value"].clone()),
+        (json!("Revenue"), json!(100.75))
+    );
+    // Split and filtered, still by the definition: EU has orders 1 and 3.
+    let by_region = mcp_call(
+        &site,
+        &token,
+        "get_metric",
+        json!({ "name": "revenue", "by": "region", "filter": "region eq 'EU'" }),
+    )
+    .await;
+    assert_eq!(
+        by_region["groups"],
+        json!([{ "label": "EU", "value": 40.75 }]),
+        "{by_region}"
+    );
+    let counted = mcp_call(&site, &token, "get_metric", json!({ "name": "sales_count" })).await;
+    assert_eq!(counted["value"], json!(4.0));
+    // Unknown metrics are refused, not guessed.
+    let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "get_metric", "arguments": { "name": "profit" } } });
+    let unknown = mcp(&site, &token, message, None).await.json();
+    assert_eq!(unknown["result"]["isError"], true);
+    let described = mcp_call(&site, &token, "describe_model", json!({})).await;
+    assert_eq!(described["metrics"][0]["definition"], "Sum of amount over every Sale");
 }

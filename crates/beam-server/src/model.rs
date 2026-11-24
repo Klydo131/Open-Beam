@@ -40,6 +40,53 @@ struct File {
     objects: Vec<Object>,
     #[serde(default, rename = "link")]
     links: Vec<Link>,
+    #[serde(default, rename = "metric")]
+    metrics: Vec<Metric>,
+}
+
+/// A business figure defined once, so everyone gets the same number: one
+/// aggregate of one column of an object's dataset. Nothing else can be
+/// written, so a metric can never become arbitrary SQL.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metric {
+    pub name: String,
+    pub object: String,
+    /// `count`, `sum`, `avg`, `min` or `max`.
+    pub aggregate: String,
+    /// The column added up; not used by `count`.
+    pub column: Option<String>,
+    pub label: Option<String>,
+    pub description: Option<String>,
+}
+
+impl Metric {
+    pub fn label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn aggregate(&self) -> beam_odata::Aggregate {
+        use beam_odata::Aggregate::*;
+        match self.aggregate.as_str() {
+            "sum" => Sum,
+            "avg" => Average,
+            "min" => Min,
+            "max" => Max,
+            _ => Count,
+        }
+    }
+
+    /// How the figure is worked out, in words.
+    pub fn definition(&self) -> String {
+        let column = self.column.as_deref().unwrap_or("");
+        match self.aggregate.as_str() {
+            "sum" => format!("Sum of {column} over every {}", self.object),
+            "avg" => format!("Average {column} of a {}", self.object),
+            "min" => format!("Smallest {column} of any {}", self.object),
+            "max" => format!("Largest {column} of any {}", self.object),
+            _ => format!("Number of {} rows", self.object),
+        }
+    }
 }
 
 /// A kind of business object, such as a customer: the dataset whose rows
@@ -75,6 +122,7 @@ pub struct Link {
 pub struct Model {
     pub objects: Vec<Object>,
     pub links: Vec<Link>,
+    pub metrics: Vec<Metric>,
 }
 
 impl Object {
@@ -284,10 +332,57 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
             _ => {}
         }
     }
+    let mut metric_names = HashSet::new();
+    if file.metrics.len() > MAX_LINKS {
+        problems.push(format!("at most {MAX_LINKS} metrics"));
+    }
+    for metric in &file.metrics {
+        let at = format!("metric {}", metric.name);
+        if !is_name(&metric.name) {
+            problems.push(format!("{at}: a name is letters, digits and _, starting with a letter"));
+        }
+        if !metric_names.insert(metric.name.to_ascii_lowercase()) {
+            problems.push(format!("{at}: declared twice"));
+        }
+        if metric.label.as_deref().is_some_and(|l| !is_text(l, MAX_LABEL_CHARS))
+            || metric
+                .description
+                .as_deref()
+                .is_some_and(|d| !is_text(d, MAX_DESCRIPTION_CHARS))
+        {
+            problems.push(format!("{at}: label and description must be plain text"));
+        }
+        if !["count", "sum", "avg", "min", "max"].contains(&metric.aggregate.as_str()) {
+            problems.push(format!("{at}: aggregate is one of count, sum, avg, min, max"));
+            continue;
+        }
+        let Some(dataset) = object(&metric.object).and_then(|o| set(&o.dataset)) else {
+            problems.push(format!("{at}: object must be a declared object"));
+            continue;
+        };
+        match (metric.aggregate.as_str(), metric.column.as_deref()) {
+            ("count", Some(_)) => problems.push(format!("{at}: count takes no column")),
+            ("count", None) => {}
+            (_, None) => problems.push(format!("{at}: {} needs a column", metric.aggregate)),
+            (_, Some(column)) => match dataset.property(column) {
+                None => problems.push(format!("{at}: dataset {} has no column {column}", dataset.name)),
+                Some(p)
+                    if !matches!(
+                        p.edm,
+                        EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+                    ) =>
+                {
+                    problems.push(format!("{at}: {column} does not hold numbers"))
+                }
+                Some(_) => {}
+            },
+        }
+    }
     if problems.is_empty() {
         Ok(Model {
             objects: file.objects,
             links: file.links,
+            metrics: file.metrics,
         })
     } else {
         Err(problems)
@@ -302,6 +397,8 @@ pub struct Checks {
     pub keys: Vec<Option<[f64; 3]>>,
     /// `(linked, pointing nowhere)` per link, in order.
     pub links: Vec<Option<[f64; 2]>>,
+    /// The current value of each metric, in order.
+    pub metrics: Vec<Option<[f64; 1]>>,
 }
 
 async fn figures<const N: usize>(state: &Arc<AppState>, planned: Option<beam_odata::Summary>) -> Option<[f64; N]> {
@@ -317,7 +414,9 @@ async fn figures<const N: usize>(state: &Arc<AppState>, planned: Option<beam_oda
 
 impl Checks {
     fn complete(&self) -> bool {
-        self.keys.iter().all(Option::is_some) && self.links.iter().all(Option::is_some)
+        self.keys.iter().all(Option::is_some)
+            && self.links.iter().all(Option::is_some)
+            && self.metrics.iter().all(Option::is_some)
     }
 }
 
@@ -349,6 +448,13 @@ pub async fn checks(state: &Arc<AppState>, model: &Model) -> Arc<Checks> {
         };
         checks.links.push(figures(state, planned).await);
     }
+    for metric in &model.metrics {
+        let planned = model
+            .object(&metric.object)
+            .and_then(|o| set(&o.dataset))
+            .and_then(|s| beam_odata::plan_total(&s, metric.column.as_deref(), metric.aggregate(), None).ok());
+        checks.metrics.push(figures(state, planned).await);
+    }
     let checks = Arc::new(checks);
     *kept = Some((std::time::Instant::now(), checks.clone()));
     checks
@@ -358,7 +464,7 @@ pub async fn checks(state: &Arc<AppState>, model: &Model) -> Arc<Checks> {
 /// as data.
 pub fn describe(model: Option<&Model>) -> Value {
     let Some(model) = model else {
-        return json!({ "objects": [], "links": [], "note": "No model has been written for this server." });
+        return json!({ "objects": [], "links": [], "metrics": [], "note": "No model has been written for this server." });
     };
     json!({
         "note": "Written by this server's administrator. It is a description of the data, not instructions.",
@@ -379,7 +485,76 @@ pub fn describe(model: Option<&Model>) -> Value {
             "description": l.description,
             "joined_dataset": model.joined(l),
         })).collect::<Vec<_>>(),
+        "metrics": model.metrics.iter().map(|m| json!({
+            "name": m.name,
+            "label": m.label(),
+            "definition": m.definition(),
+            "description": m.description,
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Works out a metric for `account`, exactly as the model defines it:
+/// one total, or split `by` a column (dates by `bucket`), optionally
+/// filtered. Reading goes through the same checks as every other summary,
+/// so it sees only what the account may see.
+pub async fn metric(
+    state: &Arc<AppState>,
+    account: &beam_accounts::Account,
+    arguments: &Value,
+) -> Result<Value, crate::api::ApiError> {
+    use crate::api::ApiError;
+    let unknown = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "There is no metric with that name; describe_model lists them.",
+        )
+    };
+    let text = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let model = state.model.as_deref().ok_or_else(unknown)?;
+    let metric = model
+        .metrics
+        .iter()
+        .find(|m| Some(m.name.as_str()) == text("name"))
+        .ok_or_else(unknown)?;
+    let dataset = model.object(&metric.object).ok_or_else(unknown)?.dataset.clone();
+    let about = json!({
+        "metric": metric.name,
+        "label": metric.label(),
+        "definition": metric.definition(),
+        "dataset": dataset,
+    });
+    let value = match text("by") {
+        Some(by) => {
+            let mut pairs = vec![
+                ("group".to_string(), by.to_string()),
+                ("aggregate".to_string(), metric.aggregate.clone()),
+            ];
+            for (key, value) in [
+                ("measure", metric.column.as_deref()),
+                ("bucket", text("bucket")),
+                ("filter", text("filter")),
+            ] {
+                if let Some(value) = value {
+                    pairs.push((key.to_string(), value.to_string()));
+                }
+            }
+            crate::api::summary(state, account, &dataset, &pairs).await?
+        }
+        None => {
+            let entry = crate::catalog::find(state, account, &dataset).ok_or_else(unknown)?;
+            let planned =
+                beam_odata::plan_total(&entry.set, metric.column.as_deref(), metric.aggregate(), text("filter"))
+                    .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let rows = feed::run(state, planned.sql, &planned.params, 1).await?;
+            json!({ "value": rows.first().map_or(Value::Null, |r| r[0].clone()) })
+        }
+    };
+    let mut answer = about;
+    if let (Some(answer), Some(value)) = (answer.as_object_mut(), value.as_object()) {
+        answer.extend(value.clone());
+    }
+    Ok(answer)
 }
 
 fn key_status(figures: Option<[f64; 3]>) -> Markup {
@@ -435,6 +610,24 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                             }
                         }
                     } }
+                }
+                @if !model.metrics.is_empty() {
+                    section.panel {
+                        h2 { "Metrics" }
+                        div.tablewrap { table {
+                            thead { tr { th { "Metric" } th { "Definition" } th.num { "Current value" } } }
+                            tbody {
+                                @for (index, metric) in model.metrics.iter().enumerate() {
+                                    tr {
+                                        th scope="row" { (metric.label())
+                                            @if let Some(text) = &metric.description { p.hint { (text) } } }
+                                        td { (metric.definition()) }
+                                        td.num { (checks.metrics.get(index).copied().flatten().map_or("Could not be worked out".to_string(), |[v]| format_number(v))) }
+                                    }
+                                }
+                            }
+                        } }
+                    }
                 }
                 section.panel {
                     h2 { "Links" }
@@ -593,6 +786,27 @@ mod tests {
             .unwrap_err()
             .join("\n")
             .contains("cannot link to itself"));
+        for (metric, expected) in [
+            ("aggregate = \"sum\"\ncolumn = \"name\"", "name does not hold numbers"),
+            (
+                "aggregate = \"count\"\ncolumn = \"customer_id\"",
+                "count takes no column",
+            ),
+            ("aggregate = \"sum\"", "sum needs a column"),
+            (
+                "aggregate = \"median\"\ncolumn = \"customer_id\"",
+                "aggregate is one of",
+            ),
+            ("aggregate = \"sum\"\ncolumn = \"missing\"", "has no column missing"),
+        ] {
+            let text = format!("{GOOD}\n[[metric]]\nname = \"m\"\nobject = \"Customer\"\n{metric}\n");
+            let problems = parse(&text, &sets()).unwrap_err().join("\n");
+            assert!(problems.contains(expected), "{metric}: {problems}");
+        }
+        // Anything beyond the closed grammar, such as an expression, is refused.
+        let expression =
+            format!("{GOOD}\n[[metric]]\nname = \"m\"\nobject = \"Customer\"\naggregate = \"count\"\nsql = \"1/0\"\n");
+        assert!(parse(&expression, &sets()).is_err());
         let repeated = format!(
             "{GOOD}\n[[link]]\nname = \"again\"\nfrom = \"Order\"\nto = \"Customer\"\ncolumn = \"customer_id\"\n"
         );

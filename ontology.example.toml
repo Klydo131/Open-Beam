@@ -33,3 +33,13 @@ from = "Order"
 to = "Customer"
 column = "customer_id"
 description = "The customer who placed the order."
+
+# A business figure defined once, so everyone gets the same number. One of
+# count, sum, avg, min or max, over one number column of an object.
+[[metric]]
+name = "revenue"
+object = "Order"
+aggregate = "sum"
+column = "amount"
+label = "Revenue"
+description = "All orders, before refunds."

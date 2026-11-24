@@ -78,6 +78,28 @@ column = "ship_to_id"
 joined = "orders_with_ship_to"
 ```
 
+## Metrics
+
+A metric is a business figure defined once, so everyone, and every AI
+assistant, gets the same number for "revenue":
+
+```toml
+[[metric]]
+name = "revenue"
+object = "Order"
+aggregate = "sum"        # count, sum, avg, min or max
+column = "amount"        # a number column; not used by count
+label = "Revenue"
+description = "All orders, before refunds."
+```
+
+A metric is one of five aggregates over one number column of an object.
+Nothing else can be written, so a metric is always plain to read and can
+never become arbitrary code. The Model page shows each metric's
+definition and current value. Assistants use the `get_metric` tool, which
+works it out by its definition, in total or split by a column or period,
+and filtered.
+
 ## What is checked
 
 When the server starts, the model must be exact; otherwise Open Beam
@@ -108,4 +130,4 @@ The design takes ideas, not code, from open projects: object types with a
 key and checked links in the style of typed graph schemas, a closed-world
 check that rejects any undeclared name, and a short reason on every link.
 It uses the W3C SKOS idea of preferred and alternative labels for
-synonyms. Metrics defined once on an object are planned next.
+synonyms. Validity rules that become watches are planned next.

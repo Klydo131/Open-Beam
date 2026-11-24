@@ -79,6 +79,18 @@ fn tools() -> Value {
             "annotations": read_only,
         },
         {
+            "name": "get_metric",
+            "title": "Get a metric",
+            "description": "Works out one of the model's metrics (listed by describe_model) exactly as it is defined, for everyone the same way. Optionally split it by a column or, for dates, by period, and filter it. Prefer this over summarize_dataset when a metric matches the question.",
+            "inputSchema": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "Metric name, from describe_model" },
+                "by": { "type": "string", "description": "Optional column of the metric's dataset to split it by" },
+                "bucket": { "enum": ["day", "month", "quarter", "year"], "description": "For a date column in by; defaults to month" },
+                "filter": filter,
+            }, "required": ["name"], "additionalProperties": false },
+            "annotations": read_only,
+        },
+        {
             "name": "list_watches",
             "title": "List watches",
             "description": "Lists the scheduled checks on datasets you can see, with their latest results, alerts first.",
@@ -161,6 +173,7 @@ async fn call_tool(state: &Arc<AppState>, viewer: &Viewer, params: &Value) -> Re
     let outcome = match params.get("name").and_then(Value::as_str) {
         Some("list_datasets") => Ok(json!({ "datasets": api::list_datasets(state, account) })),
         Some("describe_model") => Ok(crate::model::describe(state.model.as_deref())),
+        Some("get_metric") => crate::model::metric(state, account, &arguments).await,
         Some("describe_dataset") => api::dataset(state, account, &name()),
         Some("query_rows") => match pairs(&arguments, &["filter", "select", "orderby", "top", "skip", "count"]) {
             Ok(mut options) => {
