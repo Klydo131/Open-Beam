@@ -15,6 +15,7 @@ mod people;
 mod pgsql;
 mod postgres;
 mod review;
+mod spc;
 mod stacks;
 mod system;
 mod table;

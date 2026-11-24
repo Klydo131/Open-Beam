@@ -21,6 +21,23 @@ pub const MIN_PASSWORD_CHARS: usize = 15;
 pub const MAX_PASSWORD_BYTES: usize = 256;
 const SESSION_HOURS: u32 = 12;
 
+/// The watches table. Kept in one place because adding a kind means
+/// rebuilding older tables with it.
+const WATCHES_COLUMNS: &str = "(
+    id           INTEGER PRIMARY KEY,
+    dataset      TEXT NOT NULL COLLATE NOCASE,
+    name         TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('total', 'change', 'repeats', 'steady')),
+    settings     TEXT NOT NULL,
+    threshold    REAL NOT NULL,
+    created_by   INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    last_run     TEXT,
+    last_status  TEXT CHECK (last_status IN ('ok', 'alert', 'error')),
+    last_message TEXT,
+    last_value   REAL
+)";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
     #[error("Usernames are 3 to 32 characters: lowercase letters, digits, dot, dash or underscore.")]
@@ -310,20 +327,6 @@ impl Store {
                  approved_by INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
                  approved_at TEXT NOT NULL DEFAULT (datetime('now'))
              );
-             CREATE TABLE IF NOT EXISTS watches (
-                 id           INTEGER PRIMARY KEY,
-                 dataset      TEXT NOT NULL COLLATE NOCASE,
-                 name         TEXT NOT NULL,
-                 kind         TEXT NOT NULL CHECK (kind IN ('total', 'change', 'repeats')),
-                 settings     TEXT NOT NULL,
-                 threshold    REAL NOT NULL,
-                 created_by   INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
-                 created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-                 last_run     TEXT,
-                 last_status  TEXT CHECK (last_status IN ('ok', 'alert', 'error')),
-                 last_message TEXT,
-                 last_value   REAL
-             );
              CREATE TABLE IF NOT EXISTS shares (
                  upload_id  INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
                  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -331,6 +334,28 @@ impl Store {
              );
              DELETE FROM sessions WHERE expires_at <= datetime('now');",
         )?;
+        conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS watches {WATCHES_COLUMNS};"))?;
+        // Watch kinds added later widen the table's check. SQLite cannot
+        // change a check in place, so an older table is copied into a new
+        // one in a single transaction: all of it moves, or none.
+        let watches_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'watches'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !watches_sql.contains("'steady'") {
+            conn.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE watches_widened {WATCHES_COLUMNS};
+                 INSERT INTO watches_widened (id, dataset, name, kind, settings, threshold, created_by,
+                     created_at, last_run, last_status, last_message, last_value)
+                   SELECT id, dataset, name, kind, settings, threshold, created_by,
+                     created_at, last_run, last_status, last_message, last_value FROM watches;
+                 DROP TABLE watches;
+                 ALTER TABLE watches_widened RENAME TO watches;
+                 COMMIT;"
+            ))?;
+        }
         // Columns added after 0.2. Adding is the only kind of change made to
         // an existing file, so older account files open unchanged.
         for (table, column, definition) in [
@@ -1123,6 +1148,9 @@ pub enum WatchKind {
     Change,
     /// More than a number of records appear more than once.
     Repeats,
+    /// The latest period falls outside the range the measure usually moves
+    /// in, or the measure has shifted (a process behaviour chart).
+    Steady,
 }
 
 impl WatchKind {
@@ -1131,6 +1159,7 @@ impl WatchKind {
             WatchKind::Total => "total",
             WatchKind::Change => "change",
             WatchKind::Repeats => "repeats",
+            WatchKind::Steady => "steady",
         }
     }
 
@@ -1139,6 +1168,7 @@ impl WatchKind {
             "total" => Some(WatchKind::Total),
             "change" => Some(WatchKind::Change),
             "repeats" => Some(WatchKind::Repeats),
+            "steady" => Some(WatchKind::Steady),
             _ => None,
         }
     }
@@ -1390,6 +1420,37 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_files_from_before_steady_watches_are_widened_without_losing_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            // An account file as 0.3 wrote it, with one watch in it.
+            let old = super::Store::open(&path).unwrap();
+            let admin = old.create_first_admin("ada", "correct horse battery").unwrap();
+            old.add_watch("sales", "dupes", super::WatchKind::Repeats, "keys=id", 0.0, admin.id)
+                .unwrap();
+            let conn = old.conn();
+            conn.execute_batch(&format!(
+                "CREATE TABLE narrow {};
+                 INSERT INTO narrow SELECT * FROM watches; DROP TABLE watches;
+                 ALTER TABLE narrow RENAME TO watches;",
+                super::WATCHES_COLUMNS.replace(", 'steady'", "")
+            ))
+            .unwrap();
+        }
+        let store = super::Store::open(&path).unwrap();
+        let admin = store.list().unwrap()[0].id;
+        assert_eq!(store.watches(None).unwrap().len(), 1, "the old watch survived");
+        store
+            .add_watch("sales", "usual", super::WatchKind::Steady, "agg=count", 0.0, admin)
+            .unwrap();
+        assert_eq!(store.watches(None).unwrap().len(), 2);
+        // Opening again changes nothing.
+        drop(store);
+        assert_eq!(super::Store::open(&path).unwrap().watches(None).unwrap().len(), 2);
+    }
+
     #[test]
     fn guessable_passwords_are_refused_and_ordinary_phrases_are_not() {
         for weak in [

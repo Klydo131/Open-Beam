@@ -3426,3 +3426,58 @@ async fn a_client_that_never_finishes_its_headers_is_disconnected() {
     server.await.unwrap().unwrap();
     assert_eq!(connections.count(), 0, "every place was given back");
 }
+
+#[tokio::test]
+async fn a_usual_range_watch_learns_from_history_and_flags_what_falls_outside() {
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    // Twenty months that move between 96 and 104, then two to judge.
+    let ordinary = [
+        100, 104, 97, 101, 99, 103, 98, 102, 100, 96, 104, 99, 101, 98, 103, 100, 97, 102, 99, 101,
+    ];
+    let csv = |last: u32| {
+        let mut text = String::from("month,amount\n");
+        for (n, value) in ordinary.iter().chain([&last]).enumerate() {
+            text.push_str(&format!("{}-{:02}-15,{value}\n", 2024 + n / 12, n % 12 + 1));
+        }
+        text
+    };
+    for (name, last) in [("usual", 102), ("unusual", 160)] {
+        let saved = upload(&site, &ada, &csrf, &format!("{name}.csv"), csv(last).as_bytes(), name).await;
+        assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+        let added = submit(
+            &site,
+            &ada,
+            &csrf,
+            &format!("/datasets/{name}/watches"),
+            &[
+                ("name", "Amount as usual"),
+                ("kind", "steady"),
+                ("agg", "sum"),
+                ("measure", "amount"),
+                ("date", "month"),
+                ("bucket", "month"),
+                ("threshold", "999"),
+            ],
+        )
+        .await;
+        assert_eq!(added.location(), format!("/datasets/{name}/about?ok=watch"));
+    }
+    let watch = |name: &str| site.state.accounts.watches(Some(name)).unwrap().remove(0);
+    let usual = watch("usual");
+    assert_eq!(
+        usual.status,
+        Some(beam_accounts::WatchStatus::Ok),
+        "{:?}",
+        usual.message
+    );
+    assert!(usual.message.as_deref().unwrap().contains("within the usual range"));
+    assert_eq!(usual.threshold, 0.0, "a usual range takes no number");
+    let unusual = watch("unusual");
+    assert_eq!(unusual.status, Some(beam_accounts::WatchStatus::Alert));
+    let message = unusual.message.unwrap();
+    assert!(message.contains("2025-09 is 160, outside the usual range"), "{message}");
+    // The About page offers the new kind.
+    let about = get(&site, "/datasets/usual/about", Some(&ada)).await;
+    assert!(about.body.contains("stays in its usual range"));
+}

@@ -216,7 +216,7 @@ async fn check(
                 Some(value),
             ))
         }
-        WatchKind::Change => {
+        WatchKind::Change | WatchKind::Steady => {
             let date = setting(&settings, "date").unwrap_or_default();
             let is_date = set
                 .property(date)
@@ -240,6 +240,9 @@ async fn check(
                 .filter_map(|r| Some((r[0].as_str()?.to_string(), r[1].as_f64()?)))
                 .filter(|(label, _)| label != "(empty)")
                 .collect();
+            if watch.kind == WatchKind::Steady {
+                return Ok(steady(&settings, &points));
+            }
             let [.., (before_label, before), (latest_label, latest)] = points.as_slice() else {
                 return Ok((WatchStatus::Ok, "Not enough periods to compare yet.".into(), None));
             };
@@ -289,6 +292,52 @@ async fn check(
             ))
         }
     }
+}
+
+/// Judges the latest period of `points` (oldest first) against the range
+/// the measure usually moves in; see [`crate::spc`].
+fn steady(settings: &[(String, String)], points: &[(String, f64)]) -> (WatchStatus, String, Option<f64>) {
+    let values: Vec<f64> = points.iter().map(|(_, v)| *v).collect();
+    let subject = format!("{}{}", what(settings), filter_words(settings));
+    let Some(verdict) = crate::spc::judge(&values) else {
+        return (
+            WatchStatus::Ok,
+            format!(
+                "{subject}: not enough periods yet. The usual range is worked out from at least {} earlier periods.",
+                crate::spc::MIN_BASELINE
+            ),
+            None,
+        );
+    };
+    let label = points.last().map_or("", |(l, _)| l.as_str());
+    let range = format!(
+        "usually between {} and {} (worked out from {} earlier periods)",
+        format_number(verdict.lower),
+        format_number(verdict.upper),
+        verdict.baseline
+    );
+    let latest = format_number(verdict.latest);
+    let (status, finding) = match verdict.signal {
+        crate::spc::Signal::None => (WatchStatus::Ok, format!("{label} is {latest}, within the usual range: {range}.")),
+        crate::spc::Signal::Outside => (
+            WatchStatus::Alert,
+            format!("{label} is {latest}, outside the usual range: {range}. Something out of the ordinary happened."),
+        ),
+        crate::spc::Signal::Run { above } => (
+            WatchStatus::Alert,
+            format!(
+                "The last {} periods were all {} the usual middle of {}: the measure has shifted. {label} is {latest}; {range}.",
+                crate::spc::RUN,
+                if above { "above" } else { "below" },
+                format_number(verdict.middle)
+            ),
+        ),
+    };
+    (
+        status,
+        format!("{subject}: {finding} The latest period may not be complete."),
+        Some(verdict.latest),
+    )
 }
 
 /// Runs every watch. Called hourly and at start-up.
@@ -569,7 +618,10 @@ pub async fn about(
                         select #wkind name="kind" {
                             option value="repeats" { "no record appears twice" }
                             option value="total" { "a total stays within a limit" }
-                            @if !dates.is_empty() { option value="change" { "the latest period changes little" } }
+                            @if !dates.is_empty() {
+                                option value="steady" { "the latest period stays in its usual range (no number needed)" }
+                                option value="change" { "the latest period changes little" }
+                            }
                         }
                         label for="wkeys" { "Key columns, for repeats (comma-separated)" }
                         input #wkeys name="keys" list="columns" placeholder="for example: person_id, event_date";
@@ -591,14 +643,14 @@ pub async fn about(
                             option value="above" { "alert when above" } option value="below" { "alert when below" }
                         }
                         @if !dates.is_empty() {
-                            label for="wdate" { "Date column and period, for changes" }
+                            label for="wdate" { "Date column and period, for changes and usual ranges" }
                             select #wdate name="date" { @for p in &dates { option value=(p.name) { (p.name) } } }
                             select name="bucket" aria-label="Period" {
                                 option value="month" { "month" } option value="day" { "day" }
                                 option value="quarter" { "quarter" } option value="year" { "year" }
                             }
                         }
-                        label for="wthreshold" { "Number: the total limit, the percentage change, or how many repeats are acceptable" }
+                        label for="wthreshold" { "Number: the total limit, the percentage change, or how many repeats are acceptable. Not used for usual ranges." }
                         input #wthreshold name="threshold" type="number" step="any" required value="0";
                         button type="submit" { "Add watch" }
                     }
@@ -734,7 +786,7 @@ pub async fn add_watch(
     // Keep only what this kind of watch uses, so its description stays true.
     let used: &[&str] = match kind {
         WatchKind::Total => &["agg", "measure", "when", "column", "op", "value"],
-        WatchKind::Change => &["agg", "measure", "date", "bucket", "column", "op", "value"],
+        WatchKind::Change | WatchKind::Steady => &["agg", "measure", "date", "bucket", "column", "op", "value"],
         WatchKind::Repeats => &["keys", "column", "op", "value"],
     };
     let mut kept: Pairs = form
@@ -761,6 +813,8 @@ pub async fn add_watch(
     let Some(threshold) = threshold.filter(|t| t.is_finite()) else {
         return redirect(&format!("{base}?error=watch"));
     };
+    // A usual range comes from the data, not from a number.
+    let threshold = if kind == WatchKind::Steady { 0.0 } else { threshold };
     let name = setting(&form, "name").unwrap_or("");
     let candidate = Watch {
         id: 0,
