@@ -168,9 +168,11 @@ fn restore_uploads(engine: &beam_engine::Engine, accounts: &Store) {
 fn refuse_names_taken_by_uploads(engine: &beam_engine::Engine, accounts: &Store) -> Result<(), String> {
     let ours: std::collections::HashSet<String> =
         engine.datasets().iter().map(|d| d.name.to_ascii_lowercase()).collect();
-    let clashes: Vec<String> = accounts
+    // Unreadable records stop the start: checking nothing would be unsafe.
+    let uploads = accounts
         .uploads()
-        .unwrap_or_default()
+        .map_err(|e| format!("cannot read the uploads: {e}"))?;
+    let clashes: Vec<String> = uploads
         .iter()
         .filter(|u| ours.contains(&u.name.to_ascii_lowercase()))
         .map(|u| {
