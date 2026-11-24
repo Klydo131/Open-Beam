@@ -210,9 +210,10 @@ pub async fn serve(
 /// Time to send the body of anything but a file upload: forms and API
 /// messages are small, so a body still arriving after this is being dripped.
 pub const BODY_TIME: Duration = Duration::from_secs(30);
-/// Largest body read up front for requests other than file uploads; each
-/// handler applies its own, smaller limit.
-const SMALL_BODY: usize = 4 * 1024 * 1024;
+/// Largest body read up front for requests other than file uploads: the
+/// same 2 MiB that handlers accept anyway (axum's default body limit), so
+/// reading it early holds no more memory than handling it would.
+const SMALL_BODY: usize = 2 * 1024 * 1024;
 
 /// Ends any request that takes longer than [`REQUEST_TIME`]. The body of
 /// anything but a file upload must arrive within [`BODY_TIME`], so slowly
