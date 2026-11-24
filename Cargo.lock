@@ -427,7 +427,7 @@ name = "beam-server"
 version = "0.3.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "beam-accounts",
  "beam-engine",
  "beam-odata",
