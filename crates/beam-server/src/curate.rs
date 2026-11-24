@@ -305,15 +305,33 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
         .take(beam_odata::MAX_PROFILE_COLUMNS)
         .map(|p| p.name.as_str())
         .collect();
-    let result = match beam_odata::plan_profile(set, &shown) {
-        Ok(planned) => {
-            let width = 1 + shown.len() * beam_odata::PROFILE_WIDTH;
-            feed::run(state, planned.sql, &planned.params, width).await.ok()
+    // Worked out once per change to the datasets, not on every visit: each
+    // profile reads the whole dataset twice.
+    let figures = match state.remembered_profile(&set.name) {
+        Some(figures) => Some(figures),
+        None => {
+            // Read before the query, so a change made while it runs makes
+            // the result look old rather than current.
+            let generation = state.engine.generation();
+            let worked_out = match beam_odata::plan_profile(set, &shown) {
+                Ok(planned) => {
+                    let width = 1 + shown.len() * beam_odata::PROFILE_WIDTH;
+                    feed::run(state, planned.sql, &planned.params, width)
+                        .await
+                        .ok()
+                        .and_then(|rows| {
+                            rows.first()
+                                .map(|row| Arc::new(row.iter().map(Value::as_f64).collect::<Vec<_>>()))
+                        })
+                }
+                Err(_) => None,
+            };
+            if let Some(figures) = &worked_out {
+                state.remember_profile(&set.name, generation, figures.clone());
+            }
+            worked_out
         }
-        Err(_) => None,
     };
-    let figures: Option<Vec<Option<f64>>> =
-        result.and_then(|rows| rows.first().map(|row| row.iter().map(Value::as_f64).collect()));
     let show = |v: Option<f64>| v.map_or("—".to_string(), format_number);
     html! {
         section.panel {

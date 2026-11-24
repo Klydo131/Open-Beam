@@ -3567,3 +3567,28 @@ async fn a_form_whose_body_drips_in_is_turned_away_after_a_short_wait() {
     let _ = stop.send(());
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_profile_is_worked_out_once_and_again_when_the_datasets_change() {
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    assert!(site.state.remembered_profile("sales").is_none());
+    let first = get(&site, "/datasets/sales/about", Some(&ada)).await;
+    let kept = site
+        .state
+        .remembered_profile("sales")
+        .expect("kept after the first visit");
+    let queries = site.state.engine.stats().queries_total;
+    let second = get(&site, "/datasets/sales/about", Some(&ada)).await;
+    assert_eq!(first.body, second.body);
+    assert_eq!(
+        site.state.engine.stats().queries_total,
+        queries,
+        "the second visit runs no query for the profile"
+    );
+    assert!(Arc::ptr_eq(&kept, &site.state.remembered_profile("sales").unwrap()));
+    // Any change to the datasets makes it old.
+    let saved = upload(&site, &ada, &csrf, "more.csv", b"id,score\n1,2\n", "more").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    assert!(site.state.remembered_profile("sales").is_none());
+}

@@ -42,8 +42,9 @@ is removed), the answer says so instead of guessing.
 ## Check the figures: the profile
 
 The About view also shows a **Profile** of every number column (the first
-12). It reads the whole dataset each time the page opens, so it is always
-current:
+12). It is worked out the first time the page opens and kept until a
+dataset is added or removed, or the server restarts (which is also when
+changed data files are read again), so it always matches the data shown:
 
 - **Rows, values and total.** These are control totals, the check
   bookkeepers have used for centuries: compare them with the source

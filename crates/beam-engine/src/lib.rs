@@ -180,6 +180,9 @@ pub struct Engine {
     /// streaming query keeps its place while the client reads, so slow
     /// readers get places of their own and cannot hold everyone else's.
     stream_gate: Gate,
+    /// Goes up whenever a dataset is added or removed, so anything worked
+    /// out from the data can tell whether it is still current.
+    generation: std::sync::atomic::AtomicU64,
     metrics: Metrics,
     memory_limit_bytes: u64,
     spill_limit_bytes: u64,
@@ -302,6 +305,7 @@ impl Engine {
             cache: Mutex::new(cache),
             gate: Gate::new(limits.max_concurrent),
             stream_gate: Gate::new(STREAMS_AT_ONCE.min(limits.max_concurrent)),
+            generation: std::sync::atomic::AtomicU64::new(0),
             metrics: Metrics::new(),
             memory_limit_bytes,
             spill_limit_bytes,
@@ -395,6 +399,7 @@ impl Engine {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(dataset.clone());
+                self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(dataset)
             }
             Err(e) => {
@@ -532,11 +537,18 @@ impl Engine {
 
     /// Removes a dataset added with [`Engine::add_upload`]. The file is left
     /// for the caller to delete.
+    /// Changes whenever the datasets do: one is added or removed. Data in
+    /// files is read when the server starts, so it is current until then.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn remove(&self, name: &str) -> Result<(), EngineError> {
         let mut datasets = self.datasets.write().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_ident(name)))?;
         datasets.retain(|d| d.name != name);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(file) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(name) {
             let _ = std::fs::remove_file(file);
         }

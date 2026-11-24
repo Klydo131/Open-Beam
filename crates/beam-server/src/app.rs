@@ -17,6 +17,9 @@ use beam_accounts::Store;
 use beam_engine::Engine;
 use std::sync::Arc;
 
+/// The figures of a dataset's profile, as the profile query returns them.
+pub type Profile = Arc<Vec<Option<f64>>>;
+
 pub struct AppState {
     pub engine: Engine,
     pub max_page_size: u64,
@@ -31,6 +34,9 @@ pub struct AppState {
     /// Review-page previews, worked out once per draft and kept while the
     /// draft waits. Bounded; anything evicted is simply worked out again.
     previews: std::sync::Mutex<std::collections::HashMap<String, Arc<beam_engine::Preview>>>,
+    /// Dataset profiles, each with the engine generation it was worked out
+    /// at, so it is reused until the datasets change. Bounded.
+    profiles: std::sync::Mutex<std::collections::HashMap<String, (u64, Profile)>>,
 }
 
 impl AppState {
@@ -51,6 +57,7 @@ impl AppState {
             guard: auth::Guard::default(),
             connections: Arc::default(),
             previews: std::sync::Mutex::default(),
+            profiles: std::sync::Mutex::default(),
         }
     }
 
@@ -69,6 +76,28 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .get(file)
             .cloned()
+    }
+
+    /// The profile of `dataset` if it was worked out since the datasets last
+    /// changed.
+    pub fn remembered_profile(&self, dataset: &str) -> Option<Profile> {
+        let generation = self.engine.generation();
+        self.profiles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dataset)
+            .filter(|(at, _)| *at == generation)
+            .map(|(_, figures)| figures.clone())
+    }
+
+    /// Keeps a profile worked out at engine generation `generation`.
+    pub fn remember_profile(&self, dataset: &str, generation: u64, figures: Profile) {
+        const KEPT: usize = 256;
+        let mut profiles = self.profiles.lock().unwrap_or_else(|e| e.into_inner());
+        if profiles.len() >= KEPT {
+            profiles.clear();
+        }
+        profiles.insert(dataset.to_string(), (generation, figures));
     }
 
     pub fn forget_preview(&self, file: &str) {
