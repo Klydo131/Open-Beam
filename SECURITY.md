@@ -120,6 +120,10 @@ Against attacks that need no account:
   dataset's owner or an administrator and its results, including totals, are
   shown to everyone who can see the dataset. Results are recorded only while
   the dataset exists.
+- **The model (ontology) is written by an administrator** and trusted like
+  `beam.toml`. It may only name datasets from the configuration, never
+  uploads, so it cannot reveal a private dataset. AI assistants receive it
+  marked as a description of the data, not instructions.
 - **The configuration file and the machine are trusted.** Anyone who can edit
   `beam.toml` chooses which files are served, and anyone who can run commands
   on the machine can create an administrator.

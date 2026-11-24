@@ -51,6 +51,9 @@ pub struct Config {
     /// ignored, so it cannot be used to dodge the per-address limits.
     #[serde(default)]
     pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// A model of the business objects the datasets describe (see
+    /// `ontology.example.toml`), relative to this file.
+    pub ontology: Option<PathBuf>,
     #[serde(default, rename = "dataset")]
     pub datasets: Vec<DatasetConfig>,
 }
@@ -154,6 +157,9 @@ impl Config {
         let base = path.parent().unwrap_or(Path::new("."));
         config.accounts = base.join(&config.accounts);
         config.uploads = base.join(&config.uploads);
+        if let Some(ontology) = &mut config.ontology {
+            *ontology = base.join(&*ontology);
+        }
         if !(1..=3600).contains(&config.query_timeout_seconds) {
             return Err("query_timeout_seconds must be between 1 and 3600".into());
         }

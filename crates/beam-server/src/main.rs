@@ -10,6 +10,7 @@ mod curate;
 mod export;
 mod feed;
 mod mcp;
+mod model;
 mod net;
 mod people;
 mod pgsql;
@@ -160,6 +161,19 @@ fn restore_uploads(engine: &beam_engine::Engine, accounts: &Store) {
     }
 }
 
+/// The model named by `ontology`, checked against the configured datasets.
+/// A model with problems stops the server, listing all of them, as any other
+/// mistake in the configuration does.
+fn load_model(config: &config::Config, engine: &beam_engine::Engine) -> Result<Option<model::Model>, String> {
+    let Some(path) = &config.ontology else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    model::parse(&text, &model::configured_sets(engine))
+        .map(Some)
+        .map_err(|problems| format!("{}:\n  {}", path.display(), problems.join("\n  ")))
+}
+
 async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let accounts = open_accounts(&config)?;
     let account_count = accounts.count().map_err(|e| e.to_string())?;
@@ -172,6 +186,8 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     // Copies left by datasets that no longer exist, or whose files changed.
     engine.prune_cache();
     review::remove_expired_drafts(&engine, &accounts, review::DRAFT_DAYS);
+    // Checked before anything listens, so a mistake stops the start.
+    let model = load_model(&config, &engine)?;
 
     let postgres = match config.postgres_bind {
         Some(bind) => Some(
@@ -215,6 +231,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
         address.to_string(),
     );
     state.max_upload_bytes = config.max_upload_mb.saturating_mul(1024 * 1024);
+    state.model = model.map(Arc::new);
     state.connections = Arc::new(net::Connections::with_trusted_proxies(config.trusted_proxies.clone()));
     let state = Arc::new(state);
     // Unreviewed drafts are swept hourly, not only at start-up.

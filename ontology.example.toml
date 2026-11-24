@@ -1,0 +1,33 @@
+# A model of the business objects your datasets describe: what each one
+# is, the other words people use for it, and how they link. Name this file
+# with `ontology = "ontology.toml"` in beam.toml.
+#
+# Open Beam checks the model when it starts and refuses to start if
+# anything in it is wrong, listing every problem. It may only name datasets
+# from beam.toml, never uploaded ones. The Model page shows how well the
+# data keeps to it, and AI assistants read it through the describe_model tool.
+
+# One kind of business object per dataset, with the column that tells the
+# rows apart.
+[[object]]
+name = "Customer"                 # letters, digits and _
+dataset = "customers"             # a dataset from beam.toml
+key = "customer_id"               # each customer's own value
+label = "Customer"                # optional; how people say it
+synonyms = ["client", "account"]  # optional; each word may mean one object only
+description = "A person or company that buys from us."
+
+[[object]]
+name = "Order"
+dataset = "orders"
+key = "order_id"
+synonyms = ["sale", "purchase"]
+description = "One order placed by one customer."
+
+# Each order names one customer, in its customer_id column.
+[[link]]
+name = "placed_by"
+from = "Order"
+to = "Customer"
+column = "customer_id"
+description = "The customer who placed the order."

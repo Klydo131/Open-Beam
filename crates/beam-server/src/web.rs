@@ -63,6 +63,7 @@ pub fn layout(title: &str, signed: Option<&Signed>, body: Markup) -> Markup {
                             a href="/data/new" { "Add data" }
                             a href="/people" { "People" }
                             a href="/watches" { "Watches" }
+                            a href="/model" { "Model" }
                             @if signed.session.account.role == Role::Admin {
                                 a href="/admin/accounts" { "Accounts" }
                                 a href="/admin/system" { "System" }

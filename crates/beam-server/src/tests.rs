@@ -55,6 +55,11 @@ struct Call<'a> {
 
 /// A site with two datasets and, unless `fresh`, an administrator `ada` and a user `bob`.
 fn site(fresh: bool, max_page_size: u64) -> Site {
+    site_with_model(fresh, max_page_size, None)
+}
+
+/// [`site`] with a model, checked against its configured datasets.
+fn site_with_model(fresh: bool, max_page_size: u64, model: Option<&str>) -> Site {
     let dir = tempfile::tempdir().unwrap();
     let sales = dir.path().join("sales.csv");
     std::fs::write(
@@ -85,13 +90,12 @@ fn site(fresh: bool, max_page_size: u64) -> Site {
         accounts.create_first_admin("ada", ADMIN_PASSWORD).unwrap();
         accounts.create("bob", USER_PASSWORD, Role::User).unwrap();
     }
-    let state = Arc::new(AppState::new(
-        engine,
-        accounts,
-        max_page_size,
-        None,
-        "127.0.0.1:8787".into(),
-    ));
+    let mut state = AppState::new(engine, accounts, max_page_size, None, "127.0.0.1:8787".into());
+    if let Some(text) = model {
+        let sets = crate::model::configured_sets(&state.engine);
+        state.model = Some(Arc::new(crate::model::parse(text, &sets).unwrap()));
+    }
+    let state = Arc::new(state);
     Site {
         app: router(state.clone()),
         state,
@@ -2413,6 +2417,7 @@ async fn ai_assistants_get_read_only_tools_over_mcp() {
             "describe_dataset",
             "query_rows",
             "answer_verified_question",
+            "describe_model",
             "list_watches",
             "summarize_dataset"
         ]
@@ -3603,4 +3608,127 @@ async fn a_profile_that_could_not_be_worked_out_is_not_retried_on_every_visit() 
     let about = get(&site, "/datasets/sales/about", Some(&ada)).await;
     assert!(about.body.contains("could not be worked out in time"));
     assert_eq!(site.state.engine.stats().queries_total, queries);
+}
+
+#[tokio::test]
+async fn the_model_is_checked_against_the_data_and_shared_with_assistants() {
+    // The test site's sales name items of the many dataset by order_id.
+    let model = r#"
+        [[object]]
+        name = "Sale"
+        dataset = "sales"
+        key = "order_id"
+        synonyms = ["order", "purchase"]
+        description = "One sale."
+
+        [[object]]
+        name = "Item"
+        dataset = "many"
+        key = "id"
+
+        [[object]]
+        name = "Market"
+        dataset = "sales"
+        key = "region"
+    "#;
+    // One dataset describes one object.
+    let sets: Vec<_> = site(false, 50)
+        .state
+        .engine
+        .datasets()
+        .iter()
+        .map(crate::catalog::entity_set)
+        .collect();
+    assert!(crate::model::parse(model, &sets).is_err());
+    let model = model.replace(
+        "\n        [[object]]\n        name = \"Market\"\n        dataset = \"sales\"\n        key = \"region\"\n",
+        "",
+    ) + r#"
+        [[link]]
+        name = "of_item"
+        from = "Sale"
+        to = "Item"
+        column = "order_id"
+        description = "The item sold."
+    "#;
+    let site = site_with_model(false, 50, Some(&model));
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let page = get(&site, "/model", Some(&ada)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Each of 4 rows has its own key"), "{}", page.body);
+    assert!(page.body.contains("Each of 120 rows has its own key"));
+    assert!(page.body.contains("All 4 point to one"));
+    assert!(page.body.contains("Each Sale names one Item in"));
+    let queries = site.state.engine.stats().queries_total;
+    get(&site, "/model", Some(&ada)).await;
+    assert_eq!(
+        site.state.engine.stats().queries_total,
+        queries,
+        "checked once per change to the data"
+    );
+
+    let token = new_token(&site, &ada, &csrf, "t").await;
+    let described = mcp_call(&site, &token, "describe_model", json!({})).await;
+    assert_eq!(described["objects"][0]["synonyms"], json!(["order", "purchase"]));
+    assert_eq!(
+        described["links"][0]["meaning"],
+        "Each Sale names one Item in order_id."
+    );
+    assert!(described["note"].as_str().unwrap().contains("not instructions"));
+
+    // Without a model the page explains, and the tool says so.
+    let bare = site_with_model(false, 50, None);
+    let (ada, csrf) = sign_in(&bare, "ada", ADMIN_PASSWORD).await;
+    assert!(get(&bare, "/model", Some(&ada))
+        .await
+        .body
+        .contains("No model has been written yet"));
+    let token = new_token(&bare, &ada, &csrf, "t").await;
+    assert_eq!(
+        mcp_call(&bare, &token, "describe_model", json!({})).await["objects"],
+        json!([])
+    );
+}
+
+/// Calls one MCP tool and returns its structured result.
+async fn mcp_call(site: &Site, token: &str, tool: &str, arguments: Value) -> Value {
+    let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": arguments } });
+    let reply = mcp(site, token, message, None).await.json();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    reply["result"]["structuredContent"].clone()
+}
+
+#[tokio::test]
+async fn the_model_can_never_name_a_private_upload_and_reports_bad_keys_and_links() {
+    let site = site(false, 50);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let saved = upload(&site, &bob, &csrf, "secret.csv", b"id,salary\n1,100\n", "secret").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    let naming_it = "[[object]]\nname = \"Pay\"\ndataset = \"secret\"\nkey = \"id\"\n";
+    let refused = crate::model::parse(naming_it, &crate::model::configured_sets(&site.state.engine));
+    assert!(refused.unwrap_err()[0].contains("no configured dataset named secret"));
+
+    // sales has two EU rows; most items name no sale.
+    let model = r#"
+        [[object]]
+        name = "Market"
+        dataset = "sales"
+        key = "region"
+
+        [[object]]
+        name = "Item"
+        dataset = "many"
+        key = "label"
+
+        [[link]]
+        name = "sold_as"
+        from = "Item"
+        to = "Market"
+        column = "label"
+    "#;
+    let site = site_with_model(false, 50, Some(model));
+    let (ada, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let page = get(&site, "/model", Some(&ada)).await;
+    assert!(page.body.contains("1 repeated, 0 empty keys"), "{}", page.body);
+    assert!(page.body.contains("120 point to nothing"), "{}", page.body);
 }

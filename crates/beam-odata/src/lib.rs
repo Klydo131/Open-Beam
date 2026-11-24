@@ -15,8 +15,8 @@ pub use filter::{Expr, FilterError};
 pub use metadata::{metadata_xml, service_document};
 pub use query::{plan, Plan, QueryError};
 pub use summary::{
-    plan_profile, plan_repeats, plan_summary, plan_total, Aggregate, Bucket, Summary, MAX_PROFILE_COLUMNS,
-    PROFILE_WIDTH,
+    plan_key_check, plan_link_check, plan_profile, plan_repeats, plan_summary, plan_total, Aggregate, Bucket, Summary,
+    MAX_PROFILE_COLUMNS, PROFILE_WIDTH,
 };
 
 /// The subset of EDM primitive types Open Beam exposes.

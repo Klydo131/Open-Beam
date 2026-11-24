@@ -24,6 +24,10 @@ accounts = "beam-accounts.sqlite"
 # X-Forwarded-For the visitor sends.
 # trusted_proxies = ["127.0.0.1"]
 
+# A model of the business objects your datasets describe and how they link;
+# see ontology.example.toml.
+# ontology = "ontology.toml"
+
 # Longest a single query may run before it is cancelled, in seconds (1-3600).
 # query_timeout_seconds = 30
 

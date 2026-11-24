@@ -37,6 +37,10 @@ pub struct AppState {
     /// Dataset profiles, each with the engine generation it was worked out
     /// at, so it is reused until the datasets change. Bounded.
     profiles: std::sync::Mutex<std::collections::HashMap<String, (u64, Profile)>>,
+    /// The model from the configuration, if one was written.
+    pub model: Option<Arc<crate::model::Model>>,
+    /// The model's checks against the data, with the generation they are for.
+    pub model_checks: std::sync::Mutex<Option<(u64, Arc<crate::model::Checks>)>>,
 }
 
 impl AppState {
@@ -58,6 +62,8 @@ impl AppState {
             connections: Arc::default(),
             previews: std::sync::Mutex::default(),
             profiles: std::sync::Mutex::default(),
+            model: None,
+            model_checks: std::sync::Mutex::default(),
         }
     }
 
@@ -151,6 +157,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/{name}/watches/{id}/remove", post(curate::remove_watch))
         .route("/watches", get(curate::overview))
         .route("/admin/system", get(system::page_route))
+        .route("/model", get(crate::model::page_route))
         .route("/datasets/{name}/export.csv", get(export::csv))
         .route("/datasets/{name}/export.xlsx", get(export::excel))
         .route("/datasets/{name}/share", get(uploads::sharing).post(uploads::share))

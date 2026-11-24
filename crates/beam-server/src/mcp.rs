@@ -72,6 +72,13 @@ fn tools() -> Value {
             "annotations": read_only,
         },
         {
+            "name": "describe_model",
+            "title": "Describe the model",
+            "description": "The business objects the datasets describe (for example Customer, Order), the other words people use for them, and how they link: which column of one dataset names a row of another. Read this to map a question's words to datasets and to join them correctly.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": read_only,
+        },
+        {
             "name": "list_watches",
             "title": "List watches",
             "description": "Lists the scheduled checks on datasets you can see, with their latest results, alerts first.",
@@ -153,6 +160,7 @@ async fn call_tool(state: &Arc<AppState>, viewer: &Viewer, params: &Value) -> Re
     let name = || arguments.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     let outcome = match params.get("name").and_then(Value::as_str) {
         Some("list_datasets") => Ok(json!({ "datasets": api::list_datasets(state, account) })),
+        Some("describe_model") => Ok(crate::model::describe(state.model.as_deref())),
         Some("describe_dataset") => api::dataset(state, account, &name()),
         Some("query_rows") => match pairs(&arguments, &["filter", "select", "orderby", "top", "skip", "count"]) {
             Ok(mut options) => {

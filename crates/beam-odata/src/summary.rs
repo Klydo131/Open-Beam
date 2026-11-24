@@ -196,6 +196,46 @@ pub fn plan_profile(set: &EntitySet, columns: &[&str]) -> Result<Summary, QueryE
     })
 }
 
+/// Whether `key` identifies each row of `set`: returns one row of
+/// `(rows, distinct, empty)`. The key holds when `empty` is 0 and
+/// `distinct` equals `rows`.
+pub fn plan_key_check(set: &EntitySet, key: &str) -> Result<Summary, QueryError> {
+    let key = set
+        .property(key)
+        .ok_or_else(|| QueryError::UnknownProperty(key.to_string()))?;
+    let k = quote_ident(&key.name);
+    Ok(Summary {
+        sql: format!(
+            "SELECT CAST(count(*) AS DOUBLE), CAST(count(DISTINCT {k}) AS DOUBLE), \
+             CAST(count(*) FILTER (WHERE {k} IS NULL) AS DOUBLE) FROM {}",
+            quote_ident(&set.name)
+        ),
+        params: Vec::new(),
+        ordered: false,
+    })
+}
+
+/// Rows of `from` whose `column` names no row of `to` by its `key`: returns
+/// one row of `(linked, orphans)`, counting only rows where `column` is set.
+pub fn plan_link_check(from: &EntitySet, column: &str, to: &EntitySet, key: &str) -> Result<Summary, QueryError> {
+    let unknown = |name: &str| QueryError::UnknownProperty(name.to_string());
+    let column = from.property(column).ok_or_else(|| unknown(column))?;
+    let key = to.property(key).ok_or_else(|| unknown(key))?;
+    let (c, k) = (quote_ident(&column.name), quote_ident(&key.name));
+    Ok(Summary {
+        sql: format!(
+            "SELECT CAST(count(*) FILTER (WHERE t.{k} IS NOT NULL) AS DOUBLE), \
+             CAST(count(*) FILTER (WHERE t.{k} IS NULL) AS DOUBLE) \
+             FROM (SELECT {c} AS v FROM {} WHERE {c} IS NOT NULL) f \
+             LEFT JOIN (SELECT DISTINCT {k} FROM {}) t ON f.v = t.{k}",
+            quote_ident(&from.name),
+            quote_ident(&to.name)
+        ),
+        params: Vec::new(),
+        ordered: false,
+    })
+}
+
 /// How often records repeat: returns one row of `(groups, extra)` where
 /// `groups` counts combinations of `keys` that appear more than once, and
 /// `extra` counts the rows beyond the first of each. Rows where every key is
