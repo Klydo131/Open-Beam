@@ -172,7 +172,7 @@ async fn call_tool(state: &Arc<AppState>, viewer: &Viewer, params: &Value) -> Re
     let name = || arguments.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     let outcome = match params.get("name").and_then(Value::as_str) {
         Some("list_datasets") => Ok(json!({ "datasets": api::list_datasets(state, account) })),
-        Some("describe_model") => Ok(crate::model::describe(state.model.as_deref())),
+        Some("describe_model") => Ok(crate::model::describe(state.model().as_deref())),
         Some("get_metric") => crate::model::metric(state, account, &arguments).await,
         Some("describe_dataset") => api::dataset(state, account, &name()),
         Some("query_rows") => match pairs(&arguments, &["filter", "select", "orderby", "top", "skip", "count"]) {

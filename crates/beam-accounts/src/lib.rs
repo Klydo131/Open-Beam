@@ -388,6 +388,32 @@ impl Store {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// How many descriptions, verified questions and watches are kept for
+    /// `dataset` (matched by name, as everywhere).
+    pub fn curation_count(&self, dataset: &str) -> Result<[u64; 3], AccountError> {
+        let conn = self.conn();
+        let mut counts = [0; 3];
+        for (slot, table) in counts.iter_mut().zip(["notes", "questions", "watches"]) {
+            let n: i64 = conn.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE dataset = ?1"),
+                [dataset],
+                |row| row.get(0),
+            )?;
+            *slot = n.unsigned_abs();
+        }
+        Ok(counts)
+    }
+
+    /// Deletes what was written about a dataset that no longer exists, so a
+    /// later dataset of the same name starts empty.
+    pub fn forget_dataset(&self, dataset: &str) -> Result<(), AccountError> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        forget_curation(&transaction, dataset)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn count(&self) -> Result<u64, AccountError> {
         let count: i64 = self
             .conn()

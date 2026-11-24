@@ -11,6 +11,7 @@ mod export;
 mod feed;
 mod mcp;
 mod model;
+mod model_edit;
 mod net;
 mod people;
 mod pgsql;
@@ -269,7 +270,8 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
         address.to_string(),
     );
     state.max_upload_bytes = config.max_upload_mb.saturating_mul(1024 * 1024);
-    state.model = model.map(Arc::new);
+    state.model = std::sync::RwLock::new(model.map(Arc::new));
+    state.model_path = config.ontology.clone();
     state.connections = Arc::new(net::Connections::with_trusted_proxies(config.trusted_proxies.clone()));
     let state = Arc::new(state);
     // Unreviewed drafts are swept hourly, not only at start-up.

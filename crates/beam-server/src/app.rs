@@ -37,8 +37,13 @@ pub struct AppState {
     /// Dataset profiles, each with the engine generation it was worked out
     /// at, so it is reused until the datasets change. Bounded.
     profiles: std::sync::Mutex<std::collections::HashMap<String, (u64, Profile)>>,
-    /// The model from the configuration, if one was written.
-    pub model: Option<Arc<crate::model::Model>>,
+    /// The model from the configuration, if one was written. Replaced as a
+    /// whole when an administrator applies a change.
+    pub model: std::sync::RwLock<Option<Arc<crate::model::Model>>>,
+    /// The file the model is read from and saved to, when there is one.
+    pub model_path: Option<std::path::PathBuf>,
+    /// Held while a change to the model is applied, so two cannot overlap.
+    pub model_edit: tokio::sync::Mutex<()>,
     /// The model's checks against the data and when they were made. An async
     /// lock, held while they run, so concurrent first views wait for one run.
     pub model_checks: tokio::sync::Mutex<Option<(std::time::Instant, Arc<crate::model::Checks>)>>,
@@ -63,7 +68,9 @@ impl AppState {
             connections: Arc::default(),
             previews: std::sync::Mutex::default(),
             profiles: std::sync::Mutex::default(),
-            model: None,
+            model: std::sync::RwLock::new(None),
+            model_path: None,
+            model_edit: tokio::sync::Mutex::const_new(()),
             model_checks: tokio::sync::Mutex::const_new(None),
         }
     }
@@ -83,6 +90,11 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .get(file)
             .cloned()
+    }
+
+    /// The model in force now.
+    pub fn model(&self) -> Option<Arc<crate::model::Model>> {
+        self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The profile of `dataset` if it was worked out since the datasets last
@@ -159,6 +171,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/watches", get(curate::overview))
         .route("/admin/system", get(system::page_route))
         .route("/model", get(crate::model::page_route))
+        .route("/model/edit", get(crate::model_edit::edit_route))
+        .route("/model/plan", post(crate::model_edit::plan_route))
+        .route("/model/apply", post(crate::model_edit::apply_route))
         .route("/datasets/{name}/export.csv", get(export::csv))
         .route("/datasets/{name}/export.xlsx", get(export::excel))
         .route("/datasets/{name}/share", get(uploads::sharing).post(uploads::share))

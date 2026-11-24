@@ -60,6 +60,15 @@ fn site(fresh: bool, max_page_size: u64) -> Site {
 
 /// [`site`] with a model, checked against its configured datasets.
 fn site_with_model(fresh: bool, max_page_size: u64, model: Option<&str>) -> Site {
+    build_site(fresh, max_page_size, model, false)
+}
+
+/// A site whose model is kept in a file that administrators may edit.
+fn editable_site(model: &str) -> Site {
+    build_site(false, 50, (!model.is_empty()).then_some(model), true)
+}
+
+fn build_site(fresh: bool, max_page_size: u64, model: Option<&str>, editable: bool) -> Site {
     let dir = tempfile::tempdir().unwrap();
     let sales = dir.path().join("sales.csv");
     std::fs::write(
@@ -95,7 +104,12 @@ fn site_with_model(fresh: bool, max_page_size: u64, model: Option<&str>) -> Site
         let sets = crate::model::configured_sets(&state.engine);
         let model = crate::model::parse(text, &sets).unwrap();
         model.add_joins(&state.engine).unwrap();
-        state.model = Some(Arc::new(model));
+        state.model = std::sync::RwLock::new(Some(Arc::new(model)));
+    }
+    if editable {
+        let path = dir.path().join("ontology.toml");
+        std::fs::write(&path, model.unwrap_or_default()).unwrap();
+        state.model_path = Some(path);
     }
     let state = Arc::new(state);
     Site {
@@ -4027,4 +4041,287 @@ async fn each_kind_of_rule_counts_exactly_the_rows_that_break_it() {
     let planned = beam_odata::plan_rule(&set, "n", &exact).unwrap();
     let rows = crate::feed::run(&state, planned.sql, &planned.params, 2).await.unwrap();
     assert_eq!(rows[0][1].as_f64(), Some(1.0), "9007199254740993 is above the bound");
+}
+
+// ------------------------------------------------------------ model editing
+
+const SALE_AND_ITEM: &str = r#"
+[[object]]
+name = "Sale"
+dataset = "sales"
+key = "order_id"
+
+[[object]]
+name = "Item"
+dataset = "many"
+key = "id"
+"#;
+
+const OF_ITEM: &str = r#"
+[[link]]
+name = "of_item"
+from = "Sale"
+to = "Item"
+column = "order_id"
+"#;
+
+/// Previews `text` as `who` and returns the page and the fingerprint the
+/// preview was made from.
+async fn preview(site: &Site, cookie: &str, csrf: &str, text: &str) -> (Reply, String) {
+    let reply = submit(site, cookie, csrf, "/model/plan", &[("text", text)]).await;
+    let marker = "name=\"digest\" value=\"";
+    let digest = reply
+        .body
+        .find(marker)
+        .map(|at| reply.body[at + marker.len()..at + marker.len() + 64].to_string())
+        .unwrap_or_default();
+    (reply, digest)
+}
+
+#[tokio::test]
+async fn only_administrators_can_change_the_model() {
+    let site = editable_site(SALE_AND_ITEM);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    assert!(!get(&site, "/model", Some(&bob)).await.body.contains("/model/edit"));
+    assert_eq!(
+        get(&site, "/model/edit", Some(&bob)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let text = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let digest = crate::model_edit::digest(SALE_AND_ITEM);
+    for uri in ["/model/plan", "/model/apply"] {
+        let reply = submit(&site, &bob, &csrf, uri, &[("text", &text), ("digest", &digest)]).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert!(site.state.engine.dataset("sales_with_many").is_none());
+    // An administrator without the anti-forgery token is refused too.
+    let (ada, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let forged = post(
+        &site,
+        "/model/apply",
+        Some(&ada),
+        &[("text", &text), ("digest", &digest), ("csrf", "x")],
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert!(site.state.engine.dataset("sales_with_many").is_none());
+    // A server with no model file offers no editing.
+    let fixed = site_with_model(false, 50, Some(SALE_AND_ITEM));
+    let (ada, _) = sign_in(&fixed, "ada", ADMIN_PASSWORD).await;
+    assert!(!get(&fixed, "/model", Some(&ada)).await.body.contains("/model/edit"));
+    assert_eq!(
+        get(&fixed, "/model/edit", Some(&ada)).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_preview_lists_the_change_and_applying_makes_it_live_and_saves_it() {
+    let site = editable_site(SALE_AND_ITEM);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let edit = get(&site, "/model/edit", Some(&ada)).await;
+    assert_eq!(edit.status, StatusCode::OK);
+    assert!(
+        edit.body.contains("dataset = &quot;sales&quot;") || edit.body.contains("dataset = \"sales\""),
+        "{}",
+        edit.body
+    );
+    let text = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let (shown, digest) = preview(&site, &ada, &csrf, &text).await;
+    assert_eq!(shown.status, StatusCode::OK);
+    assert!(shown.body.contains("Adds link of_item"), "{}", shown.body);
+    assert!(
+        shown.body.contains("Makes the joined dataset sales_with_many"),
+        "{}",
+        shown.body
+    );
+    // A preview changes nothing.
+    assert!(site.state.engine.dataset("sales_with_many").is_none());
+    let applied = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &text), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::SEE_OTHER, "{}", applied.body);
+    assert!(site.state.engine.dataset("sales_with_many").is_some());
+    assert_eq!(site.state.model().unwrap().links.len(), 1);
+    let path = site.state.model_path.clone().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    let (bob, _) = sign_in(&site, "bob", USER_PASSWORD).await;
+    assert_eq!(
+        get(&site, "/datasets/sales_with_many", Some(&bob)).await.status,
+        StatusCode::OK
+    );
+    // No leftover temporary file.
+    let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+        .collect();
+    assert!(left.is_empty());
+
+    // Removing the link removes its dataset and says what is lost with it.
+    site.state
+        .accounts
+        .set_note("sales_with_many", "", "joined sales", 1)
+        .unwrap();
+    let (shown, digest) = preview(&site, &ada, &csrf, SALE_AND_ITEM).await;
+    assert!(shown.body.contains("Removes link of_item"), "{}", shown.body);
+    assert!(
+        shown.body.contains(
+            "Removes the joined dataset sales_with_many, with its 1 description, 0 verified questions and 0 watches"
+        ),
+        "{}",
+        shown.body
+    );
+    let applied = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", SALE_AND_ITEM), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::SEE_OTHER, "{}", applied.body);
+    assert!(site.state.engine.dataset("sales_with_many").is_none());
+    assert_eq!(
+        site.state.accounts.curation_count("sales_with_many").unwrap(),
+        [0, 0, 0]
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SALE_AND_ITEM);
+}
+
+#[tokio::test]
+async fn a_model_with_problems_or_a_stale_preview_changes_nothing() {
+    let site = editable_site(SALE_AND_ITEM);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let path = site.state.model_path.clone().unwrap();
+    // A mistake is shown, with no way to apply it.
+    let broken =
+        format!("{SALE_AND_ITEM}[[link]]\nname = \"x\"\nfrom = \"Sale\"\nto = \"Nobody\"\ncolumn = \"order_id\"\n");
+    let (shown, digest) = preview(&site, &ada, &csrf, &broken).await;
+    assert!(shown.body.contains("Problems to fix"), "{}", shown.body);
+    assert!(!shown.body.contains("/model/apply"));
+    let digest = if digest.is_empty() {
+        crate::model_edit::digest(SALE_AND_ITEM)
+    } else {
+        digest
+    };
+    let refused = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &broken), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SALE_AND_ITEM);
+    // A preview made before someone else changed the file is refused.
+    let text = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let (_, digest) = preview(&site, &ada, &csrf, &text).await;
+    std::fs::write(&path, format!("{SALE_AND_ITEM}\n# changed elsewhere\n")).unwrap();
+    let stale = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &text), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert!(stale.body.contains("changed since this preview"), "{}", stale.body);
+    assert!(site.state.engine.dataset("sales_with_many").is_none());
+    assert!(site.state.model().unwrap().links.is_empty());
+}
+
+#[tokio::test]
+async fn an_edit_cannot_give_a_joined_dataset_the_name_of_an_upload() {
+    let site = editable_site(SALE_AND_ITEM);
+    let (bob, csrf_bob) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let saved = upload(&site, &bob, &csrf_bob, "w.csv", b"id\n1\n", "Sales_With_Many").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let text = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let (shown, _) = preview(&site, &ada, &csrf, &text).await;
+    assert!(
+        shown
+            .body
+            .contains("would take the name of a dataset that already exists"),
+        "{}",
+        shown.body
+    );
+    let digest = crate::model_edit::digest(SALE_AND_ITEM);
+    let refused = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &text), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(site.state.model().unwrap().links.is_empty());
+    // The model cannot describe the upload either.
+    let naming = format!("{SALE_AND_ITEM}[[object]]\nname = \"W\"\ndataset = \"Sales_With_Many\"\nkey = \"id\"\n");
+    let (shown, _) = preview(&site, &ada, &csrf, &naming).await;
+    assert!(shown.body.contains("Problems to fix"), "{}", shown.body);
+}
+
+#[tokio::test]
+async fn a_change_that_cannot_be_saved_puts_every_dataset_back() {
+    let start = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let site = editable_site(&start);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let path = site.state.model_path.clone().unwrap();
+    // The temporary file cannot be written, so saving fails after the
+    // joined datasets have already changed.
+    let partial = path.with_file_name(format!("ontology.toml.{}.partial", std::process::id()));
+    std::fs::create_dir(&partial).unwrap();
+    let renamed = start.replace(
+        "column = \"order_id\"",
+        "column = \"order_id\"\njoined = \"sale_items\"",
+    );
+    let (shown, digest) = preview(&site, &ada, &csrf, &renamed).await;
+    assert!(
+        shown.body.contains("Makes the joined dataset sale_items"),
+        "{}",
+        shown.body
+    );
+    let failed = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &renamed), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(failed.status, StatusCode::CONFLICT);
+    assert!(failed.body.contains("cannot save the model file"), "{}", failed.body);
+    assert!(site.state.engine.dataset("sale_items").is_none());
+    assert!(site.state.engine.dataset("sales_with_many").is_some());
+    assert_eq!(
+        site.state
+            .model()
+            .unwrap()
+            .joined(&site.state.model().unwrap().links[0]),
+        "sales_with_many"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), start);
+    // Once it can be saved, the same preview applies.
+    std::fs::remove_dir(&partial).unwrap();
+    let applied = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &renamed), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::SEE_OTHER, "{}", applied.body);
+    assert!(site.state.engine.dataset("sale_items").is_some());
+    assert!(site.state.engine.dataset("sales_with_many").is_none());
 }

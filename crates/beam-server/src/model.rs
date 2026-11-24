@@ -688,7 +688,8 @@ pub async fn metric(
         )
     };
     let text = |key: &str| arguments.get(key).and_then(Value::as_str);
-    let model = state.model.as_deref().ok_or_else(unknown)?;
+    let model = state.model().ok_or_else(unknown)?;
+    let model = model.as_ref();
     let metric = model
         .metrics
         .iter()
@@ -768,7 +769,7 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         Ok(signed) => signed,
         Err(response) => return response,
     };
-    let body = match state.model.clone() {
+    let body = match state.model() {
         None => html! {
             h1 { "Model" }
             p.empty { "No model has been written yet. An administrator can describe the business objects the datasets hold, and how they link, in a file named by ontology in beam.toml; see the guide." }
@@ -854,6 +855,11 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 }
             }
         }
+    };
+    let can_edit = state.model_path.is_some() && signed.session.account.role == beam_accounts::Role::Admin;
+    let body = html! {
+        (body)
+        @if can_edit { p { a.button.quiet href="/model/edit" { "Edit the model" } } }
     };
     page(StatusCode::OK, layout("Model", Some(&signed), body))
 }

@@ -154,11 +154,32 @@ whenever datasets change:
 - **All N point to one**, or how many rows of a link point to nothing:
   an order naming a customer who is not in the customers dataset.
 
+## Change it on a page
+
+Administrators see **Edit the model** on the Model page when the server
+was started with an `ontology` file. Nothing changes until the last step:
+
+1. **Edit** shows the file as it is now.
+2. **Preview change** runs every start-up check above and, when the model
+   is sound, lists what applying it does: each object, link, metric and
+   rule added, changed or removed, and each joined dataset made, made
+   again or removed. A removed joined dataset shows how many descriptions,
+   verified questions and watches go with it.
+3. **Apply change** makes the new model live at once, with no restart,
+   and saves the file. If any step fails, such as a joined dataset that
+   cannot be made or a file that cannot be saved, everything is put back
+   as it was.
+
+A preview made before the file changed, by another administrator or by
+hand, is refused: preview again to see the change against what is there
+now. Only one change applies at a time. What was written about a removed
+joined dataset is deleted with it, so it can never reappear on a later
+dataset of the same name.
+
 ## Where it comes from
 
 The design takes ideas, not code, from open projects: object types with a
 key and checked links in the style of typed graph schemas, a closed-world
 check that rejects any undeclared name, and a short reason on every link.
 It uses the W3C SKOS idea of preferred and alternative labels for
-synonyms. Its four rule kinds are the core of W3C SHACL. Editing the
-model on a page, with a review before the change applies, is planned next.
+synonyms. Its four rule kinds are the core of W3C SHACL.
