@@ -72,6 +72,15 @@ fn is_trusted(trusted: &[IpAddr], peer: IpAddr) -> bool {
     trusted.iter().any(|t| t.to_canonical() == peer)
 }
 
+/// An address as proxies write it: plain, with a port (`203.0.113.9:5555`,
+/// `[2001:db8::1]:443`), or in brackets.
+fn hop_address(hop: &str) -> Option<IpAddr> {
+    hop.parse::<IpAddr>()
+        .ok()
+        .or_else(|| hop.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| hop.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
+}
+
 /// The visitor's address. A request from a trusted reverse proxy names it
 /// in `X-Forwarded-For`; the list is read from the right, skipping the
 /// trusted proxies themselves, because only the entries our own proxies
@@ -89,12 +98,22 @@ pub fn visitor(peer: IpAddr, headers: &axum::http::HeaderMap, trusted: &[IpAddr]
         .map(str::trim)
         .collect::<Vec<_>>();
     while let Some(hop) = hops.pop() {
-        match hop.parse::<IpAddr>() {
-            Ok(ip) if is_trusted(trusted, ip) => continue,
-            Ok(ip) => return ip,
+        match hop_address(hop) {
+            Some(ip) if is_trusted(trusted, ip) => continue,
+            Some(ip) => return ip,
             // Something unreadable where an address should be: the chain
-            // cannot be trusted past this point.
-            Err(_) => return peer,
+            // cannot be trusted past this point. Said once, because such
+            // requests then have no address to limit.
+            None => {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "beam: a trusted proxy sent an X-Forwarded-For entry that is not an address; \
+                         per-address limits do not apply to such requests"
+                    );
+                }
+                return peer;
+            }
         }
     }
     peer
@@ -303,6 +322,28 @@ mod tests {
             HeaderValue::from_static("203.0.113.9, not-an-address"),
         );
         assert_eq!(visitor(proxy, &headers, &trusted), proxy);
+        // Proxies that add the visitor's port are understood.
+        for written in ["203.0.113.9:5555", "[2001:db8::7]:443", "[2001:db8::7]"] {
+            headers.insert("x-forwarded-for", HeaderValue::from_str(written).unwrap());
+            let expected = written
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap();
+            let expected = if written.starts_with('[') {
+                "2001:db8::7"
+            } else {
+                expected
+            };
+            assert_eq!(
+                visitor(proxy, &headers, &trusted),
+                expected.parse::<IpAddr>().unwrap(),
+                "{written}"
+            );
+        }
         // An IPv4-mapped peer still matches its IPv4 entry.
         let mapped: IpAddr = "::ffff:10.0.0.5".parse().unwrap();
         headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));

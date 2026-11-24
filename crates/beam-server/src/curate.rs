@@ -307,8 +307,10 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
         .collect();
     // Worked out once per change to the datasets, not on every visit: each
     // profile reads the whole dataset twice.
+    // A profile that could not be worked out is remembered as empty, so a
+    // dataset too large for the time limit does not rerun it on every visit.
     let figures = match state.remembered_profile(&set.name) {
-        Some(figures) => Some(figures),
+        Some(figures) => Some(figures).filter(|f| !f.is_empty()),
         None => {
             // Read before the query, so a change made while it runs makes
             // the result look old rather than current.
@@ -326,9 +328,7 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                 }
                 Err(_) => None,
             };
-            if let Some(figures) = &worked_out {
-                state.remember_profile(&set.name, generation, figures.clone());
-            }
+            state.remember_profile(&set.name, generation, worked_out.clone().unwrap_or_default());
             worked_out
         }
     };

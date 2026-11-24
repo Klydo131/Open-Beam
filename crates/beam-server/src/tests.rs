@@ -3592,3 +3592,15 @@ async fn a_profile_is_worked_out_once_and_again_when_the_datasets_change() {
     assert_eq!(saved.status, StatusCode::SEE_OTHER);
     assert!(site.state.remembered_profile("sales").is_none());
 }
+
+#[tokio::test]
+async fn a_profile_that_could_not_be_worked_out_is_not_retried_on_every_visit() {
+    let site = site(false, 100);
+    let (ada, _) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let generation = site.state.engine.generation();
+    site.state.remember_profile("sales", generation, Arc::default());
+    let queries = site.state.engine.stats().queries_total;
+    let about = get(&site, "/datasets/sales/about", Some(&ada)).await;
+    assert!(about.body.contains("could not be worked out in time"));
+    assert_eq!(site.state.engine.stats().queries_total, queries);
+}

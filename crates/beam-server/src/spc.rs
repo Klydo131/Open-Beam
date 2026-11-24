@@ -24,6 +24,8 @@ pub const RUN: usize = 8;
 /// For a normal process the median moving range is about 0.954 σ, so
 /// 3 σ ≈ 3.145 median moving ranges.
 const LIMIT_FACTOR: f64 = 3.145;
+/// The classic XmR factor: 3 σ ≈ 2.66 average moving ranges (3 / 1.128).
+const AVERAGE_FACTOR: f64 = 2.66;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Signal {
@@ -72,8 +74,24 @@ pub fn judge(values: &[f64]) -> Option<Verdict> {
     let baseline = &before[before.len().saturating_sub(BASELINE)..];
     let middle = median(&mut baseline.to_vec());
     let mut ranges: Vec<f64> = baseline.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-    let spread = LIMIT_FACTOR * median(&mut ranges);
-    let (lower, upper) = (middle - spread, middle + spread);
+    let average_range = ranges.iter().sum::<f64>() / ranges.len() as f64;
+    // Counts that mostly repeat exactly (10, 10, 11, 10, 9, 10, …) have a
+    // median moving range of 0, which would call every change unusual;
+    // then the classic limits from the average moving range are used.
+    let median_range = median(&mut ranges);
+    let (lower, upper) = if median_range > 0.0 {
+        let spread = LIMIT_FACTOR * median_range;
+        (middle - spread, middle + spread)
+    } else {
+        // "Chunky" data, too coarse for the usual limits: the classic ones,
+        // widened so that a value the history already shows is never
+        // called out of the ordinary.
+        let spread = AVERAGE_FACTOR * average_range;
+        let (low, high) = baseline
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| (l.min(*v), h.max(*v)));
+        ((middle - spread).min(low), (middle + spread).max(high))
+    };
     let recent = &values[values.len() - RUN.min(values.len())..];
     let signal = if latest > upper || latest < lower {
         Signal::Outside
@@ -139,6 +157,23 @@ mod tests {
         // With the average moving range the spike would stretch the limits
         // past 130; the median ignores it.
         assert_eq!(judge(&values).unwrap().signal, Signal::Outside);
+    }
+
+    #[test]
+    fn counts_that_mostly_repeat_alert_only_on_real_departures() {
+        // Daily counts: mostly 10, with the odd 9 and 11, so most moving
+        // ranges are 0.
+        let mut values = vec![10.0, 10.0, 10.0, 11.0, 10.0, 10.0, 10.0, 10.0, 9.0, 10.0, 10.0, 10.0];
+        values.push(11.0);
+        let verdict = judge(&values).unwrap();
+        assert_eq!(verdict.signal, Signal::None, "{verdict:?}");
+        values.pop();
+        values.push(14.0);
+        assert_eq!(judge(&values).unwrap().signal, Signal::Outside);
+        // A figure that has never moved: any change is out of the ordinary.
+        let mut flat = vec![5.0; 10];
+        flat.push(6.0);
+        assert_eq!(judge(&flat).unwrap().signal, Signal::Outside);
     }
 
     #[test]
