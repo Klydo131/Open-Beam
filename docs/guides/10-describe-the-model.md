@@ -41,6 +41,33 @@ to = "Customer"
 column = "customer_id"
 ```
 
+## Joined datasets
+
+Each link adds a dataset that joins the two, named after them:
+`orders_with_customers` holds every order with its customer's columns,
+named after the object (`customer_name`, `customer_team`). It works
+everywhere a dataset does: the table and chart, the profile, Excel and
+Power BI, the API, AI assistants and watches. Everyone who can see the
+two datasets can see it.
+
+- Every order appears once, in its own order. If a customer key repeats
+  (the Model page shows it), one of those rows is used, the same one
+  every time. An order whose customer is missing keeps empty values.
+- When both datasets are kept as fast copies, so is the join, so it
+  reads as quickly as either of them. It is made again when either file
+  changes and the server restarts.
+- Two links between the same pair of objects need their own names; give
+  one with `joined`:
+
+```toml
+[[link]]
+name = "shipped_to"
+from = "Order"
+to = "Customer"
+column = "ship_to_id"
+joined = "orders_with_ship_to"
+```
+
 ## What is checked
 
 When the server starts, the model must be exact; otherwise Open Beam
@@ -52,7 +79,9 @@ refuses to start and lists every problem:
 - each dataset describes one object, and each word (name, label or
   synonym) means one object only, so nobody, person or assistant, has to
   guess which is meant;
-- a link joins like values: numbers to numbers, text to text;
+- a link joins like values: numbers to numbers, text to text, and never
+  an object to itself;
+- each joined dataset has a name of its own, not already a dataset's;
 - descriptions are plain text of reasonable length.
 
 The **Model** page then checks the model against the data, and again
@@ -69,4 +98,4 @@ The design takes ideas, not code, from open projects: object types with a
 key and checked links in the style of typed graph schemas, a closed-world
 check that rejects any undeclared name, and a short reason on every link.
 It uses the W3C SKOS idea of preferred and alternative labels for
-synonyms. Metrics and joins along links are planned next.
+synonyms. Metrics defined once on an object are planned next.

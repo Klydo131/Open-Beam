@@ -93,7 +93,9 @@ fn site_with_model(fresh: bool, max_page_size: u64, model: Option<&str>) -> Site
     let mut state = AppState::new(engine, accounts, max_page_size, None, "127.0.0.1:8787".into());
     if let Some(text) = model {
         let sets = crate::model::configured_sets(&state.engine);
-        state.model = Some(Arc::new(crate::model::parse(text, &sets).unwrap()));
+        let model = crate::model::parse(text, &sets).unwrap();
+        model.add_joins(&state.engine).unwrap();
+        state.model = Some(Arc::new(model));
     }
     let state = Arc::new(state);
     Site {
@@ -3744,4 +3746,54 @@ async fn the_model_can_never_name_a_private_upload_and_reports_bad_keys_and_link
     let page = get(&site, "/model", Some(&ada)).await;
     assert!(page.body.contains("1 repeated, 0 empty keys"), "{}", page.body);
     assert!(page.body.contains("120 point to nothing"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn each_link_adds_a_joined_dataset_that_every_way_in_can_read() {
+    let model = r#"
+        [[object]]
+        name = "Sale"
+        dataset = "sales"
+        key = "order_id"
+
+        [[object]]
+        name = "Item"
+        dataset = "many"
+        key = "id"
+
+        [[link]]
+        name = "of_item"
+        from = "Sale"
+        to = "Item"
+        column = "order_id"
+    "#;
+    let site = site_with_model(false, 50, Some(model));
+    let (bob, _) = sign_in(&site, "bob", USER_PASSWORD).await;
+    // The website: every sale with its item's label, in order.
+    let table = get(&site, "/datasets/sales_with_many", Some(&bob)).await;
+    assert_eq!(table.status, StatusCode::OK);
+    assert!(
+        table.body.contains("item_label") && table.body.contains("item 3"),
+        "{}",
+        table.body
+    );
+    // The data feed, for Excel and Power BI.
+    let rows = feed(
+        &site,
+        "/odata/sales_with_many?$select=order_id,item_label&$orderby=order_id",
+    )
+    .await;
+    assert_eq!(rows.status, StatusCode::OK);
+    let values = rows.json()["value"].clone();
+    assert_eq!(values.as_array().unwrap().len(), 4, "one row per sale: {values}");
+    assert_eq!(values[1]["item_label"], "item 2");
+    // The model names it, for people and assistants.
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    assert!(get(&site, "/model", Some(&ada))
+        .await
+        .body
+        .contains("href=\"/datasets/sales_with_many\""));
+    let token = new_token(&site, &ada, &csrf, "t").await;
+    let described = mcp_call(&site, &token, "describe_model", json!({})).await;
+    assert_eq!(described["links"][0]["joined_dataset"], "sales_with_many");
 }

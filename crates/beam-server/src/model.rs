@@ -66,6 +66,9 @@ pub struct Link {
     pub to: String,
     pub column: String,
     pub description: Option<String>,
+    /// Name of the dataset that joins the two; `{from dataset}_with_{to
+    /// dataset}` when not given.
+    pub joined: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,6 +80,43 @@ pub struct Model {
 impl Object {
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+}
+
+impl Model {
+    pub fn object(&self, name: &str) -> Option<&Object> {
+        self.objects.iter().find(|o| o.name == name)
+    }
+
+    /// The dataset `link` adds: its rows of `from`, with the columns of the
+    /// object each one names.
+    pub fn joined(&self, link: &Link) -> String {
+        link.joined.clone().unwrap_or_else(|| {
+            let dataset = |name: &str| self.object(name).map_or("", |o| o.dataset.as_str()).to_string();
+            format!("{}_with_{}", dataset(&link.from), dataset(&link.to))
+        })
+    }
+
+    /// Adds every link's joined dataset to `engine`. Called before uploads
+    /// are restored, so these names are never taken by an upload.
+    pub fn add_joins(&self, engine: &beam_engine::Engine) -> Result<(), String> {
+        for link in &self.links {
+            let (Some(from), Some(to)) = (self.object(&link.from), self.object(&link.to)) else {
+                continue; // refused by parse
+            };
+            let name = self.joined(link);
+            engine
+                .add_lookup(
+                    &name,
+                    &from.dataset,
+                    &link.column,
+                    &to.dataset,
+                    &to.key,
+                    &to.name.to_lowercase(),
+                )
+                .map_err(|e| format!("link {}: cannot make {name}: {e}", link.name))?;
+        }
+        Ok(())
     }
 }
 
@@ -188,6 +228,7 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
 
     let object = |name: &str| file.objects.iter().find(|o| o.name == name);
     let mut link_names = HashSet::new();
+    let mut joined_names: HashSet<String> = sets.iter().map(|s| s.name.to_ascii_lowercase()).collect();
     for link in &file.links {
         let at = format!("link {}", link.name);
         if !is_name(&link.name) {
@@ -215,6 +256,22 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
             problems.push(format!("{at}: from and to must be declared objects"));
             continue;
         };
+        if from.name == to.name {
+            problems.push(format!("{at}: an object cannot link to itself"));
+        }
+        let joined = link
+            .joined
+            .clone()
+            .unwrap_or_else(|| format!("{}_with_{}", from.dataset, to.dataset));
+        if !is_name(&joined) {
+            problems.push(format!(
+                "{at}: joined must be letters, digits and _, starting with a letter"
+            ));
+        } else if !joined_names.insert(joined.to_ascii_lowercase()) {
+            problems.push(format!(
+                "{at}: the dataset {joined} already exists; give this link its own joined name"
+            ));
+        }
         let (Some(from_set), Some(to_set)) = (set(&from.dataset), set(&to.dataset)) else {
             continue; // reported with the object
         };
@@ -320,6 +377,7 @@ pub fn describe(model: Option<&Model>) -> Value {
             "column": l.column,
             "meaning": format!("Each {} names one {} in {}.", l.from, l.to, l.column),
             "description": l.description,
+            "joined_dataset": model.joined(l),
         })).collect::<Vec<_>>(),
     })
 }
@@ -382,13 +440,14 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                     h2 { "Links" }
                     @if model.links.is_empty() { p.empty { "No links declared." } } @else {
                         div.tablewrap { table {
-                            thead { tr { th { "Link" } th { "Meaning" } th { "Check" } } }
+                            thead { tr { th { "Link" } th { "Meaning" } th { "Joined dataset" } th { "Check" } } }
                             tbody {
                                 @for (index, link) in model.links.iter().enumerate() {
                                     tr {
                                         th scope="row" { (link.name)
                                             @if let Some(text) = &link.description { p.hint { (text) } } }
                                         td { "Each " (link.from) " names one " (link.to) " in " code { (link.column) } }
+                                        td { @let joined = model.joined(link); a href={ "/datasets/" (joined) } { (joined) } }
                                         td { (link_status(checks.links.get(index).copied().flatten())) }
                                     }
                                 }
@@ -519,6 +578,21 @@ mod tests {
         );
         let control = GOOD.replace("A person or company", "A person\u{0007}");
         assert!(parse(&control, &sets()).is_err());
+        let clash = GOOD.replace(
+            "description = \"The customer who placed the order.\"",
+            "joined = \"customers\"",
+        );
+        assert!(parse(&clash, &sets())
+            .unwrap_err()
+            .join("\n")
+            .contains("the dataset customers already exists"));
+        let to_itself = GOOD
+            .replace("to = \"Customer\"", "to = \"Order\"")
+            .replace("column = \"customer_id\"", "column = \"order_id\"");
+        assert!(parse(&to_itself, &sets())
+            .unwrap_err()
+            .join("\n")
+            .contains("cannot link to itself"));
         let repeated = format!(
             "{GOOD}\n[[link]]\nname = \"again\"\nfrom = \"Order\"\nto = \"Customer\"\ncolumn = \"customer_id\"\n"
         );

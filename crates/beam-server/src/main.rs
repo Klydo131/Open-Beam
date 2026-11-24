@@ -182,12 +182,17 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     let engine = beam_engine::Engine::open_with_options(&config.dataset_specs(), upload_dir, &config.limits())
         .map_err(|e| e.to_string())?;
     engine.set_query_timeout(std::time::Duration::from_secs(config.query_timeout_seconds));
+    // Checked, and its joined datasets made, before anything listens and
+    // before uploads return, so a mistake stops the start and configured
+    // names always win.
+    let model = load_model(&config, &engine)?;
+    if let Some(model) = &model {
+        model.add_joins(&engine)?;
+    }
     restore_uploads(&engine, &accounts);
     // Copies left by datasets that no longer exist, or whose files changed.
     engine.prune_cache();
     review::remove_expired_drafts(&engine, &accounts, review::DRAFT_DAYS);
-    // Checked before anything listens, so a mistake stops the start.
-    let model = load_model(&config, &engine)?;
 
     let postgres = match config.postgres_bind {
         Some(bind) => Some(

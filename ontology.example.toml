@@ -24,7 +24,9 @@ key = "order_id"
 synonyms = ["sale", "purchase"]
 description = "One order placed by one customer."
 
-# Each order names one customer, in its customer_id column.
+# Each order names one customer, in its customer_id column. This also adds
+# the dataset orders_with_customers: every order with its customer's
+# columns (customer_name, ...). Set `joined = "..."` to name it yourself.
 [[link]]
 name = "placed_by"
 from = "Order"

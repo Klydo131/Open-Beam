@@ -537,6 +537,102 @@ impl Engine {
 
     /// Removes a dataset added with [`Engine::add_upload`]. The file is left
     /// for the caller to delete.
+    /// Adds `name`: every row of `from`, with the columns of the one `to`
+    /// row whose `key` equals its `column`, named `{prefix}_{column}`. Rows
+    /// keep `from`'s order and are never multiplied: when a key repeats in
+    /// `to`, one of its rows is chosen, the same one every time. Rows with no
+    /// match keep empty values. The caller checks that the columns exist and
+    /// hold like values; names are quoted here, never taken from requests.
+    pub fn add_lookup(
+        &self,
+        name: &str,
+        from: &str,
+        column: &str,
+        to: &str,
+        key: &str,
+        prefix: &str,
+    ) -> Result<Dataset, EngineError> {
+        let _adding = self.adding.lock().unwrap_or_else(|e| e.into_inner());
+        let (from_set, to_set) = match (self.dataset(from), self.dataset(to)) {
+            (Some(f), Some(t)) => (f, t),
+            _ => return Err(EngineError::InvalidName(name.to_string())),
+        };
+        let taken = self.dataset(name).is_some();
+        if !is_identifier(name) || taken || from == to {
+            return Err(EngineError::InvalidName(name.to_string()));
+        }
+        let own: Vec<String> = from_set
+            .columns
+            .iter()
+            .filter(|c| c.name != ROW_KEY)
+            .map(|c| format!("f.{}", quote_ident(&c.name)))
+            .collect();
+        let looked_up: Vec<&Column> = to_set.columns.iter().filter(|c| c.name != ROW_KEY).collect();
+        let picked = looked_up
+            .iter()
+            .map(|c| {
+                format!(
+                    "t.{} AS {}",
+                    quote_ident(&c.name),
+                    quote_ident(&format!("{prefix}_{}", c.name))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tie_break = looked_up
+            .iter()
+            .map(|c| quote_ident(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order = if from_set.columns.iter().any(|c| c.name == ROW_KEY) {
+            format!(" ORDER BY f.{}", quote_ident(ROW_KEY))
+        } else {
+            String::new()
+        };
+        let (k, c) = (quote_ident(key), quote_ident(column));
+        let sql = format!(
+            "SELECT {own}, {picked} FROM {from} f \
+             LEFT JOIN (SELECT DISTINCT ON ({k}) * FROM {to} ORDER BY {tie_break}) t ON f.{c} = t.{k}{order}",
+            own = own.join(", "),
+            from = quote_ident(from),
+            to = quote_ident(to),
+        );
+        let spec = DatasetSpec {
+            name: name.to_string(),
+            source: Source::Query(sql.clone()),
+            key: None,
+        };
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+        let dataset = create_view(&conn, &spec, &format!("({sql}) AS query"))?;
+        // When both sides are column-store copies, so is the join: both are
+        // fixed while the server runs. The key covers the copies, which change
+        // with their files, and the join itself.
+        let copies = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(from).cloned().zip(cache.get(to).cloned())
+        };
+        if let (Some(dir), Some((from_copy, to_copy))) = (self.upload_dir.as_deref(), copies) {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (CACHE_VERSION, &from_copy, &to_copy, &sql).hash(&mut hasher);
+            match materialize(&conn, dir, &dataset, hasher.finish()) {
+                Ok(file) => {
+                    self.cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(dataset.name.clone(), file);
+                }
+                Err(e) => eprintln!("beam: dataset '{name}' is joined on every read: {e}"),
+            }
+        }
+        self.datasets
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dataset.clone());
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(dataset)
+    }
+
     /// Changes whenever the datasets do: one is added or removed. Data in
     /// files is read when the server starts, so it is current until then.
     pub fn generation(&self) -> u64 {
@@ -1942,6 +2038,136 @@ mod tests {
             (stats.queries_busy, stats.queries_total, stats.queries_running),
             (1, 2, 0)
         );
+    }
+
+    #[test]
+    fn a_lookup_adds_the_linked_columns_without_losing_or_multiplying_rows() {
+        let engine = Engine::open(&[
+            // Customer 2 appears twice; order 30 names a customer who is not there.
+            query_spec(
+                "customers",
+                "SELECT * FROM (VALUES (1, 'Ana'), (2, 'Ben'), (2, 'Bea')) t(customer_id, name)",
+            ),
+            query_spec(
+                "orders",
+                "SELECT * FROM (VALUES (10, 2, 5.0), (20, 1, 7.5), (30, 9, 1.0)) t(order_id, customer_id, amount)",
+            ),
+        ])
+        .unwrap();
+        let joined = engine
+            .add_lookup(
+                "orders_with_customers",
+                "orders",
+                "customer_id",
+                "customers",
+                "customer_id",
+                "customer",
+            )
+            .unwrap();
+        let names: Vec<&str> = joined.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                ROW_KEY,
+                "order_id",
+                "customer_id",
+                "amount",
+                "customer_customer_id",
+                "customer_name"
+            ]
+        );
+        let rows = engine
+            .query(
+                &format!("SELECT order_id, customer_name FROM orders_with_customers ORDER BY {ROW_KEY}"),
+                &[],
+                2,
+            )
+            .unwrap();
+        // Every order once, in order; the repeated key picks the same row
+        // every time ("Bea" sorts first); no match stays empty.
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!(10), json!("Bea")],
+                vec![json!(20), json!("Ana")],
+                vec![json!(30), json!(null)],
+            ]
+        );
+        // Without an upload folder there is nowhere to keep a copy.
+        assert_eq!(engine.stats().cached_datasets, 0);
+        // A name already in use, or a dataset joined to itself, is refused.
+        assert!(engine
+            .add_lookup("orders", "orders", "customer_id", "customers", "customer_id", "c")
+            .is_err());
+        assert!(engine
+            .add_lookup("self_join", "orders", "order_id", "orders", "order_id", "o")
+            .is_err());
+    }
+
+    #[test]
+    fn a_lookup_between_column_store_copies_is_kept_as_one_too() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("c.csv"), "customer_id,name\n1,Ana\n2,Ben\n").unwrap();
+        fs::write(dir.path().join("o.csv"), "order_id,customer_id\n10,2\n20,1\n30,9\n").unwrap();
+        let uploads = dir.path().join("uploads");
+        let open = || {
+            Engine::open_with_uploads(
+                &[
+                    spec("customers", &dir.path().join("c.csv"), None),
+                    spec("orders", &dir.path().join("o.csv"), None),
+                ],
+                Some(&uploads),
+            )
+            .unwrap()
+        };
+        let engine = open();
+        engine
+            .add_lookup(
+                "orders_with_customers",
+                "orders",
+                "customer_id",
+                "customers",
+                "customer_id",
+                "customer",
+            )
+            .unwrap();
+        let view = engine
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM duckdb_views() WHERE view_name = 'orders_with_customers'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(view.contains("read_parquet"), "the join reads its copy: {view}");
+        let sql = format!("SELECT order_id, customer_name FROM orders_with_customers ORDER BY {ROW_KEY}");
+        let expected = vec![
+            vec![json!(10), json!("Ben")],
+            vec![json!(20), json!("Ana")],
+            vec![json!(30), json!(null)],
+        ];
+        assert_eq!(engine.query(&sql, &[], 2).unwrap(), expected);
+        // Kept by the clean-up of stale copies.
+        assert_eq!(engine.prune_cache(), 0);
+        drop(engine);
+
+        // A changed source makes a fresh joined copy with the new answer.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(dir.path().join("c.csv"), "customer_id,name\n1,Ana\n2,Bo\n").unwrap();
+        let again = open();
+        again
+            .add_lookup(
+                "orders_with_customers",
+                "orders",
+                "customer_id",
+                "customers",
+                "customer_id",
+                "customer",
+            )
+            .unwrap();
+        assert_eq!(again.query(&sql, &[], 2).unwrap()[0], vec![json!(10), json!("Bo")]);
     }
 
     #[test]
