@@ -294,6 +294,67 @@ async fn check(
     }
 }
 
+/// Control totals and the five-number summary of the number columns: the
+/// figures to reconcile against the source, and where most values lie.
+async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Property]) -> Markup {
+    if numbers.is_empty() {
+        return html! {};
+    }
+    let shown: Vec<&str> = numbers
+        .iter()
+        .take(beam_odata::MAX_PROFILE_COLUMNS)
+        .map(|p| p.name.as_str())
+        .collect();
+    let result = match beam_odata::plan_profile(set, &shown) {
+        Ok(planned) => {
+            let width = 1 + shown.len() * beam_odata::PROFILE_WIDTH;
+            feed::run(state, planned.sql, &planned.params, width).await.ok()
+        }
+        Err(_) => None,
+    };
+    let figures: Option<Vec<Option<f64>>> =
+        result.and_then(|rows| rows.first().map(|row| row.iter().map(Value::as_f64).collect()));
+    let show = |v: Option<f64>| v.map_or("—".to_string(), format_number);
+    html! {
+        section.panel {
+            h2 { "Profile" }
+            @match figures {
+                None => p.empty { "The profile could not be worked out in time." },
+                Some(figures) => {
+                    p.hint {
+                        (show(figures[0])) " rows. Compare the row count and totals with the source to check nothing was lost or doubled. "
+                        "The middle five figures show where values lie: half of them are between the quarter marks."
+                    }
+                    div.tablewrap {
+                        table {
+                            thead { tr {
+                                th { "Column" } th.num { "Values" } th.num { "Total" } th.num { "Smallest" }
+                                th.num { "Lower quarter" } th.num { "Middle" } th.num { "Upper quarter" } th.num { "Largest" }
+                                th.num title="Values more than 1.5 times the spread between the quarter marks beyond them (Tukey's fences)" { "Far out" }
+                            } }
+                            tbody {
+                                @for (index, name) in shown.iter().enumerate() {
+                                    @let at = 1 + index * beam_odata::PROFILE_WIDTH;
+                                    tr {
+                                        th scope="row" { (name) }
+                                        @for offset in 0..beam_odata::PROFILE_WIDTH {
+                                            td.num { (show(figures.get(at + offset).copied().flatten())) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    @if numbers.len() > shown.len() {
+                        p.hint { "The first " (shown.len()) " number columns are shown." }
+                    }
+                    p.hint { "Far out values are worth a look, not necessarily wrong: they lie unusually far from the rest (Tukey's fences, from 1977)." }
+                }
+            }
+        }
+    }
+}
+
 /// Judges the latest period of `points` (oldest first) against the range
 /// the measure usually moves in; see [`crate::spc`].
 fn steady(settings: &[(String, String)], points: &[(String, f64)]) -> (WatchStatus, String, Option<f64>) {
@@ -508,6 +569,7 @@ pub async fn about(
                 )
         })
         .collect();
+    let profile = profile_section(&state, set, &numbers).await;
 
     let body = html! {
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
@@ -555,6 +617,8 @@ pub async fn about(
                 }
             }
         }
+
+        (profile)
 
         section.panel {
             h2 { "Verified questions" }

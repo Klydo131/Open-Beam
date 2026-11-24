@@ -137,6 +137,65 @@ pub fn plan_total(
     })
 }
 
+/// Number columns profiled at most, to bound the cost of one profile.
+pub const MAX_PROFILE_COLUMNS: usize = 12;
+
+/// Figures returned per profiled column, in order: count, sum (the control
+/// total), minimum, lower quartile, median, upper quartile, maximum, and how
+/// many values lie beyond Tukey's fences (1.5 interquartile ranges outside
+/// the quartiles).
+pub const PROFILE_WIDTH: usize = 8;
+
+/// Control totals and the five-number summary of number columns: returns one
+/// row with the number of rows, then [`PROFILE_WIDTH`] figures per column.
+pub fn plan_profile(set: &EntitySet, columns: &[&str]) -> Result<Summary, QueryError> {
+    if columns.is_empty() || columns.len() > MAX_PROFILE_COLUMNS {
+        return Err(QueryError::InvalidValue("columns"));
+    }
+    let mut idents = Vec::with_capacity(columns.len());
+    for name in columns {
+        let property = set
+            .property(name)
+            .ok_or_else(|| QueryError::UnknownProperty(name.to_string()))?;
+        if !matches!(
+            property.edm,
+            EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+        ) {
+            return Err(QueryError::InvalidValue("columns"));
+        }
+        idents.push(quote_ident(&property.name));
+    }
+    let quartiles = idents
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("quantile_cont({c}, 0.25) AS q1_{i}, quantile_cont({c}, 0.75) AS q3_{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let figures = idents
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let fence = format!("1.5 * (q.q3_{i} - q.q1_{i})");
+            format!(
+                "CAST(count({c}) AS DOUBLE), CAST(sum({c}) AS DOUBLE), CAST(min({c}) AS DOUBLE), \
+                 CAST(any_value(q.q1_{i}) AS DOUBLE), CAST(quantile_cont({c}, 0.5) AS DOUBLE), \
+                 CAST(any_value(q.q3_{i}) AS DOUBLE), CAST(max({c}) AS DOUBLE), \
+                 CAST(count(*) FILTER (WHERE {c} < q.q1_{i} - {fence} OR {c} > q.q3_{i} + {fence}) AS DOUBLE)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = quote_ident(&set.name);
+    Ok(Summary {
+        sql: format!(
+            "WITH q AS (SELECT {quartiles} FROM {table}) \
+             SELECT CAST(count(*) AS DOUBLE), {figures} FROM {table}, q"
+        ),
+        params: Vec::new(),
+        ordered: false,
+    })
+}
+
 /// How often records repeat: returns one row of `(groups, extra)` where
 /// `groups` counts combinations of `keys` that appear more than once, and
 /// `extra` counts the rows beyond the first of each. Rows where every key is

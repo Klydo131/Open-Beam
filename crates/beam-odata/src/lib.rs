@@ -14,7 +14,10 @@ mod summary;
 pub use filter::{Expr, FilterError};
 pub use metadata::{metadata_xml, service_document};
 pub use query::{plan, Plan, QueryError};
-pub use summary::{plan_repeats, plan_summary, plan_total, Aggregate, Bucket, Summary};
+pub use summary::{
+    plan_profile, plan_repeats, plan_summary, plan_total, Aggregate, Bucket, Summary, MAX_PROFILE_COLUMNS,
+    PROFILE_WIDTH,
+};
 
 /// The subset of EDM primitive types Open Beam exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

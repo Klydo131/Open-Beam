@@ -39,6 +39,23 @@ verified question when one matches, and to say who verified it.
 If the data changes so that a question no longer fits (for example a column
 is removed), the answer says so instead of guessing.
 
+## Check the figures: the profile
+
+The About view also shows a **Profile** of every number column (the first
+12). It reads the whole dataset each time the page opens, so it is always
+current:
+
+- **Rows, values and total.** These are control totals, the check
+  bookkeepers have used for centuries: compare them with the source
+  (the total of the column in the original spreadsheet or system) to
+  confirm nothing was lost or counted twice on the way in.
+- **Smallest, lower quarter, middle, upper quarter, largest.** Where the
+  values lie: half of them are between the two quarter marks.
+- **Far out.** How many values lie more than one and a half times the
+  distance between the quarter marks beyond them (Tukey's fences). They
+  are worth a look, not necessarily wrong: a large order is real, a
+  misplaced decimal point is not.
+
 ## Watch for problems
 
 A watch is a check that runs every hour and at start-up. Add one under

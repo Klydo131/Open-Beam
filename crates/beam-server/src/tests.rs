@@ -3481,3 +3481,53 @@ async fn a_usual_range_watch_learns_from_history_and_flags_what_falls_outside() 
     let about = get(&site, "/datasets/usual/about", Some(&ada)).await;
     assert!(about.body.contains("stays in its usual range"));
 }
+
+#[tokio::test]
+async fn the_about_page_profiles_number_columns_with_control_totals_and_far_out_values() {
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    // The cells of one profiled column, in order.
+    let cells = |body: &str, column: &str| -> Vec<String> {
+        let start = body
+            .find(&format!("<th scope=\"row\">{column}</th>"))
+            .unwrap_or_else(|| panic!("no profile row for {column}"));
+        let row = &body[start..start + body[start..].find("</tr>").unwrap()];
+        row.split("<td class=\"num\">")
+            .skip(1)
+            .map(|c| c.split('<').next().unwrap().to_string())
+            .collect()
+    };
+    let about = get(&site, "/datasets/sales/about", Some(&ada)).await;
+    assert!(about.body.contains("<h2>Profile</h2>"), "{}", about.body);
+    let amount = cells(&about.body, "amount");
+    // 10.5 + 20 + 30.25 + 40: four values, total 100.75, none far out.
+    assert_eq!(
+        [&amount[0], &amount[1], &amount[2], &amount[6], &amount[7]],
+        ["4", "100.75", "10.5", "40", "0"]
+    );
+    // The row number is not a measure and is not profiled.
+    assert!(!about
+        .body
+        .contains(&format!("<th scope=\"row\">{}</th>", beam_engine::ROW_KEY)));
+
+    // Values beyond Tukey's fences are counted, and empty cells are not values.
+    let mut csv = String::from("id,score\n");
+    for n in 1..=20 {
+        csv.push_str(&format!("{n},{n}\n"));
+    }
+    // Quartiles 6.25 and 16.75, so the upper fence is 32.5: 40 is just
+    // beyond it and 1000 far beyond.
+    csv.push_str("21,40\n22,1000\n23,\n");
+    let saved = upload(&site, &ada, &csrf, "scores.csv", csv.as_bytes(), "scores").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let about = get(&site, "/datasets/scores/about", Some(&ada)).await;
+    let score = cells(&about.body, "score");
+    assert_eq!(
+        [&score[0], &score[1], &score[2], &score[3], &score[4], &score[5], &score[6], &score[7]],
+        ["22", "1,250", "1", "6.25", "11.5", "16.75", "1,000", "2"]
+    );
+    assert!(
+        about.body.contains("23 rows"),
+        "the row count includes the row with no score"
+    );
+}
