@@ -463,7 +463,8 @@ pub async fn dataset(
                             @let next = if active && !view.descending { "desc" } else { "asc" };
                             th aria-sort=[active.then_some(if view.descending { "descending" } else { "ascending" })] {
                                 a href=(table_link(set, &query, 1, Some((&property.name, next)))) {
-                                    (property.name)
+                                    // The row number the engine adds reads as a plain "#".
+                                    (if property.name == beam_engine::ROW_KEY { "#" } else { property.name.as_str() })
                                     @if active { span.arrow aria-hidden="true" { (if view.descending { " ▼" } else { " ▲" }) } }
                                 }
                             }
@@ -482,8 +483,8 @@ pub async fn dataset(
             @if !rows.is_empty() {
                 span { "Rows " (thousands(first)) "–" (thousands(last)) " of " (thousands(total)) }
             }
-            @if page_number > 1 { a href=(table_link(set, &query, page_number - 1, None)) { "← Previous" } }
-            @if has_next { a href=(table_link(set, &query, page_number + 1, None)) { "Next →" } }
+            @if page_number > 1 { a href=(table_link(set, &query, page_number - 1, None)) { "Previous" } }
+            @if has_next { a href=(table_link(set, &query, page_number + 1, None)) { "Next" } }
         }
         section.panel.elsewhere {
             h2 { "Use this data somewhere else" }
@@ -494,11 +495,11 @@ pub async fn dataset(
                 }
                 li {
                     strong { "Google Sheets" }
-                    span { "Select " a href=(with_query(&format!("/datasets/{}/export.csv", set.name), &here)) download { "Download CSV" } ", then in Sheets choose File → Import → Upload." }
+                    span { "Select " a href=(with_query(&format!("/datasets/{}/export.csv", set.name), &here)) download { "Download CSV" } ", then in Sheets choose File > Import > Upload." }
                 }
                 li {
                     strong { "Power BI" }
-                    span { "Choose Get Data → OData feed, enter " code { (feed::base_url(&state, &headers)) "/odata/" } " and sign in with Basic using your Open Beam username and password. It stays up to date when you refresh." }
+                    span { "Choose Get Data > OData feed, enter " code { (feed::base_url(&state, &headers)) "/odata/" } " and sign in with Basic using your Open Beam username and password. It stays up to date when you refresh." }
                 }
             }
             p.hint { "Downloads contain exactly what is shown above: the same filter, sort and columns." }

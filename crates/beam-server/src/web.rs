@@ -74,10 +74,7 @@ pub fn layout(title: &str, signed: Option<&Signed>, body: Markup) -> Markup {
                             input type="hidden" name="csrf" value=(signed.session.csrf);
                             span.who {
                                 (signed.session.account.name())
-                                span.badge { (role_label(signed.session.account.role)) }
-                                a.badge.mode href="/account#interface" title="Change in Settings" {
-                                    (if signed.session.account.mode == Mode::Advanced { "Advanced" } else { "Basic" })
-                                }
+                                " " span.badge { (role_label(signed.session.account.role)) }
                             }
                             button.quiet type="submit" { "Sign out" }
                         }
@@ -458,11 +455,11 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
         },
         stacks::Lane {
             number: "03",
-            title: "For everyone",
+            title: "Shared with everyone",
             tone: "lane-everyone",
             entries: built_in
                 .iter()
-                .map(|e| (*e, "set up by your administrator".to_string()))
+                .map(|e| (*e, "Configured by an administrator".to_string()))
                 .collect(),
         },
     ];
@@ -475,9 +472,8 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
     let body = html! {
         div.intro {
             div {
-                p.eyebrow { "OPEN BEAM / YOUR STACKS" }
-                h1 { "Your data, shelved and checked." }
-                p.lede { "Pick a dataset to see what it means, its verified answers and its watches. Open it to explore, chart or download." }
+                h1 { "Datasets" }
+                p.lede { "Choose a dataset to see its description, verified answers and watches, or open it to filter, chart and download." }
             }
             div.actions { a.button href="/data/new" { "Add data" } a.button.quiet href="/watches" { "Watches" } }
         }
@@ -511,7 +507,7 @@ pub async fn home(State(state): App, Query(query): Query<HashMap<String, String>
         details.panel {
             summary { "Use this data in Excel or Power BI" }
             ol {
-                li { "In Excel choose Data → Get Data → From Other Sources → From OData Feed. In Power BI Desktop choose Get Data → OData feed." }
+                li { "In Excel, choose Data > Get Data > From Other Sources > From OData Feed. In Power BI Desktop, choose Get Data > OData feed." }
                 li { "Enter this address: " code { (feed_url) } }
                 li { "When asked how to sign in, choose " strong { "Basic" } " and enter your Open Beam username and password." }
             }
@@ -540,11 +536,11 @@ pub async fn account(State(state): App, Query(query): Query<HashMap<String, Stri
                 input type="hidden" name="csrf" value=(csrf);
                 label.choice {
                     input type="radio" name="mode" value="basic" checked[!advanced];
-                    span { strong { "Basic" } " — the essentials, kept simple: browse, filter, chart, share and download." }
+                    span { strong { "Basic." } " Browse, filter, chart, share and download." }
                 }
                 label.choice {
                     input type="radio" name="mode" value="advanced" checked[advanced];
-                    span { strong { "Advanced" } " — adds column choice, more filters, naming uploads, and ready-made connections for Excel and Power BI." }
+                    span { strong { "Advanced." } " Adds column choice, more filters, naming uploads, and ready-made connections for Excel and Power BI." }
                 }
                 button type="submit" { "Save" }
             }
@@ -783,8 +779,8 @@ pub async fn accounts(State(state): App, Query(query): Query<HashMap<String, Str
                         minlength=(beam_accounts::MIN_PASSWORD_CHARS); }
                 div { label for="new-role" { "Role" }
                     select #new-role name="role" {
-                        option value="user" { "User — can read datasets" }
-                        option value="admin" { "Administrator — can also manage accounts" }
+                        option value="user" { "User: reads datasets" }
+                        option value="admin" { "Administrator: also manages accounts" }
                     } }
                 button type="submit" { "Add account" }
             }
@@ -796,7 +792,7 @@ pub async fn accounts(State(state): App, Query(query): Query<HashMap<String, Str
                 tbody {
                     @for account in &list {
                         tr {
-                            td { (account.username) @if account.id == signed.session.account.id { span.badge { "you" } } }
+                            td { (account.username) @if account.id == signed.session.account.id { " " span.badge { "you" } } }
                             td {
                                 form.row method="post" action={ "/admin/accounts/" (account.id) "/role" } {
                                     input type="hidden" name="csrf" value=(csrf);

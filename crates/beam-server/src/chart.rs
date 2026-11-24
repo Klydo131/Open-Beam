@@ -48,10 +48,12 @@ pub struct ChartQuery {
 }
 
 fn is_numeric(property: &Property) -> bool {
-    matches!(
-        property.edm,
-        EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
-    )
+    // The row number the engine adds is not a measure.
+    property.name != beam_engine::ROW_KEY
+        && matches!(
+            property.edm,
+            EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+        )
 }
 
 fn is_date(property: &Property) -> bool {
@@ -323,7 +325,7 @@ pub async fn chart(
             }
             label for="group" { "by" }
             select #group name="group" {
-                @for property in &set.properties { option value=(property.name) selected[property.name == group.name] { (property.name) } }
+                @for property in set.properties.iter().filter(|p| p.name != beam_engine::ROW_KEY) { option value=(property.name) selected[property.name == group.name] { (property.name) } }
             }
             @if set.properties.iter().any(is_date) {
                 label for="bucket" { "dates by" }

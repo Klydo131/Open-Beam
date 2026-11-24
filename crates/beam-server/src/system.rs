@@ -108,8 +108,7 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
     let body = html! {
         div.intro {
             div {
-                p.eyebrow { "OPEN BEAM / SYSTEM" }
-                h1 { "How the server is doing." }
+                h1 { "System" }
                 p.lede { "Up " (uptime / 3600) " h " ((uptime % 3600) / 60) " min. Figures are from this moment; "
                     a href="/admin/system" { "refresh" } " to update. Monitoring tools can read the same figures at " code { "/metrics" } "." }
             }
@@ -119,13 +118,13 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
             div { dt { "Running now" } dd { (stats.queries_running) " / " (stats.max_concurrent) } }
             div class={ @if stats.queries_timed_out > 0 { "alerting" } } { dt { "Timed out" } dd { (stats.queries_timed_out) } }
             div class={ @if stats.queries_out_of_memory > 0 { "alerting" } } { dt { "Out of memory" } dd { (stats.queries_out_of_memory) } }
-            div class={ @if stats.queries_busy > 0 { "alerting" } } { dt { "Turned away busy" } dd { (stats.queries_busy) } }
+            div class={ @if stats.queries_busy > 0 { "alerting" } } { dt { "Rejected as busy" } dd { (stats.queries_busy) } }
             div { dt { "Failed" } dd { (stats.queries_failed) } }
             div { dt { "Connections" } dd { (state.connections.count()) " / " (crate::net::MAX_CONNECTIONS) } }
         }
         div.system-grid {
             section.panel {
-                div.section-label { span { "01 / MEMORY" } span.tag { "BOUNDED" } }
+                h2 { "Memory" }
                 (meter("Query engine", stats.memory_used_bytes, stats.memory_limit_bytes))
                 (meter("Temporary files (spill)", stats.spill_used_bytes, stats.spill_limit_bytes.max(1)))
                 @match process {
@@ -135,16 +134,16 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
                 p.hint { "When a query needs more than the engine's share, it spills to temporary files; past that limit it stops with a clear message instead of taking the computer's memory." }
             }
             section.panel {
-                div.section-label { span { "02 / SPEED" } span.tag { "ALL QUERIES" } }
+                h2 { "Query time" }
                 dl.facts {
                     dt { "Average" } dd { (mean) }
-                    dt { "Half finish in" } dd { (p(0.5)) }
-                    dt { "95 in 100 finish in" } dd { (p(0.95)) }
-                    dt { "99 in 100 finish in" } dd { (p(0.99)) }
+                    dt { "Median" } dd { (p(0.5)) }
+                    dt { "95th percentile" } dd { (p(0.95)) }
+                    dt { "99th percentile" } dd { (p(0.99)) }
                 }
             }
             section.panel {
-                div.section-label { span { "03 / STORAGE" } span.tag { "COLUMN-STORE COPIES" } }
+                h2 { "Storage" }
                 dl.facts {
                     dt { "Datasets" } dd { (stats.datasets) }
                     dt { "Kept as fast copies" } dd { (stats.cached_datasets) }
@@ -153,7 +152,7 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
                 p.hint { "Each file dataset is copied once into a compressed column format, so queries scan it instead of reading the original file every time. A changed file gets a fresh copy." }
             }
             section.panel {
-                div.section-label { span { "04 / WATCHES" } a.tag href="/watches" { "OPEN" } }
+                div.section-label { h2 { "Watches" } a href="/watches" { "View all" } }
                 dl.facts {
                     dt { "Alerts" } dd { (count(WatchStatus::Alert)) }
                     dt { "Cannot check" } dd { (count(WatchStatus::Error)) }
@@ -162,7 +161,7 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
             }
         }
         section.panel {
-            div.section-label { span { "05 / SLOWEST RECENT QUERIES" } span.tag { "250 MS OR MORE · VALUES HIDDEN" } }
+            div.section-label { h2 { "Slowest recent queries" } span.count { "250 ms or more. Quoted values are hidden." } }
             @if stats.slow.is_empty() {
                 p.empty { "None yet." }
             } @else {

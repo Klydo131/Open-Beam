@@ -38,7 +38,7 @@ pub struct Facts {
 
 /// The steps a dataset climbs, like levels in a management game: each one
 /// is something a person does that makes its answers more dependable.
-const LEVELS: [&str; 4] = ["Stocked", "Labelled", "Watched", "Trusted"];
+const LEVELS: [&str; 4] = ["Added", "Described", "Watched", "Verified"];
 
 impl Facts {
     pub fn read(state: &AppState, entries: &[Entry]) -> Self {
@@ -84,7 +84,7 @@ impl Facts {
         ];
         let reached = 1 + done.iter().take_while(|d| **d).count();
         let next = match reached {
-            1 => Some("describe it"),
+            1 => Some("add a description"),
             2 => Some("add a watch"),
             3 => Some("verify a question"),
             _ => None,
@@ -131,8 +131,8 @@ pub fn lanes(lanes: &[Lane<'_>], facts: &Facts, picked: Option<&str>) -> Markup 
         @for lane in lanes.iter().filter(|l| !l.entries.is_empty()) {
             section.lane aria-labelledby={ "lane-" (lane.number) } {
                 div.section-label {
-                    span #{ "lane-" (lane.number) } { (lane.number) " / " (lane.title) }
-                    span.tag { (lane.entries.len()) @if lane.entries.len() == 1 { " dataset" } @else { " datasets" } }
+                    h2 #{ "lane-" (lane.number) } { (lane.title) }
+                    span.count { (lane.entries.len()) }
                 }
                 ul.shelf {
                     @for (entry, note) in &lane.entries {
@@ -183,11 +183,11 @@ pub fn counters(entries: &[Entry], facts: &Facts) -> Markup {
         .filter(|w| w.status == Some(WatchStatus::Alert))
         .count();
     html! {
-        dl.counters aria-label="Your stacks at a glance" {
+        dl.counters aria-label="Summary" {
             div { dt { "Datasets" } dd { (names.len()) } }
-            div { dt { "Labelled" } dd { (described) } }
+            div { dt { "Described" } dd { (described) } }
             div { dt { "Watched" } dd { (watched) } }
-            div { dt { "Trusted" } dd { (trusted) } }
+            div { dt { "Verified" } dd { (trusted) } }
             div { dt { "Verified answers" } dd { (verified) } }
             div class={ @if alerts > 0 { "alerting" } } { dt { "Alerts" } dd { (alerts) } }
         }
@@ -214,7 +214,7 @@ pub fn inspector(state: &AppState, entry: &Entry, facts: &Facts) -> Markup {
         .collect();
     html! {
         aside.inspector #inspector aria-labelledby="inspector-title" {
-            div.section-label { span { "INSPECTOR" } span.tag { (set.properties.len()) " columns" } }
+            div.section-label { h2 { "Details" } span.count { (set.properties.len()) " columns" } }
             h2 #inspector-title { (set.name) }
             @match notes.get("") {
                 Some(text) => p.prose { (text) },

@@ -340,15 +340,15 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                 None => p.empty { "The profile could not be worked out in time." },
                 Some(figures) => {
                     p.hint {
-                        (show(figures[0])) " rows. Compare the row count and totals with the source to check nothing was lost or doubled. "
-                        "The middle five figures show where values lie: half of them are between the quarter marks."
+                        (show(figures[0])) " rows. Compare the row count and totals with the source to confirm nothing was lost or counted twice. "
+                        "Half of the values lie between the 25th and 75th percentiles."
                     }
                     div.tablewrap {
                         table {
                             thead { tr {
                                 th { "Column" } th.num { "Values" } th.num { "Total" } th.num { "Smallest" }
-                                th.num { "Lower quarter" } th.num { "Middle" } th.num { "Upper quarter" } th.num { "Largest" }
-                                th.num title="Values more than 1.5 times the spread between the quarter marks beyond them (Tukey's fences)" { "Far out" }
+                                th.num { "25th percentile" } th.num { "Median" } th.num { "75th percentile" } th.num { "Largest" }
+                                th.num title="Values beyond 1.5 times the interquartile range outside the 25th and 75th percentiles (Tukey's fences)" { "Outliers" }
                             } }
                             tbody {
                                 @for (index, name) in shown.iter().enumerate() {
@@ -366,7 +366,7 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                     @if numbers.len() > shown.len() {
                         p.hint { "The first " (shown.len()) " number columns are shown." }
                     }
-                    p.hint { "Far out values are worth a look, not necessarily wrong: they lie unusually far from the rest (Tukey's fences, from 1977)." }
+                    p.hint { "Outliers lie more than 1.5 interquartile ranges beyond the 25th or 75th percentile (Tukey's fences). They are worth checking, not necessarily wrong." }
                 }
             }
         }
@@ -609,7 +609,7 @@ pub async fn about(
                         table {
                             thead { tr { th { "Column" } th { "Meaning" } } }
                             tbody {
-                                @for (index, property) in set.properties.iter().enumerate() {
+                                @for (index, property) in set.properties.iter().enumerate().filter(|(_, p)| p.name != beam_engine::ROW_KEY) {
                                     tr {
                                         td { label for={ "col" (index) } { (property.name) } }
                                         td { input #{ "col" (index) } name={ "col" (index) } maxlength=(beam_accounts::MAX_NOTE_CHARS / 4)

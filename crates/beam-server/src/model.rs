@@ -340,9 +340,8 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
             let checks = checks(&state, &model).await;
             html! {
                 div.intro { div {
-                    p.eyebrow { "OPEN BEAM / MODEL" }
-                    h1 { "What the data describes." }
-                    p.lede { "The business objects behind the datasets, how they link, and the other words people use for them. Checked against the data." }
+                    h1 { "Model" }
+                    p.lede { "The business objects the datasets hold, the other names people use for them, and how they link. Each is checked against the data." }
                 } }
                 section.panel {
                     h2 { "Objects" }

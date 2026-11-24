@@ -1029,7 +1029,7 @@ async fn uploads_are_private_until_shared() {
     assert_eq!(upload_files(&site), 1);
     let page = get(&site, "/datasets/team_budget_2025", Some(&bob)).await;
     assert!(page.body.contains("Rows 1–3 of 3") && page.body.contains(">Sharing<"));
-    assert!(get(&site, "/", Some(&bob)).await.body.contains(">01 / Yours</span>"));
+    assert!(get(&site, "/", Some(&bob)).await.body.contains(">Yours</h2>"));
 
     // Nobody else can inspect it from the home page either.
     let (cyd_home, _) = sign_in(&site, "cyd", CYD_PASSWORD).await;
@@ -1442,7 +1442,8 @@ async fn advanced_mode_adds_tools_without_adding_permissions() {
             && !basic.body.contains("Power Query")
             && !basic.body.contains("starts with")
     );
-    assert!(get(&site, "/", Some(&bob)).await.body.contains(">Basic</a>"));
+    // The interface mode is a setting, not a label in the top bar.
+    assert!(!get(&site, "/", Some(&bob)).await.body.contains(">Basic</a>"));
 
     let switched = submit(&site, &bob, &csrf, "/account/mode", &[("mode", "advanced")]).await;
     assert_eq!(switched.location(), "/account?ok=mode");
@@ -3096,7 +3097,7 @@ async fn datasets_climb_levels_as_people_describe_watch_and_verify_them() {
     };
     let home = || async { get(&site, "/?pick=sales", Some(&ada)).await.body };
     assert_eq!(level(&home().await), "1");
-    assert!(home().await.contains("Next: describe it"));
+    assert!(home().await.contains("Next: add a description"));
 
     submit(
         &site,
@@ -3133,7 +3134,10 @@ async fn datasets_climb_levels_as_people_describe_watch_and_verify_them() {
     assert_eq!(level(&done), "4");
     // Only the other dataset, `many`, still has a next step.
     assert_eq!(done.matches("Next:").count(), 1, "a trusted dataset has no next step");
-    assert!(done.contains("<dt>Trusted</dt><dd>1</dd>"), "the counter bar counts it");
+    assert!(
+        done.contains("<dt>Verified</dt><dd>1</dd>"),
+        "the counter bar counts it"
+    );
 }
 
 #[tokio::test]
@@ -3149,7 +3153,7 @@ async fn administrators_see_how_the_server_is_doing_and_others_do_not() {
 
     let page = get(&site, "/admin/system", Some(&ada)).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(page.body.contains("How the server is doing.") && page.body.contains("Query engine"));
+    assert!(page.body.contains("<h1>System</h1>") && page.body.contains("Query engine"));
     assert_eq!(
         get(&site, "/admin/system", Some(&bob)).await.status,
         StatusCode::FORBIDDEN
