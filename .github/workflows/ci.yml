@@ -24,12 +24,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # The compiler version is pinned in rust-toolchain.toml, so CI and
       # contributors get the same compiler and the same lints.
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # DuckDB's build unpacks its sources into target/duckdb-sources and
       # fails if a restored cache left a partial copy there.
       - name: Clear stale DuckDB sources
