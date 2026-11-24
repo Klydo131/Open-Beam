@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_OBJECTS: usize = 200;
-const MAX_LINKS: usize = 500;
+const MAX_LINKS: usize = 100;
+/// A check that could not run (busy, or past the time limit) is tried again
+/// after this long.
+const RETRY_FAILED: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const MAX_NAME_CHARS: usize = 64;
 const MAX_LABEL_CHARS: usize = 100;
 const MAX_DESCRIPTION_CHARS: usize = 1000;
@@ -193,6 +196,12 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
         if !link_names.insert(link.name.to_ascii_lowercase()) {
             problems.push(format!("{at}: declared twice"));
         }
+        if file.links.iter().take_while(|l| !std::ptr::eq(*l, link)).any(|l| {
+            (l.from.as_str(), l.to.as_str(), l.column.as_str())
+                == (link.from.as_str(), link.to.as_str(), link.column.as_str())
+        }) {
+            problems.push(format!("{at}: repeats another link"));
+        }
         if link
             .description
             .as_deref()
@@ -249,12 +258,21 @@ async fn figures<const N: usize>(state: &Arc<AppState>, planned: Option<beam_oda
     Some(out)
 }
 
-/// Checks the model against the data, once per change to the datasets.
+impl Checks {
+    fn complete(&self) -> bool {
+        self.keys.iter().all(Option::is_some) && self.links.iter().all(Option::is_some)
+    }
+}
+
+/// Checks the model against the data. The model names only configured
+/// datasets, which do not change while the server runs, so the checks run
+/// once; one that could not run is tried again after [`RETRY_FAILED`].
+/// Concurrent first views wait for a single run.
 pub async fn checks(state: &Arc<AppState>, model: &Model) -> Arc<Checks> {
-    let generation = state.engine.generation();
-    if let Some((at, checks)) = state.model_checks.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        if at == generation {
-            return checks;
+    let mut kept = state.model_checks.lock().await;
+    if let Some((at, checks)) = kept.as_ref() {
+        if checks.complete() || at.elapsed() < RETRY_FAILED {
+            return checks.clone();
         }
     }
     let set = |dataset: &str| state.engine.dataset(dataset).map(|d| crate::catalog::entity_set(&d));
@@ -275,7 +293,7 @@ pub async fn checks(state: &Arc<AppState>, model: &Model) -> Arc<Checks> {
         checks.links.push(figures(state, planned).await);
     }
     let checks = Arc::new(checks);
-    *state.model_checks.lock().unwrap_or_else(|e| e.into_inner()) = Some((generation, checks.clone()));
+    *kept = Some((std::time::Instant::now(), checks.clone()));
     checks
 }
 
@@ -501,6 +519,13 @@ mod tests {
         );
         let control = GOOD.replace("A person or company", "A person\u{0007}");
         assert!(parse(&control, &sets()).is_err());
+        let repeated = format!(
+            "{GOOD}\n[[link]]\nname = \"again\"\nfrom = \"Order\"\nto = \"Customer\"\ncolumn = \"customer_id\"\n"
+        );
+        assert!(parse(&repeated, &sets())
+            .unwrap_err()
+            .join("\n")
+            .contains("link again: repeats another link"));
         let twice = format!("{GOOD}\n[[object]]\nname = \"customer\"\ndataset = \"orders\"\nkey = \"order_id\"\n");
         let problems = parse(&twice, &sets()).unwrap_err().join("\n");
         assert!(

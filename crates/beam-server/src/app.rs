@@ -39,8 +39,9 @@ pub struct AppState {
     profiles: std::sync::Mutex<std::collections::HashMap<String, (u64, Profile)>>,
     /// The model from the configuration, if one was written.
     pub model: Option<Arc<crate::model::Model>>,
-    /// The model's checks against the data, with the generation they are for.
-    pub model_checks: std::sync::Mutex<Option<(u64, Arc<crate::model::Checks>)>>,
+    /// The model's checks against the data and when they were made. An async
+    /// lock, held while they run, so concurrent first views wait for one run.
+    pub model_checks: tokio::sync::Mutex<Option<(std::time::Instant, Arc<crate::model::Checks>)>>,
 }
 
 impl AppState {
@@ -63,7 +64,7 @@ impl AppState {
             previews: std::sync::Mutex::default(),
             profiles: std::sync::Mutex::default(),
             model: None,
-            model_checks: std::sync::Mutex::default(),
+            model_checks: tokio::sync::Mutex::const_new(None),
         }
     }
 

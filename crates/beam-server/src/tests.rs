@@ -3663,12 +3663,21 @@ async fn the_model_is_checked_against_the_data_and_shared_with_assistants() {
     assert!(page.body.contains("Each of 120 rows has its own key"));
     assert!(page.body.contains("All 4 point to one"));
     assert!(page.body.contains("Each Sale names one Item in"));
+    // Uploads cannot change what the model describes, so even after one
+    // the checks are not run again.
+    let saved = upload(&site, &ada, &csrf, "other.csv", b"id\n1\n", "other").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
     let queries = site.state.engine.stats().queries_total;
-    get(&site, "/model", Some(&ada)).await;
+    for _ in 0..3 {
+        assert!(get(&site, "/model", Some(&ada))
+            .await
+            .body
+            .contains("All 4 point to one"));
+    }
     assert_eq!(
         site.state.engine.stats().queries_total,
         queries,
-        "checked once per change to the data"
+        "checked once while the server runs"
     );
 
     let token = new_token(&site, &ada, &csrf, "t").await;
