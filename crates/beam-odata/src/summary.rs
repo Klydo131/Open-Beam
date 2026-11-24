@@ -236,6 +236,69 @@ pub fn plan_link_check(from: &EntitySet, column: &str, to: &EntitySet, key: &str
     })
 }
 
+/// What a validity rule asks of a column: a closed set, after SHACL Core's
+/// minCount, minInclusive/maxInclusive, in and uniqueness.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuleCheck {
+    /// Never empty.
+    Present,
+    /// Numbers no lower than `min` and no higher than `max`.
+    Between { min: Option<f64>, max: Option<f64> },
+    /// Text, when given, is one of these.
+    OneOf(Vec<String>),
+    /// No value appears twice.
+    Unique,
+}
+
+/// Rows of `set` that break `check` on `column`: returns one row of
+/// `(rows, breaking)`. Values from the rule are bound, never written in.
+pub fn plan_rule(set: &EntitySet, column: &str, check: &RuleCheck) -> Result<Summary, QueryError> {
+    let property = set
+        .property(column)
+        .ok_or_else(|| QueryError::UnknownProperty(column.to_string()))?;
+    let c = quote_ident(&property.name);
+    let numeric = matches!(
+        property.edm,
+        EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+    );
+    let mut params = Vec::new();
+    let breaking = match check {
+        RuleCheck::Present => format!("count(*) FILTER (WHERE {c} IS NULL)"),
+        RuleCheck::Unique => format!("count({c}) - count(DISTINCT {c})"),
+        RuleCheck::Between { min, max } => {
+            if !numeric || (min.is_none() && max.is_none()) {
+                return Err(QueryError::InvalidValue("between"));
+            }
+            let mut sides = Vec::new();
+            if let Some(min) = min {
+                params.push(Literal::Float(*min));
+                sides.push(format!("{c} < ?"));
+            }
+            if let Some(max) = max {
+                params.push(Literal::Float(*max));
+                sides.push(format!("{c} > ?"));
+            }
+            format!("count(*) FILTER (WHERE {})", sides.join(" OR "))
+        }
+        RuleCheck::OneOf(values) => {
+            if property.edm != EdmType::String || values.is_empty() {
+                return Err(QueryError::InvalidValue("one_of"));
+            }
+            params.extend(values.iter().map(|v| Literal::Text(v.clone())));
+            let marks = vec!["?"; values.len()].join(", ");
+            format!("count(*) FILTER (WHERE {c} IS NOT NULL AND {c} NOT IN ({marks}))")
+        }
+    };
+    Ok(Summary {
+        sql: format!(
+            "SELECT CAST(count(*) AS DOUBLE), CAST({breaking} AS DOUBLE) FROM {}",
+            quote_ident(&set.name)
+        ),
+        params,
+        ordered: false,
+    })
+}
+
 /// How often records repeat: returns one row of `(groups, extra)` where
 /// `groups` counts combinations of `keys` that appear more than once, and
 /// `extra` counts the rows beyond the first of each. Rows where every key is

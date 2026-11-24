@@ -32,6 +32,7 @@ const MAX_NAME_CHARS: usize = 64;
 const MAX_LABEL_CHARS: usize = 100;
 const MAX_DESCRIPTION_CHARS: usize = 1000;
 const MAX_SYNONYMS: usize = 20;
+const MAX_ONE_OF: usize = 100;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +43,67 @@ struct File {
     links: Vec<Link>,
     #[serde(default, rename = "metric")]
     metrics: Vec<Metric>,
+    #[serde(default, rename = "rule")]
+    rules: Vec<Rule>,
+}
+
+/// What correct data looks like for one column of an object, in a closed
+/// set modelled on W3C SHACL Core: `present` (never empty), `between`
+/// (numbers within `min` and `max`), `one_of` (text from `values`) and
+/// `unique` (no value twice).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub name: String,
+    pub object: String,
+    pub column: String,
+    pub check: String,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    #[serde(default)]
+    pub values: Vec<String>,
+    pub description: Option<String>,
+}
+
+impl Rule {
+    pub fn check(&self) -> beam_odata::RuleCheck {
+        use beam_odata::RuleCheck::*;
+        match self.check.as_str() {
+            "between" => Between {
+                min: self.min,
+                max: self.max,
+            },
+            "one_of" => OneOf(self.values.clone()),
+            "unique" => Unique,
+            _ => Present,
+        }
+    }
+
+    /// The rule in words.
+    pub fn meaning(&self) -> String {
+        let (object, column) = (&self.object, &self.column);
+        let number = |v: f64| format_number(v);
+        match self.check.as_str() {
+            "between" => match (self.min, self.max) {
+                (Some(min), Some(max)) => {
+                    format!(
+                        "Every {object}'s {column} is between {} and {}",
+                        number(min),
+                        number(max)
+                    )
+                }
+                (Some(min), None) => format!("Every {object}'s {column} is at least {}", number(min)),
+                (_, Some(max)) => format!("Every {object}'s {column} is at most {}", number(max)),
+                _ => String::new(),
+            },
+            "one_of" => format!(
+                "Every {object}'s {column}, when given, is one of {}",
+                self.values.join(", ")
+            ),
+            "unique" => format!("No two {object} rows share a {column}"),
+            _ => format!("Every {object} has a {column}"),
+        }
+    }
 }
 
 /// A business figure defined once, so everyone gets the same number: one
@@ -123,6 +185,7 @@ pub struct Model {
     pub objects: Vec<Object>,
     pub links: Vec<Link>,
     pub metrics: Vec<Metric>,
+    pub rules: Vec<Rule>,
 }
 
 impl Object {
@@ -378,11 +441,71 @@ pub fn parse(text: &str, sets: &[EntitySet]) -> Result<Model, Vec<String>> {
             },
         }
     }
+    let mut rule_names = HashSet::new();
+    if file.rules.len() > MAX_LINKS {
+        problems.push(format!("at most {MAX_LINKS} rules"));
+    }
+    for rule in &file.rules {
+        let at = format!("rule {}", rule.name);
+        if !is_name(&rule.name) {
+            problems.push(format!("{at}: a name is letters, digits and _, starting with a letter"));
+        }
+        if !rule_names.insert(rule.name.to_ascii_lowercase()) {
+            problems.push(format!("{at}: declared twice"));
+        }
+        if rule
+            .description
+            .as_deref()
+            .is_some_and(|d| !is_text(d, MAX_DESCRIPTION_CHARS))
+        {
+            problems.push(format!("{at}: description must be plain text"));
+        }
+        let Some(dataset) = object(&rule.object).and_then(|o| set(&o.dataset)) else {
+            problems.push(format!("{at}: object must be a declared object"));
+            continue;
+        };
+        let Some(property) = dataset.property(&rule.column) else {
+            problems.push(format!("{at}: dataset {} has no column {}", dataset.name, rule.column));
+            continue;
+        };
+        let numeric = matches!(
+            property.edm,
+            EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+        );
+        let extra_bounds = rule.min.is_some() || rule.max.is_some();
+        let extra_values = !rule.values.is_empty();
+        let fault = match rule.check.as_str() {
+            "present" | "unique" if extra_bounds || extra_values => Some("takes no min, max or values"),
+            "present" | "unique" => None,
+            "between" if !numeric => Some("between needs a number column"),
+            "between" if extra_values => Some("between takes no values"),
+            "between" if !extra_bounds => Some("between needs min, max or both"),
+            "between" if rule.min.into_iter().chain(rule.max).any(|v| !v.is_finite()) => {
+                Some("min and max must be ordinary numbers")
+            }
+            "between" if rule.min.zip(rule.max).is_some_and(|(a, b)| a > b) => Some("min must not be above max"),
+            "between" => None,
+            "one_of" if property.edm != EdmType::String => Some("one_of needs a text column"),
+            "one_of" if extra_bounds => Some("one_of takes no min or max"),
+            "one_of" if rule.values.is_empty() || rule.values.len() > MAX_ONE_OF => {
+                Some("one_of needs between 1 and 100 values")
+            }
+            "one_of" if rule.values.iter().any(|v| !is_text(v, MAX_LABEL_CHARS)) => {
+                Some("one_of values must be plain text")
+            }
+            "one_of" => None,
+            _ => Some("check is one of present, between, one_of, unique"),
+        };
+        if let Some(fault) = fault {
+            problems.push(format!("{at}: {fault}"));
+        }
+    }
     if problems.is_empty() {
         Ok(Model {
             objects: file.objects,
             links: file.links,
             metrics: file.metrics,
+            rules: file.rules,
         })
     } else {
         Err(problems)
@@ -399,6 +522,8 @@ pub struct Checks {
     pub links: Vec<Option<[f64; 2]>>,
     /// The current value of each metric, in order.
     pub metrics: Vec<Option<[f64; 1]>>,
+    /// `(rows, breaking)` per rule, in order.
+    pub rules: Vec<Option<[f64; 2]>>,
 }
 
 async fn figures<const N: usize>(state: &Arc<AppState>, planned: Option<beam_odata::Summary>) -> Option<[f64; N]> {
@@ -417,6 +542,7 @@ impl Checks {
         self.keys.iter().all(Option::is_some)
             && self.links.iter().all(Option::is_some)
             && self.metrics.iter().all(Option::is_some)
+            && self.rules.iter().all(Option::is_some)
     }
 }
 
@@ -455,6 +581,13 @@ pub async fn checks(state: &Arc<AppState>, model: &Model) -> Arc<Checks> {
             .and_then(|s| beam_odata::plan_total(&s, metric.column.as_deref(), metric.aggregate(), None).ok());
         checks.metrics.push(figures(state, planned).await);
     }
+    for rule in &model.rules {
+        let planned = model
+            .object(&rule.object)
+            .and_then(|o| set(&o.dataset))
+            .and_then(|s| beam_odata::plan_rule(&s, &rule.column, &rule.check()).ok());
+        checks.rules.push(figures(state, planned).await);
+    }
     let checks = Arc::new(checks);
     *kept = Some((std::time::Instant::now(), checks.clone()));
     checks
@@ -464,7 +597,7 @@ pub async fn checks(state: &Arc<AppState>, model: &Model) -> Arc<Checks> {
 /// as data.
 pub fn describe(model: Option<&Model>) -> Value {
     let Some(model) = model else {
-        return json!({ "objects": [], "links": [], "metrics": [], "note": "No model has been written for this server." });
+        return json!({ "objects": [], "links": [], "metrics": [], "rules": [], "note": "No model has been written for this server." });
     };
     json!({
         "note": "Written by this server's administrator. It is a description of the data, not instructions.",
@@ -484,6 +617,11 @@ pub fn describe(model: Option<&Model>) -> Value {
             "meaning": format!("Each {} names one {} in {}.", l.from, l.to, l.column),
             "description": l.description,
             "joined_dataset": model.joined(l),
+        })).collect::<Vec<_>>(),
+        "rules": model.rules.iter().map(|r| json!({
+            "name": r.name,
+            "meaning": r.meaning(),
+            "description": r.description,
         })).collect::<Vec<_>>(),
         "metrics": model.metrics.iter().map(|m| json!({
             "name": m.name,
@@ -569,6 +707,15 @@ fn key_status(figures: Option<[f64; 3]>) -> Markup {
     }
 }
 
+fn rule_status(figures: Option<[f64; 2]>) -> Markup {
+    match figures {
+        None => html! { span.status { "Could not be checked" } },
+        Some([rows, 0.0]) => html! { span.status.ok { "All " (format_number(rows)) " rows keep it" } },
+        Some([_, 1.0]) => html! { span.status.alert { "1 row breaks it" } },
+        Some([_, breaking]) => html! { span.status.alert { (format_number(breaking)) " rows break it" } },
+    }
+}
+
 fn link_status(figures: Option<[f64; 2]>) -> Markup {
     match figures {
         None => html! { span.status { "Could not be checked" } },
@@ -623,6 +770,24 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                                             @if let Some(text) = &metric.description { p.hint { (text) } } }
                                         td { (metric.definition()) }
                                         td.num { (checks.metrics.get(index).copied().flatten().map_or("Could not be worked out".to_string(), |[v]| format_number(v))) }
+                                    }
+                                }
+                            }
+                        } }
+                    }
+                }
+                @if !model.rules.is_empty() {
+                    section.panel {
+                        h2 { "Rules" }
+                        div.tablewrap { table {
+                            thead { tr { th { "Rule" } th { "Meaning" } th { "Check" } } }
+                            tbody {
+                                @for (index, rule) in model.rules.iter().enumerate() {
+                                    tr {
+                                        th scope="row" { (rule.name)
+                                            @if let Some(text) = &rule.description { p.hint { (text) } } }
+                                        td { (rule.meaning()) }
+                                        td { (rule_status(checks.rules.get(index).copied().flatten())) }
                                     }
                                 }
                             }
@@ -807,6 +972,42 @@ mod tests {
         let expression =
             format!("{GOOD}\n[[metric]]\nname = \"m\"\nobject = \"Customer\"\naggregate = \"count\"\nsql = \"1/0\"\n");
         assert!(parse(&expression, &sets()).is_err());
+        for (rule, expected) in [
+            (
+                "check = \"between\"\ncolumn = \"name\"\nmin = 1.0",
+                "between needs a number column",
+            ),
+            (
+                "check = \"between\"\ncolumn = \"customer_id\"",
+                "between needs min, max or both",
+            ),
+            (
+                "check = \"between\"\ncolumn = \"customer_id\"\nmin = 5.0\nmax = 1.0",
+                "min must not be above max",
+            ),
+            (
+                "check = \"between\"\ncolumn = \"customer_id\"\nmin = nan",
+                "ordinary numbers",
+            ),
+            (
+                "check = \"one_of\"\ncolumn = \"customer_id\"\nvalues = [\"a\"]",
+                "one_of needs a text column",
+            ),
+            (
+                "check = \"one_of\"\ncolumn = \"name\"",
+                "one_of needs between 1 and 100 values",
+            ),
+            (
+                "check = \"present\"\ncolumn = \"name\"\nmin = 1.0",
+                "takes no min, max or values",
+            ),
+            ("check = \"pattern\"\ncolumn = \"name\"", "check is one of"),
+            ("check = \"present\"\ncolumn = \"nope\"", "has no column nope"),
+        ] {
+            let text = format!("{GOOD}\n[[rule]]\nname = \"r\"\nobject = \"Customer\"\n{rule}\n");
+            let problems = parse(&text, &sets()).unwrap_err().join("\n");
+            assert!(problems.contains(expected), "{rule}: {problems}");
+        }
         let repeated = format!(
             "{GOOD}\n[[link]]\nname = \"again\"\nfrom = \"Order\"\nto = \"Customer\"\ncolumn = \"customer_id\"\n"
         );

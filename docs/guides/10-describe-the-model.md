@@ -100,6 +100,36 @@ definition and current value. Assistants use the `get_metric` tool, which
 works it out by its definition, in total or split by a column or period,
 and filtered.
 
+## Rules
+
+A rule says what correct data looks like, so problems show up before
+anyone relies on the numbers. There are four kinds, modelled on the W3C
+SHACL standard for data validation:
+
+| `check` | Means | Settings |
+| --- | --- | --- |
+| `present` | the column is never empty | none |
+| `between` | numbers are within the limits | `min`, `max` or both |
+| `one_of` | text, when given, is one of a list | `values` (1 to 100) |
+| `unique` | no value appears twice | none |
+
+```toml
+[[rule]]
+name = "sensible_amounts"
+object = "Order"
+column = "amount"
+check = "between"
+min = 0
+max = 100000
+description = "Larger orders are entered by hand and checked."
+```
+
+The Model page shows each rule in plain words and how many rows break
+it. Only the count is shown, never the values themselves. Rules cover
+the datasets in `beam.toml`, which do not change while the server runs,
+so they are checked once after each start. For data that changes, such
+as uploads, use watches.
+
 ## What is checked
 
 When the server starts, the model must be exact; otherwise Open Beam
@@ -130,4 +160,5 @@ The design takes ideas, not code, from open projects: object types with a
 key and checked links in the style of typed graph schemas, a closed-world
 check that rejects any undeclared name, and a short reason on every link.
 It uses the W3C SKOS idea of preferred and alternative labels for
-synonyms. Validity rules that become watches are planned next.
+synonyms. Its four rule kinds are the core of W3C SHACL. Editing the
+model on a page, with a review before the change applies, is planned next.

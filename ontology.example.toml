@@ -43,3 +43,13 @@ aggregate = "sum"
 column = "amount"
 label = "Revenue"
 description = "All orders, before refunds."
+
+# What correct data looks like: present, between (min/max), one_of (values)
+# or unique. The Model page counts the rows that break each rule.
+[[rule]]
+name = "sensible_amounts"
+object = "Order"
+column = "amount"
+check = "between"
+min = 0
+max = 100000

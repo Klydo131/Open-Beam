@@ -3887,3 +3887,121 @@ async fn metrics_give_everyone_the_same_number_by_their_definition() {
     let described = mcp_call(&site, &token, "describe_model", json!({})).await;
     assert_eq!(described["metrics"][0]["definition"], "Sum of amount over every Sale");
 }
+
+#[tokio::test]
+async fn rules_say_what_correct_data_looks_like_and_count_the_rows_that_break_them() {
+    // sales: amounts 10.5, 20, 30.25, 40; regions EU, US, EU and one
+    // written as markup; every shipped_at but the last is set.
+    let model = r#"
+        [[object]]
+        name = "Sale"
+        dataset = "sales"
+        key = "order_id"
+
+        [[rule]]
+        name = "sensible_amounts"
+        object = "Sale"
+        column = "amount"
+        check = "between"
+        min = 15.0
+        max = 35.0
+
+        [[rule]]
+        name = "known_regions"
+        object = "Sale"
+        column = "region"
+        check = "one_of"
+        values = ["EU", "US"]
+
+        [[rule]]
+        name = "shipped"
+        object = "Sale"
+        column = "shipped_at"
+        check = "present"
+
+        [[rule]]
+        name = "one_sale_per_order"
+        object = "Sale"
+        column = "order_id"
+        check = "unique"
+    "#;
+    let site = site_with_model(false, 50, Some(model));
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let page = get(&site, "/model", Some(&ada)).await;
+    for expected in [
+        "Every Sale's amount is between 15 and 35",
+        "2 rows break it",    // 10.5 and 40
+        "1 row breaks it",    // the markup region; and the missing shipped_at
+        "All 4 rows keep it", // order ids are unique
+        "Every Sale's region, when given, is one of EU, US",
+    ] {
+        assert!(page.body.contains(expected), "missing {expected:?}");
+    }
+    assert_eq!(page.body.matches("1 row breaks it").count(), 2);
+    // Only counts are shown, never the values that break a rule.
+    assert!(!page.body.contains("<script>"));
+    let token = new_token(&site, &ada, &csrf, "t").await;
+    let described = mcp_call(&site, &token, "describe_model", json!({})).await;
+    assert_eq!(described["rules"][2]["meaning"], "Every Sale has a shipped_at");
+}
+
+#[tokio::test]
+async fn each_kind_of_rule_counts_exactly_the_rows_that_break_it() {
+    // id 3 appears twice; one region is empty, one is not a known one.
+    let engine = Engine::open(&[DatasetSpec {
+        name: "t".into(),
+        source: Source::Query(
+            "SELECT * FROM (VALUES (1, 'EU', 5.0), (2, NULL, 50.0), (3, 'XX', 7.0), (3, 'EU', NULL)) v(id, region, amount)"
+                .into(),
+        ),
+        key: None,
+    }])
+    .unwrap();
+    let state = Arc::new(AppState::new(
+        engine,
+        Store::open_in_memory().unwrap(),
+        50,
+        None,
+        "x".into(),
+    ));
+    let set = crate::catalog::entity_set(&state.engine.dataset("t").unwrap());
+    let breaking = |column: &'static str, check: beam_odata::RuleCheck| {
+        let (state, set) = (state.clone(), set.clone());
+        async move {
+            let planned = beam_odata::plan_rule(&set, column, &check).unwrap();
+            let rows = crate::feed::run(&state, planned.sql, &planned.params, 2).await.unwrap();
+            (rows[0][0].as_f64().unwrap(), rows[0][1].as_f64().unwrap())
+        }
+    };
+    use beam_odata::RuleCheck::*;
+    assert_eq!(breaking("region", Present).await, (4.0, 1.0));
+    // An empty region is not counted against one_of; "XX" is.
+    assert_eq!(
+        breaking("region", OneOf(vec!["EU".into(), "US".into()])).await,
+        (4.0, 1.0)
+    );
+    assert_eq!(breaking("id", Unique).await, (4.0, 1.0));
+    // 50 is above the maximum; an empty amount breaks no bound.
+    assert_eq!(
+        breaking(
+            "amount",
+            Between {
+                min: Some(1.0),
+                max: Some(10.0)
+            }
+        )
+        .await,
+        (4.0, 1.0)
+    );
+    assert_eq!(
+        breaking(
+            "amount",
+            Between {
+                min: Some(6.0),
+                max: None
+            }
+        )
+        .await,
+        (4.0, 1.0)
+    );
+}
