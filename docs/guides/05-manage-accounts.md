@@ -12,7 +12,7 @@ roles:
 
 1. Sign in as an administrator and select **Accounts**.
 2. Under **Add an account**, enter a username, a temporary password of at
-   least 10 characters, and a role.
+   least 15 characters, and a role.
 3. Select **Add account**.
 4. Give the person their username and temporary password privately, and ask
    them to change it straight away.

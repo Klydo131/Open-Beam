@@ -135,7 +135,7 @@ everything arriving over the network is not.
 | Reading files that were not shared | After start-up DuckDB's file access is restricted to the configured dataset files, external access is disabled and the configuration is locked. |
 | Modifying or deleting data | The database is in-memory, datasets are views, and only `SELECT` statements are issued. |
 | Unintended network exposure | The default bind address is loopback. Open Beam refuses to listen elsewhere, or behind a public address, until an administrator exists. |
-| Password guessing | Argon2id hashing; five failures lock a username and 30 lock an address for five minutes, so one password cannot be sprayed across every username; common and keyboard-run passwords are refused when set; one message for every failed sign-in. |
+| Password guessing | Argon2id hashing; five failures lock a username and 30 lock an address for five minutes, so one password cannot be sprayed across every username; new passwords are at least 15 characters (NIST SP 800-63B-4) and common or keyboard-run ones are refused; one message for every failed sign-in. |
 | Stolen account file | It contains password hashes and session digests, not passwords or tokens. |
 | Forged requests from other sites | Session cookies are `SameSite=Strict` and `HttpOnly`; every form carries a per-session token; posts that the browser labels as cross-site are refused. |
 | Script injection through data | Pages escape all values, contain no scripts, and are served with a content policy that allows none. |

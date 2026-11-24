@@ -3373,7 +3373,7 @@ async fn common_passwords_are_refused_when_accounts_are_made() {
         &[
             ("csrf", &csrf),
             ("username", "carol"),
-            ("password", "Password123!"),
+            ("password", "Password12345678!"),
             ("role", "user"),
         ],
     )

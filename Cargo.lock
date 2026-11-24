@@ -409,7 +409,6 @@ name = "beam-engine"
 version = "0.3.0"
 dependencies = [
  "duckdb",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror",

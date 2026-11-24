@@ -29,7 +29,8 @@ Against attacks that need no account:
 - **Password guessing.** Five failures lock a username for five minutes;
   30 failures from one address, across any usernames, lock that address,
   so one common password cannot be tried against every account. New
-  passwords that guessing tools try first (common passwords with digits
+  passwords are at least 15 characters (NIST SP 800-63B-4, for a password
+  that is the only factor); those that guessing tools try first (common passwords with digits
   added, keyboard runs, one repeated character) are refused.
 - **Other websites.** A page on another site cannot post forms here, load
   our data as a script or image, frame our pages, or time our answers to

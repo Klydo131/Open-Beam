@@ -43,7 +43,7 @@ Leave this window open. Press `Ctrl+C` to stop.
 ## Step 3: Create the administrator account
 
 1. Open <http://127.0.0.1:8787/> in a web browser.
-2. Choose a username and a password of at least 10 characters.
+2. Choose a username and a password of at least 15 characters.
 3. Select **Create administrator**.
 
 ![The first-run page asking for an administrator username and password](../images/screens/setup.png)

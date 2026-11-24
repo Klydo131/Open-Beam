@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Mutex;
 
-pub const MIN_PASSWORD_CHARS: usize = 10;
+/// NIST SP 800-63B-4 (2025): a password that is the only factor at sign-in
+/// is at least 15 characters. Existing, shorter passwords keep working until
+/// they are next changed.
+pub const MIN_PASSWORD_CHARS: usize = 15;
 /// Upper bound so that hashing cannot be turned into a way to waste CPU.
 pub const MAX_PASSWORD_BYTES: usize = 256;
 const SESSION_HOURS: u32 = 12;
@@ -1409,9 +1412,15 @@ mod tests {
             assert!(!super::easy_to_guess(fine), "{fine} should be accepted");
         }
         assert!(matches!(
-            super::check_password("Password123!"),
+            super::check_password("Password12345678!"),
             Err(super::AccountError::WeakPassword)
         ));
+        // NIST SP 800-63B-4: fourteen characters is one too few.
+        assert!(matches!(
+            super::check_password("fourteen chars"),
+            Err(super::AccountError::InvalidPassword)
+        ));
+        assert!(super::check_password("fifteen letters").is_ok());
     }
 
     use super::*;
