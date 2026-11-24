@@ -174,7 +174,10 @@ A preview made before the file changed, by another administrator or by
 hand, is refused: preview again to see the change against what is there
 now. Only one change applies at a time. What was written about a removed
 joined dataset is deleted with it, so it can never reappear on a later
-dataset of the same name.
+dataset of the same name. The same goes for a joined dataset made again
+from a new link: its descriptions, verified questions and watches
+described the old data, so the preview lists them and applying removes
+them.
 
 ## Where it comes from
 

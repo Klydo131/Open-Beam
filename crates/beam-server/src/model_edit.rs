@@ -29,6 +29,9 @@ pub struct Plan {
     /// `[descriptions, verified questions, watches]`.
     pub removed_joins: Vec<(String, [u64; 3])>,
     added_joins: Vec<String>,
+    /// Joined datasets made again from a new recipe: what was written about
+    /// them described the old data, so it goes too.
+    remade_joins: Vec<String>,
 }
 
 /// Each link's joined dataset and what it is made from. A dataset whose
@@ -90,6 +93,7 @@ pub fn plan(state: &AppState, text: &str) -> Plan {
         changes: Vec::new(),
         removed_joins: Vec::new(),
         added_joins: Vec::new(),
+        remade_joins: Vec::new(),
     };
     let new = match model::parse(text, &sets) {
         Ok(new) => new,
@@ -165,9 +169,20 @@ pub fn plan(state: &AppState, text: &str) -> Plan {
     for (name, recipe) in &after {
         match before.get(name) {
             None => plan.changes.push(format!("Makes the joined dataset {name}")),
-            Some(old_recipe) if old_recipe != recipe => plan
-                .changes
-                .push(format!("Makes the joined dataset {name} again, from its new link")),
+            Some(old_recipe) if old_recipe != recipe => {
+                let [notes, questions, watches] = state.accounts.curation_count(name).unwrap_or_default();
+                let mut line = format!("Makes the joined dataset {name} again, from its new link");
+                if notes + questions + watches > 0 {
+                    line.push_str(&format!(
+                        ", removing its {}, {} and {}, which described the old data",
+                        count(notes, "description"),
+                        count(questions, "verified question"),
+                        count(watches, "watch")
+                    ));
+                }
+                plan.changes.push(line);
+                plan.remade_joins.push(name.clone());
+            }
             Some(_) => continue,
         }
         plan.added_joins.push(name.clone());
@@ -226,7 +241,9 @@ fn apply_now(state: &AppState, text: &str, planned_from: &str) -> Result<(), Str
             for link in &old.links {
                 let name = old.joined(link);
                 if removed.contains(&name) && engine.dataset(&name).is_none() {
-                    let _ = add_one(engine, old, link);
+                    if let Err(e) = add_one(engine, old, link) {
+                        eprintln!("model change: could not put back {name}: {e}; restart to restore it");
+                    }
                 }
             }
         }
@@ -251,9 +268,11 @@ fn apply_now(state: &AppState, text: &str, planned_from: &str) -> Result<(), Str
     *state.model.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(new));
     // What was written about a joined dataset that is gone no longer
     // describes anything, and must not reappear on a later dataset of that
-    // name, such as an upload.
-    for (name, _) in &plan.removed_joins {
-        let _ = state.accounts.forget_dataset(name);
+    // name, such as an upload. A remade one now holds other data.
+    for name in plan.removed_joins.iter().map(|(n, _)| n).chain(&plan.remade_joins) {
+        if let Err(e) = state.accounts.forget_dataset(name) {
+            eprintln!("model change: could not clear what was written about {name}: {e}");
+        }
     }
     Ok(())
 }
@@ -353,6 +372,15 @@ pub async fn edit_route(State(state): App, headers: HeaderMap) -> Response {
     page(StatusCode::OK, layout("Edit the model", Some(&signed), body))
 }
 
+impl EditForm {
+    /// Browsers send line breaks as CRLF; the file keeps LF, so saving
+    /// from the page does not rewrite every line.
+    fn normalised(mut self) -> Self {
+        self.text = self.text.replace("\r\n", "\n");
+        self
+    }
+}
+
 #[derive(Deserialize)]
 pub struct EditForm {
     csrf: String,
@@ -412,6 +440,7 @@ pub async fn plan_route(State(state): App, headers: HeaderMap, Form(form): Form<
         Ok(text) => text,
         Err(e) => return message_page(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read the model", &e),
     };
+    let form = form.normalised();
     let worker = state.clone();
     let text = form.text.clone();
     let Ok(plan) = tokio::task::spawn_blocking(move || plan(&worker, &text)).await else {
@@ -433,6 +462,7 @@ pub async fn apply_route(State(state): App, headers: HeaderMap, Form(form): Form
     if let Err(response) = check_csrf(&signed, &form.csrf) {
         return response;
     }
+    let form = form.normalised();
     match apply(&state, form.text.clone(), form.digest.clone()).await {
         Ok(()) => redirect("/model"),
         Err(error) => {

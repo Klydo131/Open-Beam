@@ -4325,3 +4325,49 @@ async fn a_change_that_cannot_be_saved_puts_every_dataset_back() {
     assert!(site.state.engine.dataset("sale_items").is_some());
     assert!(site.state.engine.dataset("sales_with_many").is_none());
 }
+
+#[tokio::test]
+async fn a_remade_join_loses_what_described_its_old_data_and_files_keep_lf() {
+    let start = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let site = editable_site(&start);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    site.state
+        .accounts
+        .set_note("sales_with_many", "", "old recipe", 1)
+        .unwrap();
+    // Same joined name, new recipe: the two objects swap datasets. Sent
+    // as a browser would, with CRLF line breaks.
+    let recipe = start
+        .replace(
+            "name = \"Sale\"\ndataset = \"sales\"\nkey = \"order_id\"",
+            "name = \"Sale\"\ndataset = \"many\"\nkey = \"id\"",
+        )
+        .replace(
+            "name = \"Item\"\ndataset = \"many\"\nkey = \"id\"",
+            "name = \"Item\"\ndataset = \"sales\"\nkey = \"order_id\"",
+        )
+        .replace("column = \"order_id\"", "column = \"id\"\njoined = \"sales_with_many\"");
+    let sent = recipe.replace('\n', "\r\n");
+    let (shown, digest) = preview(&site, &ada, &csrf, &sent).await;
+    assert!(
+        shown.body.contains("Makes the joined dataset sales_with_many again, from its new link, removing its 1 description, 0 verified questions and 0 watches"),
+        "{}",
+        shown.body
+    );
+    let applied = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &sent), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::SEE_OTHER, "{}", applied.body);
+    assert_eq!(
+        site.state.accounts.curation_count("sales_with_many").unwrap(),
+        [0, 0, 0]
+    );
+    let saved = std::fs::read_to_string(site.state.model_path.clone().unwrap()).unwrap();
+    assert!(!saved.contains('\r'));
+    assert_eq!(saved, recipe);
+}
