@@ -3797,3 +3797,33 @@ async fn each_link_adds_a_joined_dataset_that_every_way_in_can_read() {
     let described = mcp_call(&site, &token, "describe_model", json!({})).await;
     assert_eq!(described["links"][0]["joined_dataset"], "sales_with_many");
 }
+
+#[tokio::test]
+async fn a_configured_or_joined_name_never_takes_over_an_upload() {
+    let site = site(false, 50);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let saved = upload(&site, &bob, &csrf, "w.csv", b"id\n1\n", "sales_with_many").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    // Restarting with a model whose join takes that name must not start.
+    let model = r#"
+        [[object]]
+        name = "Sale"
+        dataset = "sales"
+        key = "order_id"
+        [[object]]
+        name = "Item"
+        dataset = "many"
+        key = "id"
+        [[link]]
+        name = "of_item"
+        from = "Sale"
+        to = "Item"
+        column = "order_id"
+    "#;
+    let restarted = site_with_model(false, 50, Some(model));
+    let refused = crate::refuse_names_taken_by_uploads(&restarted.state.engine, &site.state.accounts);
+    let message = refused.unwrap_err();
+    assert!(message.contains("sales_with_many (uploaded by bob)"), "{message}");
+    // With no clash it starts.
+    assert!(crate::refuse_names_taken_by_uploads(&restarted.state.engine, &restarted.state.accounts).is_ok());
+}

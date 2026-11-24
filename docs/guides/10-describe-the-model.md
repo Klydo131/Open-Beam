@@ -56,6 +56,16 @@ two datasets can see it.
 - When both datasets are kept as fast copies, so is the join, so it
   reads as quickly as either of them. It is made again when either file
   changes and the server restarts.
+- If a customer key repeats, the first of its rows in the data is used.
+- A looked-up column that would have the same name as one of the
+  dataset's own (an order that already has `customer_name`) is refused,
+  rather than renamed where nobody would notice.
+- The join is made when the server starts, before it accepts visitors;
+  very large datasets make the start slower the first time.
+- A joined name may not be the name of anyone's upload: descriptions,
+  verified questions and watches are kept by name, so the new dataset,
+  which everyone sees, would show what the upload's owner wrote about
+  their private data. The server refuses to start and names the upload.
 - Two links between the same pair of objects need their own names; give
   one with `joined`:
 

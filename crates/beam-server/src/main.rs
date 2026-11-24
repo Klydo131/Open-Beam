@@ -161,6 +161,36 @@ fn restore_uploads(engine: &beam_engine::Engine, accounts: &Store) {
     }
 }
 
+/// Refuses to start when a configured or joined dataset has the name of a
+/// saved upload. Descriptions, verified questions and watches are kept by
+/// dataset name, so the new dataset, which everyone can see, would show what
+/// the upload's owner wrote about their private data.
+fn refuse_names_taken_by_uploads(engine: &beam_engine::Engine, accounts: &Store) -> Result<(), String> {
+    let ours: std::collections::HashSet<String> =
+        engine.datasets().iter().map(|d| d.name.to_ascii_lowercase()).collect();
+    let clashes: Vec<String> = accounts
+        .uploads()
+        .unwrap_or_default()
+        .iter()
+        .filter(|u| ours.contains(&u.name.to_ascii_lowercase()))
+        .map(|u| {
+            let owner = accounts
+                .get(u.owner_id)
+                .map_or("an account".to_string(), |a| a.username);
+            format!("{} (uploaded by {owner})", u.name)
+        })
+        .collect();
+    if clashes.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "these names belong to uploads, so a configured or joined dataset cannot use them: {}. \
+             Rename the dataset in beam.toml, or give the link its own `joined` name.",
+            clashes.join(", ")
+        ))
+    }
+}
+
 /// The model named by `ontology`, checked against the configured datasets.
 /// A model with problems stops the server, listing all of them, as any other
 /// mistake in the configuration does.
@@ -189,6 +219,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     if let Some(model) = &model {
         model.add_joins(&engine)?;
     }
+    refuse_names_taken_by_uploads(&engine, &accounts)?;
     restore_uploads(&engine, &accounts);
     // Copies left by datasets that no longer exist, or whose files changed.
     engine.prune_cache();

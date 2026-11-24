@@ -568,6 +568,21 @@ impl Engine {
             .map(|c| format!("f.{}", quote_ident(&c.name)))
             .collect();
         let looked_up: Vec<&Column> = to_set.columns.iter().filter(|c| c.name != ROW_KEY).collect();
+        // A looked-up name that is already one of `from`'s columns would be
+        // renamed out of sight; refuse it instead.
+        if let Some(clash) = looked_up.iter().find_map(|c| {
+            let wanted = format!("{prefix}_{}", c.name);
+            from_set
+                .columns
+                .iter()
+                .any(|own| own.name.eq_ignore_ascii_case(&wanted))
+                .then_some(wanted)
+        }) {
+            return Err(EngineError::InvalidQuery {
+                dataset: name.to_string(),
+                reason: format!("{from} already has a column named {clash}"),
+            });
+        }
         let picked = looked_up
             .iter()
             .map(|c| {
@@ -579,15 +594,22 @@ impl Engine {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let tie_break = looked_up
-            .iter()
-            .map(|c| quote_ident(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // A repeated key resolves to its first row in the file when the
+        // order is known, else to the same row by its values.
+        let tie_break = if to_set.columns.iter().any(|c| c.name == ROW_KEY) {
+            quote_ident(ROW_KEY)
+        } else {
+            looked_up
+                .iter()
+                .map(|c| quote_ident(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // Rows keep `from`'s order: its row number, or its key.
         let order = if from_set.columns.iter().any(|c| c.name == ROW_KEY) {
             format!(" ORDER BY f.{}", quote_ident(ROW_KEY))
         } else {
-            String::new()
+            format!(" ORDER BY f.{}", quote_ident(&from_set.key))
         };
         let (k, c) = (quote_ident(key), quote_ident(column));
         let sql = format!(
@@ -2083,16 +2105,28 @@ mod tests {
                 2,
             )
             .unwrap();
-        // Every order once, in order; the repeated key picks the same row
-        // every time ("Bea" sorts first); no match stays empty.
+        // Every order once, in order; the repeated key picks its first row
+        // in the data ("Ben"); no match stays empty.
         assert_eq!(
             rows,
             vec![
-                vec![json!(10), json!("Bea")],
+                vec![json!(10), json!("Ben")],
                 vec![json!(20), json!("Ana")],
                 vec![json!(30), json!(null)],
             ]
         );
+        // A looked-up column that would collide with one of the dataset's own
+        // is refused rather than renamed out of sight.
+        let clash = Engine::open(&[
+            query_spec("people", "SELECT * FROM (VALUES (1, 'Ana')) t(id, name)"),
+            query_spec("notes", "SELECT * FROM (VALUES (1, 'x')) t(person_name, id)"),
+        ])
+        .unwrap();
+        let refused = clash.add_lookup("notes_with_people", "notes", "id", "people", "id", "person");
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("already has a column named person_name"));
         // Without an upload folder there is nowhere to keep a copy.
         assert_eq!(engine.stats().cached_datasets, 0);
         // A name already in use, or a dataset joined to itself, is refused.
