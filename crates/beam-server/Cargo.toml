@@ -28,7 +28,7 @@ maud = "0.27"
 calamine = "0.38"
 zip = { version = "9", default-features = false }
 getrandom = "0.4"
-rust_xlsxwriter = { version = "0.102", default-features = false }
+rust_xlsxwriter = { version = "0.103", default-features = false }
 sha2 = "0.11"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-graceful"] }
