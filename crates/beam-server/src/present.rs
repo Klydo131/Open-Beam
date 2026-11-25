@@ -268,6 +268,16 @@ pub async fn svg(State(state): App, Path((name, file)): Path<(String, String)>, 
     response
 }
 
+/// Excel holds at most 32,767 characters in a cell; longer text is cut,
+/// and says so, rather than failing the whole file.
+fn fits_a_cell(text: &str) -> String {
+    const MAX: usize = 32_767;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    text.chars().take(MAX - 1).chain(['…']).collect()
+}
+
 /// The deck as an Excel workbook: an overview sheet, then a sheet per
 /// question with its figures as a named table and a native chart over them.
 fn workbook_bytes(dataset: &str, slides: &[(&Question, Drawn)]) -> Result<Vec<u8>, rust_xlsxwriter::XlsxError> {
@@ -307,7 +317,7 @@ fn workbook_bytes(dataset: &str, slides: &[(&Question, Drawn)]) -> Result<Vec<u8
             Ok((points, line, cut)) if !points.is_empty() => {
                 let last = 3 + points.len() as u32;
                 for (offset, (label, value)) in points.iter().enumerate() {
-                    sheet.write_string(4 + offset as u32, 0, label)?;
+                    sheet.write_string(4 + offset as u32, 0, fits_a_cell(label))?;
                     sheet.write_number(4 + offset as u32, 1, *value)?;
                 }
                 // A table name may not look like a cell, and Q1 is one.
@@ -398,5 +408,22 @@ mod tests {
         assert!(svg.contains("fill=\"#b86e00\"") && svg.contains("fill=\"#ffffff\""));
         let line = standalone(&crate::chart::line_chart(&points, "Trend").into_string());
         assert!(!line.contains("class="), "{line}");
+    }
+
+    #[test]
+    fn a_label_longer_than_a_cell_is_cut_not_fatal() {
+        let question = Question {
+            id: 1,
+            dataset: "d".into(),
+            question: "Long".into(),
+            settings: String::new(),
+            approved_by: None,
+            approved_at: "2026-11-25 00:00:00".into(),
+        };
+        let long = "x".repeat(40_000);
+        let slides = [(&question, Ok((vec![(long, 1.0)], false, false)))];
+        assert!(workbook_bytes("d", &slides).is_ok());
+        assert_eq!(fits_a_cell(&"y".repeat(40_000)).chars().count(), 32_767);
+        assert_eq!(fits_a_cell("short"), "short");
     }
 }
