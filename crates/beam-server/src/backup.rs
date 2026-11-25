@@ -43,12 +43,20 @@ fn digest_of(path: &Path) -> Result<String, String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Makes sure a file just written has reached the disk. Opened for
+/// writing: Windows refuses to flush a file opened only for reading.
+fn synced(path: &Path) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 /// Copies `from` to `to` and makes sure it reached the disk.
 fn copy_synced(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::copy(from, to).map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))?;
-    std::fs::File::open(to)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("cannot write {}: {e}", to.display()))
+    synced(to)
 }
 
 /// Uploaded files: plain files directly in the folder, without the
@@ -126,9 +134,7 @@ pub fn backup(config: &Config, to: &Path) -> Result<String, String> {
     }
     let partial = to.join(format!("{SUMS}.partial"));
     std::fs::write(&partial, sums).map_err(|e| format!("cannot write {}: {e}", partial.display()))?;
-    std::fs::File::open(&partial)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("cannot write {}: {e}", partial.display()))?;
+    synced(&partial)?;
     std::fs::rename(&partial, to.join(SUMS)).map_err(|e| format!("cannot finish the backup: {e}"))?;
     Ok(format!(
         "Backed up {} files ({:.1} MB) to {}. Check them any time with: sha256sum -c {SUMS}",
