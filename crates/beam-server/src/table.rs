@@ -285,13 +285,20 @@ fn places(rows: &[Vec<Value>], columns: usize) -> Vec<usize> {
     places
 }
 
+/// `n` with `places` decimals, by adding zeros to its own digits: never
+/// rounded or passed through a float, so long values stay exact. A value
+/// with more decimals than that keeps them all.
 fn number_text(n: &serde_json::Number, places: usize) -> String {
-    // A whole-number column has no places, so its values never pass
-    // through a float here.
-    match n.as_f64() {
-        Some(f) if places > 0 && f.is_finite() => format!("{f:.places$}"),
-        _ => n.to_string(),
+    let text = n.to_string();
+    if places == 0 || text.contains(['e', 'E']) {
+        return text;
     }
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.len() > places {
+        return text;
+    }
+    format!("{whole}.{fraction:0<places$}")
 }
 
 fn cell(value: &Value, edm: EdmType, places: usize) -> Markup {
@@ -617,5 +624,17 @@ mod tests {
         // A value written with many digits is capped, not shown in full.
         let long = vec![vec![n("0.30000000000000004")]];
         assert_eq!(super::places(&long, 1), vec![MAX_PLACES]);
+    }
+
+    #[test]
+    fn padding_keeps_every_digit() {
+        let n = |t: &str| match serde_json::from_str::<Value>(t).unwrap() {
+            Value::Number(n) => n,
+            _ => unreachable!(),
+        };
+        assert_eq!(number_text(&n("9007199254740993"), 2), "9007199254740993.00");
+        assert_eq!(number_text(&n("-3.5"), 2), "-3.50");
+        assert_eq!(number_text(&n("1e-7"), 2), "1e-7");
+        assert_eq!(number_text(&n("0.1234567"), 2), "0.1234567");
     }
 }

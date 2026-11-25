@@ -255,14 +255,11 @@ pub async fn check_password(
     };
     // The typed name is written only when it names an account: people
     // sometimes type their password into the username box.
-    // Attempts turned away before the check (locked, busy) skip the lookup,
-    // so a flood of them adds no database work.
+    // A locked attempt names its account too, so each locked account is
+    // recorded separately. Busy attempts, which come when the server is
+    // overloaded, add no lookup.
     let named = match (&account, outcome) {
-        (None, "failure") => state
-            .accounts
-            .list()
-            .ok()
-            .and_then(|all| all.into_iter().find(|a| a.username.eq_ignore_ascii_case(username))),
+        (None, "failure" | "locked") => state.accounts.find(username).ok().flatten(),
         _ => None,
     };
     crate::audit::record(

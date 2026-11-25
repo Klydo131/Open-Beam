@@ -40,27 +40,87 @@ pub async fn with_peer<F: std::future::Future>(peer: Option<IpAddr>, work: F) ->
     PEER.scope(peer, work).await
 }
 
+/// A source of repeated refusals: when its last line was written, how
+/// many like it were left out since, and that line, to write the count with.
+struct Source {
+    since: Instant,
+    left_out: u64,
+    line: Value,
+}
+
+static SEEN: Mutex<Option<HashMap<String, Source>>> = Mutex::new(None);
+
 /// Whether to write an event now, and how many like it were left out
 /// since the last one written. `key` names the kind, source and account.
-fn admit(table: &mut HashMap<String, (Instant, u64)>, key: String, now: Instant) -> Option<u64> {
-    if table.len() >= MAX_SOURCES {
-        table.clear();
+/// Counts that would be lost when the table starts afresh are returned in
+/// `pending` for writing.
+fn admit(
+    table: &mut HashMap<String, Source>,
+    key: String,
+    line: &Value,
+    now: Instant,
+    pending: &mut Vec<Value>,
+) -> Option<u64> {
+    if table.len() >= MAX_SOURCES && !table.contains_key(&key) {
+        pending.extend(table.drain().filter_map(|(_, s)| counted(s)));
     }
     match table.get_mut(&key) {
-        Some((since, left_out)) if now.duration_since(*since) < WINDOW => {
-            *left_out += 1;
+        Some(source) if now.duration_since(source.since) < WINDOW => {
+            source.left_out += 1;
             None
         }
-        Some((since, left_out)) => {
-            let skipped = *left_out;
-            *since = now;
-            *left_out = 0;
+        Some(source) => {
+            let skipped = source.left_out;
+            source.since = now;
+            source.left_out = 0;
             Some(skipped)
         }
         None => {
-            table.insert(key, (now, 0));
+            table.insert(
+                key,
+                Source {
+                    since: now,
+                    left_out: 0,
+                    line: line.clone(),
+                },
+            );
             Some(0)
         }
+    }
+}
+
+/// The line that reports a source's left-out count, if it has one.
+fn counted(source: Source) -> Option<Value> {
+    (source.left_out > 0).then(|| {
+        let mut line = source.line;
+        line["left_out"] = json!(source.left_out);
+        line
+    })
+}
+
+/// Lines for the counts of sources whose window has passed, which are then
+/// forgotten. Without this a burst that stops would never be counted.
+fn due(table: &mut HashMap<String, Source>, now: Instant) -> Vec<Value> {
+    let ended: Vec<String> = table
+        .iter()
+        .filter(|(_, s)| now.duration_since(s.since) >= WINDOW)
+        .map(|(k, _)| k.clone())
+        .collect();
+    ended
+        .into_iter()
+        .filter_map(|key| table.remove(&key).and_then(counted))
+        .collect()
+}
+
+/// Writes the counts of repeated refusals whose window has passed. Called
+/// once a [`WINDOW`] by the server.
+pub fn flush() {
+    let lines = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        due(seen.get_or_insert_with(HashMap::new), Instant::now())
+    };
+    for line in lines {
+        emit(line);
     }
 }
 
@@ -78,37 +138,7 @@ fn shortened(value: Value) -> Value {
 /// says what, and must hold no secret.
 pub fn record(event: &str, outcome: &str, who: Option<&Account>, from: Option<IpAddr>, fields: Value) {
     let from = from.or_else(|| PEER.try_with(|p| *p).ok().flatten());
-    let mut left_out = 0;
-    // Tests run side by side in one process and would share this table,
-    // so they see every line; `admit` itself is tested on its own.
-    if REPEATING.contains(&outcome) && !cfg!(test) {
-        static SEEN: Mutex<Option<HashMap<String, (Instant, u64)>>> = Mutex::new(None);
-        // What was refused is part of the key, so refusals on different
-        // pages are each written; the path is not, so varying it cannot
-        // get round the limit.
-        let mut what = fields.clone();
-        if let Value::Object(map) = &mut what {
-            map.remove("path");
-        }
-        let key = format!(
-            "{event}|{outcome}|{}|{}|{what}",
-            who.map_or(String::new(), |a| a.id.to_string()),
-            from.map_or(String::new(), |ip| crate::net::client(ip).to_string())
-        );
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        match admit(seen.get_or_insert_with(HashMap::new), key, Instant::now()) {
-            Some(skipped) => left_out = skipped,
-            None => return,
-        }
-    }
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let mut line = json!({
-        "audit": event,
-        "outcome": outcome,
-        "at": crate::net::rfc3339(seconds),
-    });
+    let mut line = json!({ "audit": event, "outcome": outcome });
     if let Some(account) = who {
         line["account"] = json!(account.username);
         line["account_id"] = json!(account.id);
@@ -116,14 +146,51 @@ pub fn record(event: &str, outcome: &str, who: Option<&Account>, from: Option<Ip
     if let Some(ip) = from {
         line["from"] = json!(ip.to_string());
     }
-    if left_out > 0 {
-        line["left_out"] = json!(left_out);
-    }
     if let (Value::Object(extra), Value::Object(out)) = (shortened(fields), &mut line) {
         for (key, value) in extra {
             out.entry(key).or_insert(value);
         }
     }
+    // Tests run side by side in one process and would share this table,
+    // so they see every line; `admit` and `due` are tested on their own.
+    if REPEATING.contains(&outcome) && !cfg!(test) {
+        // What was refused is part of the key, so refusals on different
+        // pages are each written; the path is not, so varying it cannot
+        // get round the limit.
+        let mut what = line.clone();
+        if let Value::Object(map) = &mut what {
+            map.remove("path");
+        }
+        let key = what.to_string();
+        let mut pending = Vec::new();
+        let admitted = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            admit(
+                seen.get_or_insert_with(HashMap::new),
+                key,
+                &what,
+                Instant::now(),
+                &mut pending,
+            )
+        };
+        for earlier in pending {
+            emit(earlier);
+        }
+        match admitted {
+            Some(0) => {}
+            Some(skipped) => line["left_out"] = json!(skipped),
+            None => return,
+        }
+    }
+    emit(line);
+}
+
+/// Stamps a line with the time and writes it.
+fn emit(mut line: Value) {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    line["at"] = json!(crate::net::rfc3339(seconds));
     let text = line.to_string();
     #[cfg(test)]
     written().lock().unwrap_or_else(|e| e.into_inner()).push(text.clone());
@@ -179,17 +246,69 @@ mod tests {
     #[test]
     fn repeated_refusals_are_written_once_a_window_with_a_count() {
         let mut table = HashMap::new();
+        let mut pending = Vec::new();
         let start = Instant::now();
-        let key = || "sign_in|locked|1|203.0.113.0".to_string();
-        assert_eq!(admit(&mut table, key(), start), Some(0));
+        let line = json!({ "audit": "sign_in", "outcome": "locked", "account": "bob" });
+        let key = || "bob-locked".to_string();
+        assert_eq!(admit(&mut table, key(), &line, start, &mut pending), Some(0));
         for n in 1..=500 {
-            assert_eq!(admit(&mut table, key(), start + Duration::from_millis(n)), None);
+            assert_eq!(
+                admit(&mut table, key(), &line, start + Duration::from_millis(n), &mut pending),
+                None
+            );
         }
-        // Another source is written at once.
-        assert_eq!(admit(&mut table, "sign_in|locked|2|".into(), start), Some(0));
+        // Another account is written at once.
+        assert_eq!(
+            admit(&mut table, "carol-locked".into(), &line, start, &mut pending),
+            Some(0)
+        );
         // After the window, the next is written with the count left out.
-        assert_eq!(admit(&mut table, key(), start + WINDOW), Some(500));
-        assert_eq!(admit(&mut table, key(), start + WINDOW + Duration::from_secs(1)), None);
+        assert_eq!(admit(&mut table, key(), &line, start + WINDOW, &mut pending), Some(500));
+        assert_eq!(
+            admit(
+                &mut table,
+                key(),
+                &line,
+                start + WINDOW + Duration::from_secs(1),
+                &mut pending
+            ),
+            None
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_burst_that_stops_is_still_counted() {
+        let mut table = HashMap::new();
+        let mut pending = Vec::new();
+        let start = Instant::now();
+        let line = json!({ "audit": "sign_in", "outcome": "locked", "account": "bob" });
+        admit(&mut table, "k".into(), &line, start, &mut pending);
+        for _ in 0..7 {
+            admit(&mut table, "k".into(), &line, start, &mut pending);
+        }
+        // Nothing is due inside the window; after it, one line with the count.
+        assert!(due(&mut table, start + Duration::from_secs(1)).is_empty());
+        let lines = due(&mut table, start + WINDOW);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["left_out"], 7);
+        assert_eq!(lines[0]["account"], "bob");
+        assert!(table.is_empty(), "a counted source is forgotten");
+    }
+
+    #[test]
+    fn counts_are_written_before_the_table_starts_afresh() {
+        let mut table = HashMap::new();
+        let mut pending = Vec::new();
+        let start = Instant::now();
+        let line = json!({ "audit": "x" });
+        for n in 0..MAX_SOURCES {
+            admit(&mut table, n.to_string(), &line, start, &mut pending);
+        }
+        admit(&mut table, "0".into(), &line, start, &mut pending);
+        admit(&mut table, "new".into(), &line, start, &mut pending);
+        assert_eq!(pending.len(), 1, "the one source with a count is written");
+        assert_eq!(pending[0]["left_out"], 1);
     }
 
     #[test]

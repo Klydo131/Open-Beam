@@ -277,6 +277,16 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     state.model_path = config.ontology.clone();
     state.connections = Arc::new(net::Connections::with_trusted_proxies(config.trusted_proxies.clone()));
     let state = Arc::new(state);
+    // Counts of repeated refusals are written once their window passes,
+    // even when the refusals have stopped.
+    tokio::spawn(async {
+        let mut ticks = tokio::time::interval(audit::WINDOW);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            audit::flush();
+        }
+    });
     // Unreviewed drafts are swept hourly, not only at start-up.
     let sweeper = state.clone();
     tokio::spawn(async move {

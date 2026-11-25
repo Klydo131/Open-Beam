@@ -477,6 +477,21 @@ impl Store {
 
     /// Returns the account when the username and password match an active
     /// account. Takes about the same time whether or not the username exists.
+    /// The account a typed username names, if any: one indexed lookup.
+    pub fn find(&self, username: &str) -> Result<Option<Account>, AccountError> {
+        let Ok(username) = normalise_username(username) else {
+            return Ok(None);
+        };
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE username = ?1"),
+                [username],
+                read_account,
+            )
+            .optional()?)
+    }
+
     pub fn verify(&self, username: &str, password: &str) -> Result<Option<Account>, AccountError> {
         let found = match normalise_username(username) {
             Ok(username) => self
