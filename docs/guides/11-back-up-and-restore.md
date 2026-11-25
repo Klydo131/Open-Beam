@@ -35,7 +35,7 @@ sha256sum -c SHA256SUMS
 ```
 
 The account database holds password hashes, so keep backups as private as
-the server itself.
+the server itself; Open Beam makes the folder readable by you alone.
 
 ## Restore
 
@@ -47,14 +47,19 @@ beam restore /backups/beam-2026-11-25
 
 Before changing anything, Open Beam checks every file against its digest
 and checks that the account database is whole. It refuses when anything
-has changed, when the list names a file a backup never holds, or when
-something is still listening on the server's address.
+has changed, when the list names a file a backup never holds or a file
+that is a link, and while Open Beam is running with the same account
+database, whatever address or configuration file it was started with.
 
-Then it puts the account database, the model and the uploaded files in
-place. Whatever it replaces is kept beside it, named
-`… .before-restore-<number>`, so a restore can itself be undone by moving
-those back. Remove them once you are sure.
+Then it makes every part ready beside where it goes and puts them in
+place together: if one cannot be, those already done are put back, so a
+restore happens whole or not at all. Whatever it replaces is kept beside
+it, named `… .before-restore-<number>`, so a restore can itself be undone
+by moving those back. Remove them once you are sure.
 
 Restoring brings back everything as it was when the backup was made:
 accounts created since are gone, and passwords changed since are back to
-what they were.
+what they were. Everyone is signed out and signs in again. API tokens are
+as they were in the backup, so a token revoked since works again: after
+restoring because of a security problem, change passwords and revoke
+tokens again.

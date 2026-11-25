@@ -486,12 +486,19 @@ impl Store {
         let target = to
             .to_str()
             .ok_or(AccountError::BadBackup("the backup path must be valid UTF-8"))?;
-        self.conn().execute("VACUUM INTO ?1", [target])?;
+        // Created empty and private first (VACUUM INTO accepts an empty
+        // file), so the copy is never readable by others, not even briefly.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        options
+            .open(to)
+            .map_err(|_| AccountError::BadBackup("the backup file could not be created"))?;
+        self.conn().execute("VACUUM INTO ?1", [target])?;
         Ok(())
     }
 
@@ -974,6 +981,12 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// Signs everyone out, for example after restoring a backup whose
+    /// sessions may since have been ended. Returns how many there were.
+    pub fn end_all_sessions(&self) -> Result<usize, AccountError> {
+        Ok(self.conn().execute("DELETE FROM sessions", [])?)
     }
 
     pub fn end_session(&self, token: &str) -> Result<(), AccountError> {

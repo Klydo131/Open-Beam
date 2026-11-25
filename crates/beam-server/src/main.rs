@@ -217,6 +217,9 @@ fn load_model(config: &config::Config, engine: &beam_engine::Engine) -> Result<O
 }
 
 async fn serve(config: config::Config, open: bool) -> Result<(), String> {
+    // Held while the server runs, so a restore cannot replace the account
+    // database under it.
+    let _held = backup::hold_accounts(&config.accounts)?;
     let accounts = open_accounts(&config)?;
     let account_count = accounts.count().map_err(|e| e.to_string())?;
     config::check_exposure(&config, account_count)?;

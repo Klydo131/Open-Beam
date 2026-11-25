@@ -82,7 +82,22 @@ pub fn backup(config: &Config, to: &Path) -> Result<String, String> {
     {
         return Err(format!("{} is not empty; back up into a new folder", to.display()));
     }
-    std::fs::create_dir_all(to.join(UPLOADS)).map_err(|e| format!("cannot create {}: {e}", to.display()))?;
+    // Private from the start: the backup holds password hashes and data.
+    let mut folders = std::fs::DirBuilder::new();
+    folders.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        folders.mode(0o700);
+    }
+    folders
+        .create(to.join(UPLOADS))
+        .map_err(|e| format!("cannot create {}: {e}", to.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700));
+    }
     let mut written = Vec::new();
 
     let accounts =
@@ -155,7 +170,12 @@ fn verified(from: &Path) -> Result<Vec<String>, String> {
         if !allowed(name) {
             return Err(format!("{SUMS} names a file a backup never holds: {name}"));
         }
-        if digest_of(&from.join(name))? != digest {
+        let path = from.join(name);
+        // A link could make a restore copy any file on this machine.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            return Err(format!("{name} is not a plain file; nothing was restored"));
+        }
+        if digest_of(&path)? != digest {
             return Err(format!(
                 "{name} has changed since the backup was made; nothing was restored"
             ));
@@ -169,32 +189,62 @@ fn verified(from: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Moves `path` aside to `<path>.before-restore-<stamp>` if it exists.
-fn set_aside(path: &Path, stamp: &str) -> Result<Option<PathBuf>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
+/// The lock a running server holds on its account database, so nothing
+/// replaces the database under it. Servers share it; a restore needs it
+/// alone.
+fn lock_file(accounts: &Path) -> Result<std::fs::File, String> {
+    let mut name = accounts.as_os_str().to_os_string();
+    name.push(".lock");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&name)
+        .map_err(|e| format!("cannot open {}: {e}", Path::new(&name).display()))
+}
+
+/// Held by a running server for as long as it runs.
+pub fn hold_accounts(accounts: &Path) -> Result<std::fs::File, String> {
+    let file = lock_file(accounts)?;
+    file.try_lock_shared()
+        .map_err(|_| "a restore is in progress; start Open Beam when it has finished".to_string())?;
+    Ok(file)
+}
+
+/// `path` with `.<tag>-<stamp>` added to its name.
+fn beside(path: &Path, tag: &str, stamp: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".before-restore-{stamp}"));
-    let aside = path.with_file_name(name);
-    std::fs::rename(path, &aside).map_err(|e| format!("cannot move {} aside: {e}", path.display()))?;
-    Ok(Some(aside))
+    name.push(format!(".{tag}-{stamp}"));
+    path.with_file_name(name)
 }
 
-/// Puts `from` in place of `to`: copied beside it first, then swapped.
-fn put_in_place(from: &Path, to: &Path, stamp: &str) -> Result<(), String> {
-    let mut name = to.file_name().unwrap_or_default().to_os_string();
-    name.push(".restoring");
-    let incoming = to.with_file_name(name);
-    copy_synced(from, &incoming)?;
-    set_aside(to, stamp)?;
-    std::fs::rename(&incoming, to).map_err(|e| format!("cannot put {} in place: {e}", to.display()))
+fn remove_any(path: &Path) {
+    let _ = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
 }
 
-/// Restores the backup in `from` over the files `config` names.
+/// One thing to put in place: the copy made ready beside it, and where
+/// what is there now is kept.
+struct Part {
+    live: PathBuf,
+    staged: Option<PathBuf>,
+    kept: PathBuf,
+    label: String,
+}
+
+/// Restores the backup in `from` over the files `config` names: all of it
+/// or, on any failure, none of it.
 pub fn restore(config: &Config, from: &Path) -> Result<String, String> {
     let names = verified(from)?;
-    // A running server would keep using the files it has open.
+    let lock = lock_file(&config.accounts)?;
+    if lock.try_lock().is_err() {
+        return Err("Open Beam is running with this account database: stop Open Beam before restoring".into());
+    }
+    // A server holds the lock from this version on; an older one is still
+    // noticed by its address.
     if let Err(e) = std::net::TcpListener::bind(config.bind) {
         if e.kind() == std::io::ErrorKind::AddrInUse {
             return Err(format!(
@@ -205,50 +255,144 @@ pub fn restore(config: &Config, from: &Path) -> Result<String, String> {
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| d.as_nanos())
         .to_string();
-    let mut notes = Vec::new();
 
+    // 1. Make everything ready beside where it goes, changing nothing.
+    let mut parts = Vec::new();
+    let mut notes = Vec::new();
+    let staged = beside(&config.accounts, "restoring", &stamp);
+    copy_synced(&from.join(ACCOUNTS), &staged)?;
+    // Sessions in a backup may have been ended since; everyone signs in again.
+    Store::open(&staged)
+        .and_then(|store| store.end_all_sessions())
+        .map_err(|e| {
+            remove_any(&staged);
+            format!("cannot prepare the account database: {e}")
+        })?;
+    parts.push(Part {
+        live: config.accounts.clone(),
+        kept: beside(&config.accounts, "before-restore", &stamp),
+        staged: Some(staged),
+        label: format!("the account database ({})", config.accounts.display()),
+    });
     // A journal left by a crash would be replayed onto the restored
     // database, so it goes aside with the file it belongs to.
     for suffix in ["-journal", "-wal", "-shm"] {
         let mut name = config.accounts.as_os_str().to_os_string();
         name.push(suffix);
-        set_aside(Path::new(&name), &stamp)?;
+        let live = PathBuf::from(name);
+        if live.exists() {
+            parts.push(Part {
+                kept: beside(&live, "before-restore", &stamp),
+                live,
+                staged: None,
+                label: String::new(),
+            });
+        }
     }
-    put_in_place(&from.join(ACCOUNTS), &config.accounts, &stamp)?;
-    notes.push(format!("the account database ({})", config.accounts.display()));
-
-    if names.iter().any(|n| n == MODEL) {
-        match &config.ontology {
-            Some(model) => {
-                put_in_place(&from.join(MODEL), model, &stamp)?;
-                notes.push(format!("the model ({})", model.display()));
+    let ready = (|| -> Result<(), String> {
+        if names.iter().any(|n| n == MODEL) {
+            match &config.ontology {
+                Some(model) => {
+                    let staged = beside(model, "restoring", &stamp);
+                    copy_synced(&from.join(MODEL), &staged)?;
+                    parts.push(Part {
+                        live: model.clone(),
+                        kept: beside(model, "before-restore", &stamp),
+                        staged: Some(staged),
+                        label: format!("the model ({})", model.display()),
+                    });
+                }
+                None => notes.push(format!(
+                    "not the model: set ontology in beam.toml, then copy {MODEL} from the backup"
+                )),
             }
-            None => notes.push(format!(
-                "not the model: set ontology in beam.toml, then copy {MODEL} from the backup"
-            )),
         }
+        let uploads: Vec<&String> = names.iter().filter(|n| n.starts_with("uploads/")).collect();
+        if !uploads.is_empty() || config.uploads.exists() {
+            let staged = beside(&config.uploads, "restoring", &stamp);
+            std::fs::create_dir_all(&staged).map_err(|e| format!("cannot create {}: {e}", staged.display()))?;
+            for name in &uploads {
+                let file = name.trim_start_matches("uploads/");
+                copy_synced(&from.join(name.as_str()), &staged.join(file))?;
+            }
+            parts.push(Part {
+                live: config.uploads.clone(),
+                kept: beside(&config.uploads, "before-restore", &stamp),
+                staged: Some(staged),
+                label: format!("{} uploaded files ({})", uploads.len(), config.uploads.display()),
+            });
+        }
+        // Never overwrite something kept earlier.
+        if let Some(taken) = parts.iter().find(|p| p.kept.exists()) {
+            return Err(format!("{} already exists", taken.kept.display()));
+        }
+        Ok(())
+    })();
+    if let Err(e) = ready {
+        for part in &parts {
+            if let Some(staged) = &part.staged {
+                remove_any(staged);
+            }
+        }
+        return Err(format!("{e}; nothing was restored"));
     }
 
-    let uploads: Vec<&String> = names.iter().filter(|n| n.starts_with("uploads/")).collect();
-    if !uploads.is_empty() || config.uploads.exists() {
-        set_aside(&config.uploads, &stamp)?;
-        std::fs::create_dir_all(&config.uploads)
-            .map_err(|e| format!("cannot create {}: {e}", config.uploads.display()))?;
-        for name in &uploads {
-            let file = name.trim_start_matches("uploads/");
-            copy_synced(&from.join(name.as_str()), &config.uploads.join(file))?;
+    // 2. Swap each into place, undoing all of it if one fails.
+    let mut done: Vec<&Part> = Vec::new();
+    for part in &parts {
+        let swapped = (|| -> std::io::Result<()> {
+            if part.live.exists() {
+                std::fs::rename(&part.live, &part.kept)?;
+            }
+            if let Some(staged) = &part.staged {
+                if let Err(e) = std::fs::rename(staged, &part.live) {
+                    if part.kept.exists() {
+                        let _ = std::fs::rename(&part.kept, &part.live);
+                    }
+                    return Err(e);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = swapped {
+            let mut undone = true;
+            for earlier in done.iter().rev() {
+                if earlier.staged.is_some() {
+                    remove_any(&earlier.live);
+                }
+                if earlier.kept.exists() {
+                    undone &= std::fs::rename(&earlier.kept, &earlier.live).is_ok();
+                }
+            }
+            for part in &parts {
+                if let Some(staged) = &part.staged {
+                    remove_any(staged);
+                }
+            }
+            return Err(if undone {
+                format!("cannot put {} in place: {e}; nothing was restored", part.live.display())
+            } else {
+                format!(
+                    "cannot put {} in place: {e}, and putting back what was there failed; \
+                     the earlier files are kept, ending in .before-restore-{stamp}",
+                    part.live.display()
+                )
+            });
         }
-        notes.push(format!(
-            "{} uploaded files ({})",
-            uploads.len(),
-            config.uploads.display()
-        ));
+        done.push(part);
     }
+    drop(lock);
+    let mut restored: Vec<String> = parts
+        .iter()
+        .filter(|p| !p.label.is_empty())
+        .map(|p| p.label.clone())
+        .collect();
+    restored.extend(notes);
     Ok(format!(
-        "Restored {}. What was there before is kept beside each, ending in .before-restore-{stamp}.",
-        notes.join(", ")
+        "Restored {}. Everyone signs in again. What was there before is kept beside each, ending in .before-restore-{stamp}.",
+        restored.join(", ")
     ))
 }
 
@@ -409,5 +553,92 @@ mod tests {
         assert!(restore(&config, &saved).unwrap_err().contains("stop Open Beam"));
         drop(listener);
         assert!(restore(&config, &saved).is_ok());
+    }
+
+    #[test]
+    fn restoring_twice_keeps_what_was_there_before_the_first() {
+        let place = tempfile::tempdir().unwrap();
+        let config = setup(place.path(), free_port());
+        let saved = place.path().join("saved");
+        backup(&config, &saved).unwrap();
+        Store::open(&config.accounts)
+            .unwrap()
+            .create("bob", PASSWORD, Role::User)
+            .unwrap();
+        restore(&config, &saved).unwrap();
+        // At once again, as a script or an impatient retry would.
+        restore(&config, &saved).unwrap();
+        // Some kept copy still holds bob, who existed before the first restore.
+        let kept_bob = std::fs::read_dir(place.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains("beam-accounts.sqlite.before-restore-"))
+            .any(|p| Store::open(&p).unwrap().find("bob").unwrap().is_some());
+        assert!(kept_bob, "the copy kept by the first restore was lost");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_a_backup_is_refused() {
+        let place = tempfile::tempdir().unwrap();
+        let config = setup(place.path(), free_port());
+        let saved = place.path().join("saved");
+        backup(&config, &saved).unwrap();
+        let outside = place.path().join("secret.txt");
+        std::fs::write(&outside, "private").unwrap();
+        std::os::unix::fs::symlink(&outside, saved.join("uploads/x.csv")).unwrap();
+        let sums = std::fs::read_to_string(saved.join(SUMS)).unwrap();
+        std::fs::write(
+            saved.join(SUMS),
+            format!("{sums}{}  uploads/x.csv\n", digest_of(&outside).unwrap()),
+        )
+        .unwrap();
+        assert!(restore(&config, &saved).unwrap_err().contains("not a plain file"));
+    }
+
+    #[test]
+    fn nothing_is_restored_while_a_server_holds_the_accounts() {
+        let place = tempfile::tempdir().unwrap();
+        let config = setup(place.path(), free_port());
+        let saved = place.path().join("saved");
+        backup(&config, &saved).unwrap();
+        // A server on another address, or with another configuration file,
+        // still holds the accounts it uses.
+        let held = hold_accounts(&config.accounts).unwrap();
+        assert!(restore(&config, &saved).unwrap_err().contains("stop Open Beam"));
+        drop(held);
+        assert!(restore(&config, &saved).is_ok());
+    }
+
+    #[test]
+    fn a_restore_signs_everyone_out() {
+        let place = tempfile::tempdir().unwrap();
+        let config = setup(place.path(), free_port());
+        let store = Store::open(&config.accounts).unwrap();
+        let ada = store.verify("ada", PASSWORD).unwrap().unwrap();
+        let token = store.start_session(ada.id).unwrap().token;
+        let saved = place.path().join("saved");
+        backup(&config, &saved).unwrap();
+        drop(store);
+        restore(&config, &saved).unwrap();
+        let restored = Store::open(&config.accounts).unwrap();
+        assert!(
+            restored.session(&token).unwrap().is_none(),
+            "a session from the backup came back"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_is_private_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let place = tempfile::tempdir().unwrap();
+        let config = setup(place.path(), free_port());
+        let saved = place.path().join("saved");
+        backup(&config, &saved).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&saved), 0o700);
+        assert_eq!(mode(&saved.join(ACCOUNTS)), 0o600);
     }
 }
