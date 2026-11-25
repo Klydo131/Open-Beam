@@ -46,6 +46,8 @@ enum Place {
     Share,
     Accounts,
     Model,
+    /// A dataset that has verified questions to present.
+    Present,
 }
 
 struct Lesson {
@@ -192,6 +194,19 @@ const LESSONS: &[Lesson] = &[
         audience: Audience::Curator,
     },
     Lesson {
+        id: "present",
+        title: "Present the answers",
+        steps: &[
+            "On a dataset's About tab, select Present as slides.",
+            "Press Page Down or Next; press F11 for full screen.",
+            "Print to PDF for a deck, or download a chart for PowerPoint.",
+        ],
+        picture: &["Verified questions", "Present as slides"],
+        point: 1,
+        place: Place::Present,
+        audience: Audience::Everyone,
+    },
+    Lesson {
         id: "accounts",
         title: "Give someone an account",
         steps: &[
@@ -256,7 +271,12 @@ fn picture(lesson: &Lesson) -> Markup {
 }
 
 /// Where "Try it" opens for this person, or why it cannot.
-fn try_it(lesson: &Lesson, visible: &[Entry], account: &beam_accounts::Account) -> Result<String, &'static str> {
+fn try_it(
+    lesson: &Lesson,
+    visible: &[Entry],
+    account: &beam_accounts::Account,
+    presentable: Option<String>,
+) -> Result<String, &'static str> {
     let anchor = format!("#learn-{}", lesson.id);
     let any = visible.first().map(|e| e.set.name.clone());
     let curated = visible
@@ -294,6 +314,10 @@ fn try_it(lesson: &Lesson, visible: &[Entry], account: &beam_accounts::Account) 
             "/datasets/{}/about{anchor}",
             curated.ok_or("Add a dataset of your own first, then try it there.")?
         ),
+        Place::Present => format!(
+            "/datasets/{}/about{anchor}",
+            presentable.ok_or("Save a verified question on a dataset first; then its answers can be presented.")?
+        ),
         Place::Share => format!(
             "/datasets/{}/share{anchor}",
             owned.ok_or("Add a file of your own first: datasets you add are the ones you can share.")?
@@ -308,6 +332,11 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
     };
     let account = &signed.session.account;
     let visible = catalog::visible(&state, account);
+    // A dataset with verified questions, for the lesson on presenting.
+    let presentable = visible
+        .iter()
+        .find(|e| state.accounts.questions(&e.set.name).is_ok_and(|q| !q.is_empty()))
+        .map(|e| e.set.name.clone());
     let admin = account.role == Role::Admin;
     let shown = |audience: Audience| match audience {
         Audience::Everyone | Audience::Curator => true,
@@ -325,7 +354,7 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                                 h3 { (lesson.title) }
                                 (picture(lesson))
                                 ol.learn-steps { @for step in lesson.steps { li { (step) } } }
-                                @match try_it(lesson, &visible, account) {
+                                @match try_it(lesson, &visible, account, presentable.clone()) {
                                     Ok(href) => a.button href=(href) { "Try it" },
                                     Err(why) => p.hint { (why) },
                                 }

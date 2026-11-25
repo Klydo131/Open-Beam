@@ -4694,3 +4694,113 @@ fn tutorial_motion_stops_within_five_seconds_and_honours_reduced_motion() {
         .skip(1)
         .any(|block| block.contains(".learn-arrow { animation: none; }")));
 }
+
+#[tokio::test]
+async fn verified_questions_present_as_slides_and_charts_download_for_powerpoint() {
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    // No questions yet: one title slide and a pointer to the Chart view.
+    let empty = get(&site, "/datasets/sales/present", Some(&ada)).await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(empty.body.contains("No verified questions yet"));
+    let question = [
+        ("question", "Sales by region"),
+        ("group", "region"),
+        ("agg", "sum"),
+        ("measure", "amount"),
+        ("kind", "bar"),
+    ];
+    let saved = submit(&site, &ada, &csrf, "/datasets/sales/questions", &question).await;
+    assert_eq!(saved.location(), "/datasets/sales/about?ok=question");
+    assert!(get(&site, "/datasets/sales/about", Some(&ada))
+        .await
+        .body
+        .contains("/datasets/sales/present"));
+
+    let (bob, _) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let deck = get(&site, "/datasets/sales/present", Some(&bob)).await;
+    assert_eq!(
+        deck.body.matches("<section class=\"slide").count(),
+        2,
+        "title and one question"
+    );
+    assert!(deck.body.contains("Sales by region") && deck.body.contains("Verified by ada"));
+    let svg_link = "/datasets/sales/present/1.svg";
+    assert!(deck.body.contains(svg_link), "{}", deck.body);
+
+    let svg = get(&site, svg_link, Some(&bob)).await;
+    assert_eq!(svg.status, StatusCode::OK);
+    assert_eq!(svg.headers.get(CONTENT_TYPE).unwrap(), "image/svg+xml");
+    assert!(svg
+        .headers
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("attachment"));
+    assert!(svg.body.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
+    assert!(!svg.body.contains("class=") && !svg.body.contains("<script"));
+    assert!(svg.body.contains("EU"), "the chart's own data: {}", svg.body);
+
+    // Nothing for questions that do not exist, or without signing in.
+    assert_eq!(
+        get(&site, "/datasets/sales/present/99.svg", Some(&bob)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&site, "/datasets/sales/present/x.svg", Some(&bob)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(&site, svg_link, None).await.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_private_dataset_cannot_be_presented_by_others() {
+    let site = site(false, 100);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let saved = upload(&site, &bob, &csrf, "p.csv", b"team,score\na,1\nb,2\n", "private_scores").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    let made = submit(
+        &site,
+        &bob,
+        &csrf,
+        "/datasets/private_scores/questions",
+        &[
+            ("question", "Scores"),
+            ("group", "team"),
+            ("agg", "sum"),
+            ("measure", "score"),
+        ],
+    )
+    .await;
+    assert_eq!(made.location(), "/datasets/private_scores/about?ok=question");
+    site.state
+        .accounts
+        .create("carol", "a long enough third passphrase", Role::User)
+        .unwrap();
+    let (carol, _) = sign_in(&site, "carol", "a long enough third passphrase").await;
+    assert_eq!(
+        get(&site, "/datasets/private_scores/present", Some(&carol))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&site, "/datasets/private_scores/present/1.svg", Some(&carol))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&site, "/datasets/private_scores/present", Some(&bob)).await.status,
+        StatusCode::OK
+    );
+}
+
+#[test]
+fn slides_print_one_widescreen_page_each() {
+    let css = include_str!("../static/app.css");
+    assert!(css.contains("@page { size: 13.333in 7.5in;"), "PowerPoint's 16:9 page");
+    assert!(css.contains(".slide + .slide { break-before: page; }"));
+    assert!(css.contains("scroll-snap-type: y mandatory"));
+}

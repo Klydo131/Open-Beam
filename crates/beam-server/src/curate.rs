@@ -663,6 +663,8 @@ pub async fn about(
                     @if curator { " Draw the answer on the " a href={ (base) "/chart" } { "Chart" } " view, then save it as a verified question there." }
                 }
             } @else {
+                (crate::learn::spot("present", "show these answers as slides; print them to PDF or download a chart for PowerPoint."))
+                p { a.button.quiet href={ (base) "/present" } { "Present as slides" } }
                 ul.plain {
                     @for q in &questions {
                         li {

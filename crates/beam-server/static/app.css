@@ -306,3 +306,28 @@ dl.counters dd, .facts dd, .stats strong { font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) {
   .learn-arrow { animation: none; }
 }
+
+/* ---------------------------------------------------------------- Present
+   Slides one screen high that snap into place (no script); printed, one
+   16:9 page each (13.333 in × 7.5 in, PowerPoint's widescreen size). */
+.presenting { margin: 0; }
+main.deck { height: 100vh; max-width: none; margin: 0; padding: 0; overflow-y: auto; scroll-snap-type: y mandatory; }
+.slide { box-sizing: border-box; height: 100vh; scroll-snap-align: start; display: flex; flex-direction: column; justify-content: center; gap: 1rem; padding: 5vh 7vw 3vh; border-bottom: 1px solid var(--border); }
+.slide h1 { font-size: clamp(2rem, 5vw, 3.6rem); margin: 0; }
+.slide h2 { font-size: clamp(1.4rem, 3vw, 2.4rem); margin: 0; font-weight: 600; }
+.slide-kicker { margin: 0; color: var(--accent); font-weight: 600; letter-spacing: 0.04em; }
+.slide-lede { margin: 0; font-size: clamp(1.05rem, 1.8vw, 1.4rem); color: var(--muted); max-width: 50rem; }
+.slide-chart { flex: 1; min-height: 0; display: flex; align-items: center; }
+.slide-chart .chart { width: 100%; max-height: 62vh; }
+.slide-meta { margin: 0; color: var(--muted); font-size: 0.9rem; }
+.slide-nav { display: flex; gap: 1.2rem; align-items: center; font-size: 0.9rem; margin-top: auto; }
+.slide-count { color: var(--muted); margin-right: auto; order: -1; }
+@media print {
+  @page { size: 13.333in 7.5in; margin: 0; }
+  :root { --bg: #ffffff; --panel: #ffffff; --text: #1d2129; --muted: #5d6470; --border: #ffffff; --accent: #b86e00; --raised: #eef0f3; }
+  .presenting, main.deck { height: auto; overflow: visible; background: #fff; }
+  .slide { height: 7.5in; border: 0; overflow: hidden; }
+  .slide + .slide { break-before: page; }
+  .slide-nav, .slide-meta a { display: none; }
+  .slide-chart .chart { max-height: 5in; }
+}

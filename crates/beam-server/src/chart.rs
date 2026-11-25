@@ -92,7 +92,7 @@ fn shorten(label: &str, max_chars: usize) -> String {
 }
 
 /// Horizontal bars, one per group, with the value written beside each.
-fn bar_chart(points: &[(String, f64)], title: &str) -> Markup {
+pub(crate) fn bar_chart(points: &[(String, f64)], title: &str) -> Markup {
     const LEFT: f64 = 210.0;
     const WIDTH: f64 = 440.0;
     const ROW: f64 = 30.0;
@@ -137,7 +137,7 @@ fn tidy_axis(min: f64, max: f64) -> (f64, f64, f64) {
 }
 
 /// A line through the groups in their natural order.
-fn line_chart(points: &[(String, f64)], title: &str) -> Markup {
+pub(crate) fn line_chart(points: &[(String, f64)], title: &str) -> Markup {
     const LEFT: f64 = 70.0;
     const RIGHT: f64 = 740.0;
     const TOP: f64 = 20.0;
