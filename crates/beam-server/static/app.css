@@ -282,7 +282,7 @@ dl.counters dd, .facts dd, .stats strong { font-variant-numeric: tabular-nums; }
 .learn-spot { display: none; }
 .learn-spot:target { display: block; margin: 0.4rem 0 0.6rem; scroll-margin-top: 1.5rem; flex-basis: 100%; }
 .learn-tip { display: flex; align-items: center; gap: 0.6rem; margin: 0; padding: 0.55rem 0.8rem; border: 2px dashed var(--accent); border-radius: 8px; background: var(--panel); color: var(--text); max-width: 40rem; }
-.learn-tip strong { color: var(--accent); }
+.learn-tip strong { color: var(--text); }
 .learn-tip span { flex: 1; }
 .learn-done { white-space: nowrap; font-weight: 600; }
 .learn-arrow { color: var(--accent); flex: none; animation: learn-nudge 1s ease-in-out 4; }

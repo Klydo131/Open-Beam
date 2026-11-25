@@ -448,9 +448,9 @@ pub async fn dataset(
 
     let body = html! {
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
+        (crate::learn::spot("download", "the Download buttons on the right give you exactly the rows on screen."))
         div.titlebar {
             h1 { (set.name) }
-            (crate::learn::spot("download", "Download Excel gives you exactly the rows on screen."))
             div.actions {
                 a.button.quiet href=(with_query(&format!("/datasets/{}/export.csv", set.name), &here)) download { "Download CSV" }
                 a.button href=(with_query(&format!("/datasets/{}/export.xlsx", set.name), &here)) download { "Download Excel" }

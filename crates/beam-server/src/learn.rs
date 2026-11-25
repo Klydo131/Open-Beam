@@ -226,12 +226,15 @@ const ARROW: &str = r#"<svg class="learn-arrow" viewBox="0 0 24 24" width="28" h
 /// it directly before the control it points at: it stays hidden unless the
 /// address ends in `#learn-<id>`, and then the control after it is marked.
 pub fn spot(id: &str, tip: &str) -> Markup {
+    // "Got it" goes to a mark just above the tip, which closes it without
+    // moving the reader's place on the page.
     html! {
+        span id={ "learn-" (id) "-seen" } {}
         div.learn-spot id={ "learn-" (id) } role="note" {
             p.learn-tip {
                 (PreEscaped(ARROW))
                 span { strong { "Tip: " } (tip) }
-                a.learn-done href="#" { "Got it" }
+                a.learn-done href={ "#learn-" (id) "-seen" } { "Got it" }
             }
         }
     }
