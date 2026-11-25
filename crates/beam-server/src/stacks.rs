@@ -143,7 +143,7 @@ pub fn lanes(lanes: &[Lane<'_>], facts: &Facts, picked: Option<&str>) -> Markup 
                             a class={ "spine " (lane.tone) @if chosen { " chosen" } }
                                 href={ "/?pick=" (name) "#inspector" }
                                 aria-current=[chosen.then_some("true")] {
-                                strong.spine-title { (name) }
+                                strong.spine-title { (breakable(name)) }
                                 span.spine-meta { (entry.set.properties.len()) " columns" }
                                 span.spine-meta { (note) }
                                 @let (reached, next) = facts.level(name);
@@ -188,7 +188,7 @@ pub fn counters(entries: &[Entry], facts: &Facts) -> Markup {
             div { dt { "Described" } dd { (described) } }
             div { dt { "Watched" } dd { (watched) } }
             div { dt { "Verified" } dd { (trusted) } }
-            div { dt { "Verified answers" } dd { (verified) } }
+            div { dt { "Verified questions" } dd { (verified) } }
             div class={ @if alerts > 0 { "alerting" } } { dt { "Alerts" } dd { (alerts) } }
         }
     }
@@ -258,6 +258,18 @@ pub fn inspector(state: &AppState, entry: &Entry, facts: &Facts) -> Markup {
                     }
                 }
             }
+        }
+    }
+}
+
+/// A dataset name that may wrap after each `_`, so `orders_with_customers`
+/// breaks between words on a narrow card instead of inside one.
+fn breakable(name: &str) -> Markup {
+    let mut parts = name.split_inclusive('_').peekable();
+    html! {
+        @while let Some(part) = parts.next() {
+            (part)
+            @if parts.peek().is_some() { wbr; }
         }
     }
 }

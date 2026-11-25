@@ -146,7 +146,10 @@ Against attacks that need no account:
   these lines: let the service manager (systemd, Docker) keep them,
   ideally on another machine, so someone who breaks in cannot erase them.
   Attempts turned away because a name or address is locked out are
-  recorded without the name.
+  recorded without the name. A refusal that repeats (the same kind, from
+  the same address, for the same account) is written at most once a
+  minute, with a count of the ones left out, so a flood of guesses
+  cannot flood the record: 300 wrong passwords in a row write six lines.
 
 ## Your data and credentials
 

@@ -245,7 +245,19 @@ pub fn cross_site_fetch(method: &Method, headers: &HeaderMap) -> bool {
 /// Headers every response carries. Pages load nothing from other origins and
 /// run no scripts, and the policy says so.
 async fn security_headers(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let peer = request.extensions().get::<crate::net::Peer>().map(|p| p.0);
+    crate::audit::with_peer(peer, guarded(state, request, next)).await
+}
+
+async fn guarded(state: Arc<AppState>, request: Request, next: Next) -> Response {
     let mut response = if cross_site_fetch(request.method(), request.headers()) {
+        crate::audit::record(
+            "cross_site_request_refused",
+            "refused",
+            None,
+            None,
+            serde_json::json!({ "method": request.method().as_str(), "path": request.uri().path() }),
+        );
         (
             StatusCode::FORBIDDEN,
             "Requests from other websites are not accepted.\n",

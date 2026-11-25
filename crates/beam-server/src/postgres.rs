@@ -51,6 +51,8 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) {
     let slots = Arc::new(crate::net::Connections::with_limits(MAX_CONNECTIONS, MAX_PER_ADDRESS));
     loop {
         let Ok((stream, address)) = listener.accept().await else {
+            // Out of file handles, for example: pause rather than spin.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
         let Some(slot) = slots.admit(address.ip()) else {

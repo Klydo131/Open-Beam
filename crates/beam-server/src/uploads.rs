@@ -438,6 +438,13 @@ fn managed(state: &AppState, signed: &Signed, name: &str) -> Result<Entry, Respo
         ));
     }
     if !table::can_manage(signed, &entry) {
+        crate::audit::record(
+            "access_denied",
+            "refused",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({ "needs": "owner", "dataset": entry.set.name }),
+        );
         return Err(message_page(
             StatusCode::FORBIDDEN,
             "Not your dataset",

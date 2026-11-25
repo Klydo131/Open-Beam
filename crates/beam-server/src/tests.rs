@@ -674,7 +674,7 @@ async fn dataset_pages_show_sort_filter_and_page_through_rows() {
 
     let table = view("/datasets/sales").await;
     assert!(table.body.contains("Rows 1–4 of 4"));
-    assert!(table.body.contains("<td class=\"num\">10.5</td>") && table.body.contains("<td class=\"null\">—</td>"));
+    assert!(table.body.contains("<td class=\"num\">10.50</td>") && table.body.contains("<td class=\"null\">—</td>"));
     assert!(
         table.body.contains("<td>2024-01-06 08:30:00</td>"),
         "timestamps read naturally on a page"
@@ -684,7 +684,7 @@ async fn dataset_pages_show_sort_filter_and_page_through_rows() {
     assert!(!table.body.contains("<script"));
 
     let sorted = view("/datasets/sales?sort=amount&dir=desc").await;
-    assert!(sorted.body.find(">40.0<").unwrap() < sorted.body.find(">10.5<").unwrap());
+    assert!(sorted.body.find(">40.00<").unwrap() < sorted.body.find(">10.50<").unwrap());
     assert!(sorted.body.contains("aria-sort=\"descending\""));
 
     let filtered = view("/datasets/sales?column=region&op=contains&value=eu").await;
@@ -4471,6 +4471,24 @@ async fn the_security_record_says_who_did_what_and_holds_no_secret() {
     let (auditee, csrf_auditee) = sign_in(&site, "auditee", "a long enough first passphrase").await;
     let refused = get(&site, "/admin/accounts", Some(&auditee)).await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        get(&site, "/admin/system", Some(&auditee)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    // A post another website makes the browser send.
+    let cross = call(
+        &site,
+        "POST",
+        "/account/profile",
+        Call {
+            cookie: Some(&auditee),
+            fetch_site: Some("cross-site"),
+            form: Some(&[("csrf", "x")]),
+            ..Call::default()
+        },
+    )
+    .await;
+    assert_eq!(cross.status, StatusCode::FORBIDDEN);
     let token = new_token(&site, &auditee, &csrf_auditee, "audit test").await;
     let bad = call(
         &site,
@@ -4505,6 +4523,12 @@ async fn the_security_record_says_who_did_what_and_holds_no_secret() {
     );
     assert!(find("sign_in", "success", "auditee"));
     assert!(find("access_denied", "refused", "auditee"));
+    assert!(lines
+        .iter()
+        .any(|l| l["audit"] == "access_denied" && l["area"] == "system" && l["account"] == "auditee"));
+    assert!(lines
+        .iter()
+        .any(|l| l["audit"] == "cross_site_request_refused" && l["path"] == "/account/profile"));
     assert!(find("token_created", "success", "auditee"));
     assert!(lines.iter().any(|l| l["audit"] == "token_refused"));
     for line in crate::audit::written().lock().unwrap().iter() {
@@ -4551,6 +4575,9 @@ async fn an_assistant_is_told_when_more_rows_remain_and_a_bad_page_size_is_refus
     // Exactly what was asked for: no next page offered, as in the REST API.
     let ten = mcp(&site, &token, rows(Some(json!(10))), None).await.json();
     assert_eq!(ten["result"]["structuredContent"]["rows"].as_array().unwrap().len(), 10);
+    // ...but still told that more rows exist.
+    assert_eq!(ten["result"]["structuredContent"]["more"], true);
+    assert_eq!(all["result"]["structuredContent"]["more"], Value::Null);
     // A page size that is not a whole number from 1 up is refused, not ignored.
     for bad in [
         json!("abc"),
@@ -4562,4 +4589,23 @@ async fn an_assistant_is_told_when_more_rows_remain_and_a_bad_page_size_is_refus
         let reply = mcp(&site, &token, rows(Some(bad.clone())), None).await.json();
         assert_eq!(reply["result"]["isError"], true, "top = {bad}: {reply}");
     }
+}
+
+#[tokio::test]
+async fn pages_show_numbers_and_names_the_way_people_read_them() {
+    let site = site(false, 50);
+    let (bob, _) = sign_in(&site, "bob", USER_PASSWORD).await;
+    // Identifiers are counted but never added up; amounts are.
+    let about = get(&site, "/datasets/sales/about", Some(&bob)).await.body;
+    assert_eq!(about.matches("Not added up").count(), 1, "only order_id: {about}");
+    assert!(about.contains("100.75"), "the amount total stays");
+    // A column of decimals shows one number of places, under a right-aligned heading.
+    let table = get(&site, "/datasets/sales", Some(&bob)).await.body;
+    assert!(table.contains(">20.00<") && table.contains(">10.50<"), "{table}");
+    assert!(table.contains("<th class=\"num\""));
+    // Long names wrap between their words on the home page.
+    let modeled = editable_site(&format!("{SALE_AND_ITEM}{OF_ITEM}"));
+    let (ada, _) = sign_in(&modeled, "ada", ADMIN_PASSWORD).await;
+    let home = get(&modeled, "/", Some(&ada)).await.body;
+    assert!(home.contains("sales_<wbr>with_<wbr>many"), "{home}");
 }

@@ -355,8 +355,13 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                                     @let at = 1 + index * beam_odata::PROFILE_WIDTH;
                                     tr {
                                         th scope="row" { (name) }
+                                        @let identifier = is_identifier(name, &set.key);
                                         @for offset in 0..beam_odata::PROFILE_WIDTH {
-                                            td.num { (show(figures.get(at + offset).copied().flatten())) }
+                                            @if offset == 1 && identifier {
+                                                td.num title="Not added up: the values are identifiers, not amounts" { "—" }
+                                            } @else {
+                                                td.num { (show(figures.get(at + offset).copied().flatten())) }
+                                            }
                                         }
                                     }
                                 }
@@ -757,6 +762,13 @@ fn curated(
     check_csrf(&signed, setting(form, "csrf").unwrap_or(""))?;
     let entry = catalog::find(state, &signed.session.account, name).ok_or_else(not_found)?;
     if !can_curate(&signed.session.account, &entry) {
+        crate::audit::record(
+            "access_denied",
+            "refused",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({ "needs": "owner", "dataset": entry.set.name }),
+        );
         return Err(message_page(
             StatusCode::FORBIDDEN,
             "Not your dataset",
@@ -1015,4 +1027,11 @@ pub fn save_question_form(set: &EntitySet, csrf: &str, current: &[(&str, &str)],
             }
         }
     }
+}
+
+/// A column of identifiers, whose total means nothing: the dataset's key,
+/// or one named `id` or ending in `_id` by the usual convention.
+fn is_identifier(column: &str, key: &str) -> bool {
+    let lower = column.to_ascii_lowercase();
+    column == key || lower == "id" || lower.ends_with("_id")
 }

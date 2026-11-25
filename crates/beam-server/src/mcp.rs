@@ -54,7 +54,7 @@ fn tools() -> Value {
         {
             "name": "query_rows",
             "title": "Read rows",
-            "description": "Reads up to 200 rows of a dataset, optionally filtered, sorted and limited to some columns. Use count=true to also get the total number of matching rows.",
+            "description": "Reads up to 200 rows of a dataset, optionally filtered, sorted and limited to some columns. Use count=true to also get the total number of matching rows. When more rows match than were returned, the reply says more=true and gives next_skip to pass as skip for the next page; answer from all pages, or say the answer covers only part.",
             "inputSchema": { "type": "object", "properties": {
                 "name": name,
                 "filter": filter,
@@ -174,7 +174,9 @@ async fn query_rows(
     if let Some(rows) = body.get_mut("rows").and_then(Value::as_array_mut) {
         if rows.len() as u64 > page {
             rows.truncate(usize::try_from(page).unwrap_or(usize::MAX));
-            // Asking for exactly this many is a request to stop here.
+            // Asking for exactly this many is a request to stop here, but
+            // the assistant is still told that more rows exist.
+            body["more"] = json!(true);
             if asked != Some(page) {
                 body["next_skip"] = json!(skip + page);
             }

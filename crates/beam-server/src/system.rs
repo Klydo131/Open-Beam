@@ -72,6 +72,13 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
         Err(response) => return response,
     };
     if signed.session.account.role != Role::Admin {
+        crate::audit::record(
+            "access_denied",
+            "refused",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({ "needs": "administrator", "area": "system" }),
+        );
         return message_page(
             StatusCode::FORBIDDEN,
             "Administrators only",
@@ -188,6 +195,13 @@ pub async fn page_route(State(state): App, headers: HeaderMap) -> Response {
 /// The same figures in Prometheus' text format, for administrators.
 pub async fn metrics_route(State(state): App, Extension(viewer): Extension<Viewer>) -> Response {
     if viewer.0.role != Role::Admin {
+        crate::audit::record(
+            "access_denied",
+            "refused",
+            Some(&viewer.0),
+            None,
+            serde_json::json!({ "needs": "administrator", "area": "metrics" }),
+        );
         return (StatusCode::FORBIDDEN, "Only administrators can read metrics.\n").into_response();
     }
     let Some(stats) = read_stats(&state).await else {

@@ -251,11 +251,55 @@ pub fn readable_timestamp(text: &str) -> String {
     }
 }
 
-fn cell(value: &Value, edm: EdmType) -> Markup {
+fn is_number(edm: EdmType) -> bool {
+    matches!(
+        edm,
+        EdmType::Int32 | EdmType::Int64 | EdmType::Double | EdmType::Decimal { .. }
+    )
+}
+
+/// Digits after the point in `n` as written, ignoring a lone `.0`.
+fn fraction_digits(n: &serde_json::Number) -> usize {
+    let text = n.to_string();
+    match text.split_once('.') {
+        Some((_, fraction)) if !text.contains(['e', 'E']) => fraction.trim_end_matches('0').len(),
+        _ => 0,
+    }
+}
+
+/// Most decimals shown for one column.
+const MAX_PLACES: usize = 6;
+
+/// Decimal places for each column on this page: the most any of its values
+/// has, so a column of amounts lines up (35.83, 429.10, 697.00). Only the
+/// display changes; downloads and feeds keep the values as they are.
+fn places(rows: &[Vec<Value>], columns: usize) -> Vec<usize> {
+    let mut places = vec![0; columns];
+    for row in rows {
+        for (at, value) in row.iter().enumerate().take(columns) {
+            if let Value::Number(n) = value {
+                places[at] = places[at].max(fraction_digits(n).min(MAX_PLACES));
+            }
+        }
+    }
+    places
+}
+
+fn number_text(n: &serde_json::Number, places: usize) -> String {
+    // A whole-number column has no places, so its values never pass
+    // through a float here.
+    match n.as_f64() {
+        Some(f) if places > 0 && f.is_finite() => format!("{f:.places$}"),
+        _ => n.to_string(),
+    }
+}
+
+fn cell(value: &Value, edm: EdmType, places: usize) -> Markup {
     match value {
         Value::Null => html! { td.null { "—" } },
         Value::String(s) if edm == EdmType::DateTimeOffset => html! { td { (readable_timestamp(s)) } },
-        Value::Number(n) => html! { td.num { (n.to_string()) } },
+        Value::Number(n) if n.to_string().contains(['e', 'E']) => html! { td.num { (n.to_string()) } },
+        Value::Number(n) => html! { td.num { (number_text(n, places)) } },
         Value::Bool(b) => html! { td { (if *b { "true" } else { "false" }) } },
         Value::String(s) => html! { td { (s) } },
         other => html! { td { (other.to_string()) } },
@@ -461,7 +505,7 @@ pub async fn dataset(
                         @for property in &view.columns {
                             @let active = view.sort == Some(property.name.as_str());
                             @let next = if active && !view.descending { "desc" } else { "asc" };
-                            th aria-sort=[active.then_some(if view.descending { "descending" } else { "ascending" })] {
+                            th class=[is_number(property.edm).then_some("num")] aria-sort=[active.then_some(if view.descending { "descending" } else { "ascending" })] {
                                 a href=(table_link(set, &query, 1, Some((&property.name, next)))) {
                                     // The row number the engine adds reads as a plain "#".
                                     (if property.name == beam_engine::ROW_KEY { "#" } else { property.name.as_str() })
@@ -472,8 +516,9 @@ pub async fn dataset(
                     }
                 }
                 tbody {
+                    @let places = places(&rows, view.columns.len());
                     @for row in &rows {
-                        tr { @for (value, property) in row.iter().zip(&view.columns) { (cell(value, property.edm)) } }
+                        tr { @for ((value, property), places) in row.iter().zip(&view.columns).zip(&places) { (cell(value, property.edm, *places)) } }
                     }
                 }
             }
@@ -548,5 +593,29 @@ mod tests {
             power_query("http://h/odata/s?$filter=a eq \"x\""),
             "let\n    Source = OData.Feed(\"http://h/odata/s?$filter=a eq \"\"x\"\"\", null, [Implementation = \"2.0\"])\nin\n    Source"
         );
+    }
+
+    #[test]
+    fn a_column_shows_one_number_of_decimals() {
+        let n = |t: &str| serde_json::from_str::<Value>(t).unwrap();
+        let rows = vec![
+            vec![n("35.83"), n("10001")],
+            vec![n("429.1"), n("10002")],
+            vec![n("697.0"), n("3")],
+        ];
+        let places = places(&rows, 2);
+        assert_eq!(places, vec![2, 0]);
+        let shown: Vec<String> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Number(x) => number_text(x, places[0]),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(shown, ["35.83", "429.10", "697.00"]);
+        assert_eq!(number_text(&serde_json::Number::from(10001), 0), "10001");
+        // A value written with many digits is capped, not shown in full.
+        let long = vec![vec![n("0.30000000000000004")]];
+        assert_eq!(super::places(&long, 1), vec![MAX_PLACES]);
     }
 }
