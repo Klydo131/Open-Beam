@@ -42,6 +42,9 @@ pub struct AppState {
     pub model: std::sync::RwLock<Option<Arc<crate::model::Model>>>,
     /// The file the model is read from and saved to, when there is one.
     pub model_path: Option<std::path::PathBuf>,
+    /// Fingerprint of the file text the running model was read from, to
+    /// tell when the file has been changed by hand since.
+    pub model_source: std::sync::RwLock<String>,
     /// Held while a change to the model is applied, so two cannot overlap.
     pub model_edit: tokio::sync::Mutex<()>,
     /// The model's checks against the data and when they were made. An async
@@ -70,6 +73,7 @@ impl AppState {
             profiles: std::sync::Mutex::default(),
             model: std::sync::RwLock::new(None),
             model_path: None,
+            model_source: std::sync::RwLock::default(),
             model_edit: tokio::sync::Mutex::const_new(()),
             model_checks: tokio::sync::Mutex::const_new(None),
         }

@@ -51,6 +51,7 @@ struct Call<'a> {
     basic: Option<(&'a str, &'a str)>,
     form: Option<&'a [(&'a str, &'a str)]>,
     fetch_site: Option<&'a str>,
+    bearer: Option<&'a str>,
 }
 
 /// A site with two datasets and, unless `fresh`, an administrator `ada` and a user `bob`.
@@ -69,6 +70,10 @@ fn editable_site(model: &str) -> Site {
 }
 
 fn build_site(fresh: bool, max_page_size: u64, model: Option<&str>, editable: bool) -> Site {
+    build_site_with(Store::open_in_memory().unwrap(), fresh, max_page_size, model, editable)
+}
+
+fn build_site_with(accounts: Store, fresh: bool, max_page_size: u64, model: Option<&str>, editable: bool) -> Site {
     let dir = tempfile::tempdir().unwrap();
     let sales = dir.path().join("sales.csv");
     std::fs::write(
@@ -94,7 +99,6 @@ fn build_site(fresh: bool, max_page_size: u64, model: Option<&str>, editable: bo
         Some(&uploads),
     )
     .unwrap();
-    let accounts = Store::open_in_memory().unwrap();
     if !fresh {
         accounts.create_first_admin("ada", ADMIN_PASSWORD).unwrap();
         accounts.create("bob", USER_PASSWORD, Role::User).unwrap();
@@ -110,6 +114,7 @@ fn build_site(fresh: bool, max_page_size: u64, model: Option<&str>, editable: bo
         let path = dir.path().join("ontology.toml");
         std::fs::write(&path, model.unwrap_or_default()).unwrap();
         state.model_path = Some(path);
+        state.model_source = std::sync::RwLock::new(crate::model_edit::digest(model.unwrap_or_default()));
     }
     let state = Arc::new(state);
     Site {
@@ -130,6 +135,9 @@ async fn call(site: &Site, method: &str, uri: &str, call: Call<'_>) -> Reply {
     if let Some((username, password)) = call.basic {
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         request = request.header(AUTHORIZATION, format!("Basic {encoded}"));
+    }
+    if let Some(token) = call.bearer {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
     }
     if let Some(site) = call.fetch_site {
         request = request.header("sec-fetch-site", site);
@@ -1812,7 +1820,7 @@ async fn abandoned_sign_ins_do_not_lock_an_account_for_good() {
     // client that disconnects does.
     for n in 0..5 {
         let password = format!("abandoned {n}");
-        let attempt = crate::auth::check_password(&site.state, "bob", &password, None);
+        let attempt = crate::auth::check_password(&site.state, "bob", &password, None, "web");
         let _ = tokio::time::timeout(std::time::Duration::from_millis(1), attempt).await;
     }
     assert_eq!(
@@ -1901,7 +1909,7 @@ async fn a_flood_of_sign_ins_is_turned_away_instead_of_queued() {
             } else {
                 ("bob".to_string(), USER_PASSWORD)
             };
-            crate::auth::check_password(&state, &name, password, None).await
+            crate::auth::check_password(&state, &name, password, None, "web").await
         }
     });
     let outcomes = futures_join(attempts).await;
@@ -3333,7 +3341,7 @@ async fn one_address_spraying_passwords_across_usernames_is_stopped() {
         // must not wipe out the bot's failures.
         if n == crate::auth::MAX_ADDRESS_FAILURES / 2 {
             assert!(
-                crate::auth::check_password(&site.state, "ada", ADMIN_PASSWORD, Some(bot))
+                crate::auth::check_password(&site.state, "ada", ADMIN_PASSWORD, Some(bot), "web")
                     .await
                     .unwrap()
                     .is_some()
@@ -3341,7 +3349,7 @@ async fn one_address_spraying_passwords_across_usernames_is_stopped() {
         }
         // A different username each time, so no single username locks.
         let name = format!("user{n}");
-        match crate::auth::check_password(&site.state, &name, "Summer2026!", Some(bot)).await {
+        match crate::auth::check_password(&site.state, &name, "Summer2026!", Some(bot), "web").await {
             Ok(None) => {}
             Err(crate::auth::Refused::Locked) => {
                 refused_at = Some(n);
@@ -3355,33 +3363,35 @@ async fn one_address_spraying_passwords_across_usernames_is_stopped() {
     // it is tried...
     for _ in 0..6 {
         assert!(matches!(
-            crate::auth::check_password(&site.state, "bob", "a wrong guess", Some(bot)).await,
+            crate::auth::check_password(&site.state, "bob", "a wrong guess", Some(bot), "web").await,
             Err(crate::auth::Refused::Locked)
         ));
     }
     // ...and those refusals did not count against bob himself...
-    assert!(crate::auth::check_password(&site.state, "bob", USER_PASSWORD, None)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, None, "web")
+            .await
+            .unwrap()
+            .is_some()
+    );
     // ...and everyone else, and this machine, still sign in.
     let elsewhere: std::net::IpAddr = "198.51.100.4".parse().unwrap();
     assert!(
-        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(elsewhere))
+        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(elsewhere), "web")
             .await
             .unwrap()
             .is_some()
     );
     let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     assert!(
-        crate::auth::check_password(&site.state, "ada", ADMIN_PASSWORD, Some(local))
+        crate::auth::check_password(&site.state, "ada", ADMIN_PASSWORD, Some(local), "web")
             .await
             .unwrap()
             .is_some()
     );
     site.state.guard.age_attempts(crate::auth::FAILURE_WINDOW);
     assert!(
-        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(bot))
+        crate::auth::check_password(&site.state, "bob", USER_PASSWORD, Some(bot), "web")
             .await
             .unwrap()
             .is_some()
@@ -4370,4 +4380,186 @@ async fn a_remade_join_loses_what_described_its_old_data_and_files_keep_lf() {
     let saved = std::fs::read_to_string(site.state.model_path.clone().unwrap()).unwrap();
     assert!(!saved.contains('\r'));
     assert_eq!(saved, recipe);
+}
+
+#[tokio::test]
+async fn a_preview_that_cannot_count_what_would_be_lost_refuses_the_change() {
+    let place = tempfile::tempdir().unwrap();
+    let file = place.path().join("accounts.sqlite");
+    let start = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    let site = build_site_with(Store::open(&file).unwrap(), false, 50, Some(&start), true);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    // The accounts database fails underneath the server.
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch("DROP TABLE watches")
+        .unwrap();
+    let (shown, _) = preview(&site, &ada, &csrf, SALE_AND_ITEM).await;
+    assert!(
+        shown
+            .body
+            .contains("cannot count what is written about sales_with_many"),
+        "{}",
+        shown.body
+    );
+    assert!(!shown.body.contains("/model/apply"));
+    let digest = crate::model_edit::digest(&start);
+    let refused = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", SALE_AND_ITEM), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(site.state.engine.dataset("sales_with_many").is_some());
+}
+
+#[tokio::test]
+async fn the_edit_page_says_when_the_file_is_not_what_is_running() {
+    let site = editable_site(SALE_AND_ITEM);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let notice = "has been changed since the running model was read";
+    assert!(!get(&site, "/model/edit", Some(&ada)).await.body.contains(notice));
+    let path = site.state.model_path.clone().unwrap();
+    let by_hand = format!("{SALE_AND_ITEM}{OF_ITEM}");
+    std::fs::write(&path, &by_hand).unwrap();
+    assert!(get(&site, "/model/edit", Some(&ada)).await.body.contains(notice));
+    // Applying the file puts it in force, and the notice goes.
+    let (_, digest) = preview(&site, &ada, &csrf, &by_hand).await;
+    let applied = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/model/apply",
+        &[("text", &by_hand), ("digest", &digest)],
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::SEE_OTHER, "{}", applied.body);
+    assert!(!get(&site, "/model/edit", Some(&ada)).await.body.contains(notice));
+}
+
+#[tokio::test]
+async fn the_security_record_says_who_did_what_and_holds_no_secret() {
+    let site = editable_site(SALE_AND_ITEM);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let made = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/admin/accounts",
+        &[
+            ("username", "auditee"),
+            ("password", "a long enough first passphrase"),
+            ("role", "user"),
+        ],
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::SEE_OTHER);
+    // A wrong password for a real account, and a password typed where the
+    // username goes.
+    let typed_secret = "my-own-passphrase-typed-in-the-wrong-box";
+    post(
+        &site,
+        "/login",
+        None,
+        &[("username", "auditee"), ("password", "a wrong guess entirely")],
+    )
+    .await;
+    post(&site, "/login", None, &[("username", typed_secret), ("password", "x")]).await;
+    let (auditee, csrf_auditee) = sign_in(&site, "auditee", "a long enough first passphrase").await;
+    let refused = get(&site, "/admin/accounts", Some(&auditee)).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let token = new_token(&site, &auditee, &csrf_auditee, "audit test").await;
+    let bad = call(
+        &site,
+        "GET",
+        "/api/v1/datasets",
+        Call {
+            bearer: Some("obt_not_a_real_token_at_all"),
+            ..Call::default()
+        },
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
+
+    let lines: Vec<serde_json::Value> = crate::audit::written()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let find = |event: &str, outcome: &str, who: &str| {
+        lines
+            .iter()
+            .any(|l| l["audit"] == event && l["outcome"] == outcome && l["account"] == who)
+    };
+    assert!(find("account_change", "success", "ada"), "{lines:?}");
+    assert!(lines
+        .iter()
+        .any(|l| l["audit"] == "account_change" && l["target"]["username"] == "auditee"));
+    assert!(
+        find("sign_in", "failure", "auditee"),
+        "a failure names the real account"
+    );
+    assert!(find("sign_in", "success", "auditee"));
+    assert!(find("access_denied", "refused", "auditee"));
+    assert!(find("token_created", "success", "auditee"));
+    assert!(lines.iter().any(|l| l["audit"] == "token_refused"));
+    for line in crate::audit::written().lock().unwrap().iter() {
+        for secret in [
+            typed_secret,
+            "a long enough first passphrase",
+            "a wrong guess entirely",
+            &token,
+            ADMIN_PASSWORD,
+            &csrf,
+            &ada,
+        ] {
+            assert!(!line.contains(secret), "{line} holds a secret");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_assistant_is_told_when_more_rows_remain_and_a_bad_page_size_is_refused() {
+    // The server's own page limit is high, so only the assistant limits apply.
+    let site = site(false, 1000);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    let token = new_token(&site, &ada, &csrf, "assistant").await;
+    let rows = |top: Option<Value>| {
+        let mut arguments = json!({ "name": "many" });
+        if let Some(top) = top {
+            arguments["top"] = top;
+        }
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "query_rows", "arguments": arguments } })
+    };
+    // No page size: the first 50 of 120, and where the next page starts.
+    let first = mcp(&site, &token, rows(None), None).await.json();
+    let content = &first["result"]["structuredContent"];
+    assert_eq!(content["rows"].as_array().unwrap().len(), 50, "{first}");
+    assert_eq!(content["next_skip"], 50, "{first}");
+    // More than an assistant may take at once: cut to 200, and here all 120 fit.
+    let all = mcp(&site, &token, rows(Some(json!(500))), None).await.json();
+    assert_eq!(
+        all["result"]["structuredContent"]["rows"].as_array().unwrap().len(),
+        120
+    );
+    assert_eq!(all["result"]["structuredContent"]["next_skip"], Value::Null);
+    // Exactly what was asked for: no next page offered, as in the REST API.
+    let ten = mcp(&site, &token, rows(Some(json!(10))), None).await.json();
+    assert_eq!(ten["result"]["structuredContent"]["rows"].as_array().unwrap().len(), 10);
+    // A page size that is not a whole number from 1 up is refused, not ignored.
+    for bad in [
+        json!("abc"),
+        json!(-5),
+        json!(0),
+        json!(2.5),
+        json!("99999999999999999999"),
+    ] {
+        let reply = mcp(&site, &token, rows(Some(bad.clone())), None).await.json();
+        assert_eq!(reply["result"]["isError"], true, "top = {bad}: {reply}");
+    }
 }

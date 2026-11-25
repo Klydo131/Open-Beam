@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod audit;
 mod auth;
 mod catalog;
 mod chart;
@@ -197,13 +198,14 @@ fn refuse_names_taken_by_uploads(engine: &beam_engine::Engine, accounts: &Store)
 /// The model named by `ontology`, checked against the configured datasets.
 /// A model with problems stops the server, listing all of them, as any other
 /// mistake in the configuration does.
-fn load_model(config: &config::Config, engine: &beam_engine::Engine) -> Result<Option<model::Model>, String> {
+/// The model and the text it was read from.
+fn load_model(config: &config::Config, engine: &beam_engine::Engine) -> Result<Option<(model::Model, String)>, String> {
     let Some(path) = &config.ontology else {
         return Ok(None);
     };
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     model::parse(&text, &model::configured_sets(engine))
-        .map(Some)
+        .map(|model| Some((model, text)))
         .map_err(|problems| format!("{}:\n  {}", path.display(), problems.join("\n  ")))
 }
 
@@ -218,7 +220,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     // Checked, and its joined datasets made, before anything listens and
     // before uploads return, so a mistake stops the start and configured
     // names always win.
-    let model = load_model(&config, &engine)?;
+    let (model, source) = load_model(&config, &engine)?.unzip();
     if let Some(model) = &model {
         model.add_joins(&engine)?;
     }
@@ -271,6 +273,7 @@ async fn serve(config: config::Config, open: bool) -> Result<(), String> {
     );
     state.max_upload_bytes = config.max_upload_mb.saturating_mul(1024 * 1024);
     state.model = std::sync::RwLock::new(model.map(Arc::new));
+    state.model_source = std::sync::RwLock::new(source.as_deref().map(model_edit::digest).unwrap_or_default());
     state.model_path = config.ontology.clone();
     state.connections = Arc::new(net::Connections::with_trusted_proxies(config.trusted_proxies.clone()));
     let state = Arc::new(state);

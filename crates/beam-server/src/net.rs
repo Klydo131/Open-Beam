@@ -64,6 +64,10 @@ pub fn client(ip: IpAddr) -> IpAddr {
 pub struct Connections {
     open: Mutex<(usize, HashMap<IpAddr, usize>)>,
     trusted: Vec<IpAddr>,
+    /// At most this many at once (0: [`MAX_CONNECTIONS`]).
+    total: usize,
+    /// At most this many from one address (0: [`MAX_PER_ADDRESS`]).
+    per_address: usize,
 }
 
 /// True when `peer` is one of the configured reverse proxies.
@@ -128,8 +132,17 @@ pub struct Place {
 impl Connections {
     pub fn with_trusted_proxies(trusted: Vec<IpAddr>) -> Self {
         Self {
-            open: Mutex::default(),
             trusted,
+            ..Self::default()
+        }
+    }
+
+    /// A table with its own limits, for a listener other than the website.
+    pub fn with_limits(total: usize, per_address: usize) -> Self {
+        Self {
+            total,
+            per_address,
+            ..Self::default()
         }
     }
 
@@ -142,7 +155,13 @@ impl Connections {
         let from = client(from);
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let mine = open.1.get(&from).copied().unwrap_or(0);
-        if open.0 >= MAX_CONNECTIONS || (mine >= MAX_PER_ADDRESS && !exempt) {
+        let total = if self.total == 0 { MAX_CONNECTIONS } else { self.total };
+        let per_address = if self.per_address == 0 {
+            MAX_PER_ADDRESS
+        } else {
+            self.per_address
+        };
+        if open.0 >= total || (mine >= per_address && !exempt) {
             return None;
         }
         open.0 += 1;
@@ -400,5 +419,21 @@ mod tests {
             MAX_PER_ADDRESS * 2,
             "a reverse proxy is not capped per address"
         );
+    }
+
+    #[test]
+    fn a_listener_can_have_its_own_limits() {
+        let table = Arc::new(Connections::with_limits(5, 2));
+        let a: IpAddr = "203.0.113.7".parse().unwrap();
+        let b: IpAddr = "198.51.100.4".parse().unwrap();
+        let held: Vec<Place> = (0..2).map(|_| table.admit(a).unwrap()).collect();
+        assert!(table.admit(a).is_none(), "a third from one address is refused");
+        let local = IpAddr::from([127, 0, 0, 1]);
+        // Two from another address and one from this machine fill all five.
+        let more: Vec<Place> = [b, b, local].into_iter().map(|ip| table.admit(ip).unwrap()).collect();
+        assert!(table.admit(local).is_none(), "the total holds for everyone");
+        drop(held);
+        assert!(table.admit(a).is_some(), "places are given back");
+        drop(more);
     }
 }

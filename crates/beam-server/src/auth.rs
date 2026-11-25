@@ -237,7 +237,45 @@ pub fn expired_cookie() -> HeaderValue {
 /// Checks a username and password off the async runtime, applying the
 /// failed-attempt limits (per username, and per address when `from` is
 /// known) and the bound on waiting attempts.
+/// Checks a password and records the attempt: `via` says where it came
+/// from ("web", "feed", "reauthenticate").
 pub async fn check_password(
+    state: &Arc<AppState>,
+    username: &str,
+    password: &str,
+    from: Option<std::net::IpAddr>,
+    via: &str,
+) -> Result<Option<Account>, Refused> {
+    let result = check_password_quietly(state, username, password, from).await;
+    let (outcome, account) = match &result {
+        Ok(Some(account)) => ("success", Some(account.clone())),
+        Ok(None) => ("failure", None),
+        Err(Refused::Locked) => ("locked", None),
+        Err(Refused::Busy) => ("busy", None),
+    };
+    // The typed name is written only when it names an account: people
+    // sometimes type their password into the username box.
+    // Attempts turned away before the check (locked, busy) skip the lookup,
+    // so a flood of them adds no database work.
+    let named = match (&account, outcome) {
+        (None, "failure") => state
+            .accounts
+            .list()
+            .ok()
+            .and_then(|all| all.into_iter().find(|a| a.username.eq_ignore_ascii_case(username))),
+        _ => None,
+    };
+    crate::audit::record(
+        "sign_in",
+        outcome,
+        account.as_ref().or(named.as_ref()),
+        from,
+        serde_json::json!({ "via": via }),
+    );
+    result
+}
+
+async fn check_password_quietly(
     state: &Arc<AppState>,
     username: &str,
     password: &str,
@@ -347,7 +385,17 @@ async fn admit(
     }
     // A personal API token: a long random secret looked up by its digest.
     if let Some(secret) = bearer_token(headers) {
-        return Ok(state.accounts.token_account(secret).ok().flatten());
+        let account = state.accounts.token_account(secret).ok().flatten();
+        if account.is_none() {
+            crate::audit::record(
+                "token_refused",
+                "failure",
+                None,
+                from,
+                serde_json::json!({ "via": "feed" }),
+            );
+        }
+        return Ok(account);
     }
     let Some((username, password)) = basic_credentials(headers) else {
         return Ok(None);
@@ -367,7 +415,7 @@ async fn admit(
             return Ok(state.accounts.get(*id).ok().filter(|account| account.active));
         }
     }
-    let Some(account) = check_password(state, &username, &password, from).await? else {
+    let Some(account) = check_password(state, &username, &password, from, "feed").await? else {
         return Ok(None);
     };
     let mut verified = state.guard.verified.lock().unwrap_or_else(|e| e.into_inner());
@@ -397,6 +445,13 @@ pub async fn same_site_posts_only(State(state): State<Arc<AppState>>, request: R
         !(ours.iter().any(|o| o == origin) || state.public_url.as_deref() == Some(origin))
     });
     if request.method() == Method::POST && (labelled_cross_site || foreign_origin) {
+        crate::audit::record(
+            "cross_site_post_refused",
+            "refused",
+            None,
+            request.extensions().get::<crate::net::Peer>().map(|p| p.0),
+            serde_json::json!({ "path": request.uri().path() }),
+        );
         return crate::web::message_page(
             StatusCode::FORBIDDEN,
             "Request refused",

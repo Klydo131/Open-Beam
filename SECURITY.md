@@ -60,6 +60,8 @@ Against attacks that need no account:
   right; the header is ignored from every other address. Connection limits
   per address still see the proxy, which has only the overall limit, so
   limit connections per visitor in the proxy itself.
+- **PostgreSQL connections** are limited to 64 at once and 8 from any
+  one address other than this machine, apart from the website's.
 - **PostgreSQL clients that read slowly** hold one of two places kept for
   streamed results, apart from the places every other query uses, so they
   can delay each other but not the website or the data feed.
@@ -133,8 +135,18 @@ Against attacks that need no account:
 - **Sign-in limiting is per username.** Someone who can reach the sign-in page
   can keep a known username locked by guessing repeatedly. Limit who can reach
   the page, and note that the lock clears by itself after five minutes.
-- **No audit log yet.** Account changes and sign-ins are not recorded beyond
-  each account's last sign-in time.
+- **The security record goes to standard error.** Every sign-in (web,
+  data feed and PostgreSQL, succeeded or not), sign-out, refused API
+  token, refused administrator page, refused form token, form posted from
+  another site, account change, API token change and model change is
+  written as one JSON line with the time in UTC, the account and, where
+  known, the visitor's address (after OWASP ASVS 5.0 chapter V16). No
+  password, token or cookie is written, and a name typed at sign-in is
+  written only when it names an account. Open Beam does not keep or rotate
+  these lines: let the service manager (systemd, Docker) keep them,
+  ideally on another machine, so someone who breaks in cannot erase them.
+  Attempts turned away because a name or address is locked out are
+  recorded without the name.
 
 ## Your data and credentials
 

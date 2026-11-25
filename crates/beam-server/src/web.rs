@@ -155,6 +155,13 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Signed, Respon
     if signed.session.account.role == Role::Admin {
         Ok(signed)
     } else {
+        crate::audit::record(
+            "access_denied",
+            "refused",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({ "needs": "administrator" }),
+        );
         Err(message_page(
             StatusCode::FORBIDDEN,
             "Administrators only",
@@ -167,6 +174,13 @@ pub fn check_csrf(signed: &Signed, submitted: &str) -> Result<(), Response> {
     if bool::from(submitted.as_bytes().ct_eq(signed.session.csrf.as_bytes())) {
         Ok(())
     } else {
+        crate::audit::record(
+            "form_token_refused",
+            "refused",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({}),
+        );
         Err(message_page(
             StatusCode::FORBIDDEN,
             "Request refused",
@@ -365,7 +379,7 @@ pub async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let from = peer.map(|p| p.0 .0);
-    match auth::check_password(&state, &form.username, &form.password, from).await {
+    match auth::check_password(&state, &form.username, &form.password, from, "web").await {
         Ok(Some(account)) => start_session(&state, &account, "/"),
         // One message for every failure, so the page does not reveal which usernames exist.
         Ok(None) => login_page(
@@ -388,6 +402,13 @@ pub async fn logout(State(state): App, headers: HeaderMap, Form(form): Form<Csrf
             return response;
         }
         let _ = state.accounts.end_session(&signed.token);
+        crate::audit::record(
+            "sign_out",
+            "success",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({}),
+        );
     }
     let mut response = redirect("/login");
     response.headers_mut().insert(SET_COOKIE, auth::expired_cookie());
@@ -641,7 +662,15 @@ pub async fn create_token(State(state): App, headers: HeaderMap, Form(form): For
     if let Err(response) = check_csrf(&signed, &form.csrf) {
         return response;
     }
-    match state.accounts.create_token(signed.session.account.id, &form.name) {
+    let created = state.accounts.create_token(signed.session.account.id, &form.name);
+    crate::audit::record(
+        "token_created",
+        if created.is_ok() { "success" } else { "failure" },
+        Some(&signed.session.account),
+        None,
+        serde_json::json!({ "token_id": created.as_ref().ok().map(|(token, _)| token.id), "name": form.name }),
+    );
+    match created {
         Ok((_, secret)) => {
             let body = html! {
                 h1 { "Settings" }
@@ -668,7 +697,15 @@ pub async fn revoke_token(
     if let Err(response) = check_csrf(&signed, &form.csrf) {
         return response;
     }
-    match state.accounts.revoke_token(signed.session.account.id, id) {
+    let revoked = state.accounts.revoke_token(signed.session.account.id, id);
+    crate::audit::record(
+        "token_revoked",
+        if revoked.is_ok() { "success" } else { "failure" },
+        Some(&signed.session.account),
+        None,
+        serde_json::json!({ "token_id": id }),
+    );
+    match revoked {
         Ok(()) => redirect("/account?ok=token-revoked#tokens"),
         Err(_) => redirect("/account?error=not-found#tokens"),
     }
@@ -741,12 +778,19 @@ pub async fn change_password(State(state): App, headers: HeaderMap, Form(form): 
         return redirect("/account?error=mismatch");
     }
     let me = signed.session.account.clone();
-    match auth::check_password(&state, &me.username, &form.current, None).await {
+    match auth::check_password(&state, &me.username, &form.current, None, "reauthenticate").await {
         Ok(Some(_)) => {}
         _ => return redirect("/account?error=current"),
     }
     let (id, password) = (me.id, form.password);
-    match blocking(&state, move |s| s.accounts.set_password(id, &password)).await {
+    let result = blocking(&state, move |s| s.accounts.set_password(id, &password)).await;
+    changed(
+        &signed,
+        "change_own_password",
+        serde_json::json!({ "account_id": id }),
+        &result,
+    );
+    match result {
         Ok(()) => {
             state.guard.forget_verified();
             // Changing the password ended every session, including this one.
@@ -831,6 +875,18 @@ pub async fn accounts(State(state): App, Query(query): Query<HashMap<String, Str
 }
 
 /// Shared tail of every account-management action.
+/// Records an account change made by `by` to `target`.
+fn changed(by: &Signed, action: &str, target: serde_json::Value, result: &Result<(), AccountError>) {
+    let outcome = if result.is_ok() { "success" } else { "failure" };
+    crate::audit::record(
+        "account_change",
+        outcome,
+        Some(&by.session.account),
+        None,
+        serde_json::json!({ "action": action, "target": target }),
+    );
+}
+
 fn after_change(state: &AppState, result: Result<(), AccountError>, ok: &str) -> Response {
     state.guard.forget_verified();
     match result {
@@ -854,16 +910,24 @@ pub struct CreateAccountForm {
 }
 
 pub async fn create_account(State(state): App, headers: HeaderMap, Form(form): Form<CreateAccountForm>) -> Response {
-    if let Err(response) = admin_post(&state, &headers, &form.csrf) {
-        return response;
-    }
+    let signed = match admin_post(&state, &headers, &form.csrf) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
     let Some(role) = Role::parse(&form.role) else {
         return redirect("/admin/accounts?error=role");
     };
+    let username = form.username.clone();
     let result = blocking(&state, move |s| {
         s.accounts.create(&form.username, &form.password, role).map(|_| ())
     })
     .await;
+    changed(
+        &signed,
+        "create",
+        serde_json::json!({ "username": username, "role": role.as_str() }),
+        &result,
+    );
     after_change(&state, result, "created")
 }
 
@@ -879,13 +943,21 @@ pub async fn set_role(
     headers: HeaderMap,
     Form(form): Form<RoleForm>,
 ) -> Response {
-    if let Err(response) = admin_post(&state, &headers, &form.csrf) {
-        return response;
-    }
+    let signed = match admin_post(&state, &headers, &form.csrf) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
     let Some(role) = Role::parse(&form.role) else {
         return redirect("/admin/accounts?error=role");
     };
-    after_change(&state, state.accounts.set_role(id, role), "role")
+    let result = state.accounts.set_role(id, role);
+    changed(
+        &signed,
+        "set_role",
+        serde_json::json!({ "account_id": id, "role": role.as_str() }),
+        &result,
+    );
+    after_change(&state, result, "role")
 }
 
 #[derive(Deserialize)]
@@ -900,11 +972,14 @@ pub async fn set_active(
     headers: HeaderMap,
     Form(form): Form<ActiveForm>,
 ) -> Response {
-    if let Err(response) = admin_post(&state, &headers, &form.csrf) {
-        return response;
-    }
+    let signed = match admin_post(&state, &headers, &form.csrf) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
     let ok = if form.active { "enabled" } else { "disabled" };
-    after_change(&state, state.accounts.set_active(id, form.active), ok)
+    let result = state.accounts.set_active(id, form.active);
+    changed(&signed, ok, serde_json::json!({ "account_id": id }), &result);
+    after_change(&state, result, ok)
 }
 
 #[derive(Deserialize)]
@@ -924,6 +999,12 @@ pub async fn reset_password(
         Err(response) => return response,
     };
     let result = blocking(&state, move |s| s.accounts.set_password(id, &form.password)).await;
+    changed(
+        &signed,
+        "reset_password",
+        serde_json::json!({ "account_id": id }),
+        &result,
+    );
     if result.is_ok() && id == signed.session.account.id {
         // An administrator who resets their own password stays signed in.
         state.guard.forget_verified();

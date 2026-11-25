@@ -735,14 +735,20 @@ pub async fn metric(
     Ok(answer)
 }
 
+/// "1 row", "2 rows", in the page's number format.
+fn counted(n: f64, one: &str, many: &str) -> String {
+    format!("{} {}", format_number(n), if n == 1.0 { one } else { many })
+}
+
 fn key_status(figures: Option<[f64; 3]>) -> Markup {
     match figures {
         None => html! { span.status { "Could not be checked" } },
+        Some([1.0, 1.0, 0.0]) => html! { span.status.ok { "Its 1 row has a key" } },
         Some([rows, distinct, empty]) if empty == 0.0 && distinct == rows => {
             html! { span.status.ok { "Each of " (format_number(rows)) " rows has its own key" } }
         }
         Some([rows, distinct, empty]) => html! {
-            span.status.alert { (format_number(rows - distinct)) " repeated, " (format_number(empty)) " empty keys" }
+            span.status.alert { (format_number(rows - distinct)) " repeated, " (counted(empty, "empty key", "empty keys")) }
         },
     }
 }
@@ -750,6 +756,7 @@ fn key_status(figures: Option<[f64; 3]>) -> Markup {
 fn rule_status(figures: Option<[f64; 2]>) -> Markup {
     match figures {
         None => html! { span.status { "Could not be checked" } },
+        Some([1.0, 0.0]) => html! { span.status.ok { "Its 1 row keeps it" } },
         Some([rows, 0.0]) => html! { span.status.ok { "All " (format_number(rows)) " rows keep it" } },
         Some([_, 1.0]) => html! { span.status.alert { "1 row breaks it" } },
         Some([_, breaking]) => html! { span.status.alert { (format_number(breaking)) " rows break it" } },
@@ -759,8 +766,9 @@ fn rule_status(figures: Option<[f64; 2]>) -> Markup {
 fn link_status(figures: Option<[f64; 2]>) -> Markup {
     match figures {
         None => html! { span.status { "Could not be checked" } },
+        Some([1.0, 0.0]) => html! { span.status.ok { "It points to one" } },
         Some([linked, 0.0]) => html! { span.status.ok { "All " (format_number(linked)) " point to one" } },
-        Some([_, orphans]) => html! { span.status.alert { (format_number(orphans)) " point to nothing" } },
+        Some([_, orphans]) => html! { span.status.alert { (counted(orphans, "points", "point")) " to nothing" } },
     }
 }
 
@@ -1084,5 +1092,17 @@ mod tests {
             problems.contains("declared twice") && problems.contains("already describes another object"),
             "{problems}"
         );
+    }
+
+    #[test]
+    fn statuses_count_one_in_the_singular() {
+        let text = |m: Markup| m.into_string();
+        assert!(text(key_status(Some([1.0, 1.0, 0.0]))).contains("Its 1 row has a key"));
+        assert!(text(key_status(Some([3.0, 2.0, 1.0]))).contains("1 repeated, 1 empty key<"));
+        assert!(text(key_status(Some([3.0, 1.0, 2.0]))).contains("2 empty keys"));
+        assert!(text(rule_status(Some([1.0, 0.0]))).contains("Its 1 row keeps it"));
+        assert!(text(link_status(Some([1.0, 0.0]))).contains("It points to one"));
+        assert!(text(link_status(Some([5.0, 1.0]))).contains("1 points to nothing"));
+        assert!(text(link_status(Some([5.0, 2.0]))).contains("2 point to nothing"));
     }
 }

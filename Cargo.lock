@@ -440,6 +440,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "maud",
+ "rusqlite",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

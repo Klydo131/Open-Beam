@@ -170,7 +170,9 @@ pub fn plan(state: &AppState, text: &str) -> Plan {
         match before.get(name) {
             None => plan.changes.push(format!("Makes the joined dataset {name}")),
             Some(old_recipe) if old_recipe != recipe => {
-                let [notes, questions, watches] = state.accounts.curation_count(name).unwrap_or_default();
+                let Some([notes, questions, watches]) = kept(state, &mut plan, name) else {
+                    continue;
+                };
                 let mut line = format!("Makes the joined dataset {name} again, from its new link");
                 if notes + questions + watches > 0 {
                     line.push_str(&format!(
@@ -188,11 +190,28 @@ pub fn plan(state: &AppState, text: &str) -> Plan {
         plan.added_joins.push(name.clone());
     }
     for name in before.keys().filter(|n| !after.contains_key(*n)) {
-        let kept = state.accounts.curation_count(name).unwrap_or_default();
-        plan.removed_joins.push((name.clone(), kept));
+        if let Some(counts) = kept(state, &mut plan, name) {
+            plan.removed_joins.push((name.clone(), counts));
+        }
+    }
+    if !plan.problems.is_empty() {
+        return plan;
     }
     plan.model = Some(new);
     plan
+}
+
+/// What is written about `name`, or a problem: a preview must never say
+/// nothing would be lost when it could not look.
+fn kept(state: &AppState, plan: &mut Plan, name: &str) -> Option<[u64; 3]> {
+    match state.accounts.curation_count(name) {
+        Ok(counts) => Some(counts),
+        Err(e) => {
+            plan.problems
+                .push(format!("cannot count what is written about {name}: {e}"));
+            None
+        }
+    }
 }
 
 fn describe<T: std::fmt::Debug>(items: &[T], name: impl Fn(&T) -> &String) -> BTreeMap<String, String> {
@@ -266,6 +285,7 @@ fn apply_now(state: &AppState, text: &str, planned_from: &str) -> Result<(), Str
         return Err(e);
     }
     *state.model.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(new));
+    *state.model_source.write().unwrap_or_else(|e| e.into_inner()) = digest(text);
     // What was written about a joined dataset that is gone no longer
     // describes anything, and must not reappear on a later dataset of that
     // name, such as an upload. A remade one now holds other data.
@@ -327,6 +347,13 @@ fn count(n: u64, one: &str) -> String {
 fn admin(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::Signed, Response> {
     let signed = require_signed_in(state, headers)?;
     if signed.session.account.role != Role::Admin {
+        crate::audit::record(
+            "access_denied",
+            "refused",
+            Some(&signed.session.account),
+            None,
+            serde_json::json!({ "needs": "administrator", "area": "model" }),
+        );
         return Err(message_page(
             StatusCode::FORBIDDEN,
             "Administrators only",
@@ -367,6 +394,9 @@ pub async fn edit_route(State(state): App, headers: HeaderMap) -> Response {
     let body = html! {
         p.crumbs { a href="/model" { "Model" } " / Edit" }
         h1 { "Edit the model" }
+        @if digest(&text) != *state.model_source.read().unwrap_or_else(|e| e.into_inner()) {
+            p.notice role="status" { "The model file has been changed since the running model was read from it. Preview to see how the file differs from what is in force; applying it puts the file in force." }
+        }
         section.panel { (editor(&signed.session.csrf, &text)) }
     };
     page(StatusCode::OK, layout("Edit the model", Some(&signed), body))
@@ -463,7 +493,15 @@ pub async fn apply_route(State(state): App, headers: HeaderMap, Form(form): Form
         return response;
     }
     let form = form.normalised();
-    match apply(&state, form.text.clone(), form.digest.clone()).await {
+    let result = apply(&state, form.text.clone(), form.digest.clone()).await;
+    crate::audit::record(
+        "model_change",
+        if result.is_ok() { "success" } else { "failure" },
+        Some(&signed.session.account),
+        None,
+        serde_json::json!({ "file_digest": digest(&form.text), "reason": result.as_ref().err() }),
+    );
+    match result {
         Ok(()) => redirect("/model"),
         Err(error) => {
             let worker = state.clone();

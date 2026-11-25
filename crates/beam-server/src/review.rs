@@ -166,7 +166,7 @@ pub async fn review(
             }
         }
         section {
-            h2.section { "First " (preview.rows.len()) " rows" }
+            h2.section { @if preview.rows.len() == 1 { "The first row" } @else { "First " (preview.rows.len()) " rows" } }
             div.tablewrap {
                 table {
                     thead { tr { @for column in &preview.columns { th { (column.name) } } } }

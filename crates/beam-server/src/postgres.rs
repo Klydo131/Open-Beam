@@ -23,6 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// Connections served at once; more are refused straight away.
 const MAX_CONNECTIONS: usize = 64;
+/// Connections from one address at once; this machine is not limited.
+const MAX_PER_ADDRESS: usize = 8;
 /// Longest any single message from a client may be.
 const MAX_MESSAGE: usize = 1024 * 1024;
 /// Time allowed to send the start-up messages and sign in.
@@ -43,12 +45,15 @@ const CANCEL_REQUEST: i32 = 80_877_102;
 
 /// Accepts connections until the process ends.
 pub async fn serve(listener: TcpListener, state: Arc<AppState>) {
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    // Kept apart from the website's connections, and limited per address
+    // too, so one client cannot hold every place, even for the 15 seconds
+    // each may take to sign in.
+    let slots = Arc::new(crate::net::Connections::with_limits(MAX_CONNECTIONS, MAX_PER_ADDRESS));
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, address)) = listener.accept().await else {
             continue;
         };
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
+        let Some(slot) = slots.admit(address.ip()) else {
             let mut stream = stream;
             let _ = stream
                 .write_all(&error_message("53300", "too many connections to Open Beam"))
@@ -58,7 +63,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) {
         let state = state.clone();
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
-            let _ = Connection::new(stream, state).run().await;
+            let _ = Connection::new(stream, state, address.ip()).run().await;
             drop(slot);
         });
     }
@@ -123,6 +128,8 @@ struct Connection {
     reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     writer: BufWriter<tokio::io::WriteHalf<TcpStream>>,
     state: Arc<AppState>,
+    /// The client's address, for the security record.
+    from: std::net::IpAddr,
     account: Option<Account>,
     /// Prepared statements with the parameter types the client declared.
     statements: std::collections::HashMap<String, (Prepared, Vec<i32>)>,
@@ -141,12 +148,13 @@ async fn read_body(reader: &mut (impl AsyncReadExt + Unpin), length: i32) -> std
 }
 
 impl Connection {
-    fn new(stream: TcpStream, state: Arc<AppState>) -> Self {
+    fn new(stream: TcpStream, state: Arc<AppState>, from: std::net::IpAddr) -> Self {
         let (read, write) = tokio::io::split(stream);
         Self {
             reader: BufReader::new(read),
             writer: BufWriter::new(write),
             state,
+            from,
             account: None,
             statements: Default::default(),
             portals: Default::default(),
@@ -219,6 +227,13 @@ impl Connection {
             .ok()
             .flatten()
             .filter(|account| account.username.eq_ignore_ascii_case(user.trim()));
+        crate::audit::record(
+            "sign_in",
+            if account.is_some() { "success" } else { "failure" },
+            account.as_ref(),
+            Some(self.from),
+            serde_json::json!({ "via": "postgres" }),
+        );
         let Some(account) = account else {
             self.send(&error_message(
                 "28P01",

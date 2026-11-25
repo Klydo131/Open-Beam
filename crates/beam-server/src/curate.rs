@@ -340,7 +340,7 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                 None => p.empty { "The profile could not be worked out in time." },
                 Some(figures) => {
                     p.hint {
-                        (show(figures[0])) " rows. Compare the row count and totals with the source to confirm nothing was lost or counted twice. "
+                        (show(figures[0])) @if figures[0] == Some(1.0) { " row. " } @else { " rows. " } "Compare the row count and totals with the source to confirm nothing was lost or counted twice. "
                         "Half of the values lie between the 25th and 75th percentiles."
                     }
                     div.tablewrap {
