@@ -145,6 +145,8 @@ Step-by-step guides, in order:
 7. [Add, share and export data](docs/guides/07-add-share-and-export.md)
 8. [Connect programs and AI assistants](docs/guides/08-connect-programs-and-assistants.md)
 9. [Describe, verify and watch your data](docs/guides/09-describe-verify-and-watch.md)
+10. [Describe the model](docs/guides/10-describe-the-model.md)
+11. [Back up and restore](docs/guides/11-back-up-and-restore.md)
 
 ## Architecture
 

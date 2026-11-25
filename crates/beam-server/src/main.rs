@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod audit;
 mod auth;
+mod backup;
 mod catalog;
 mod chart;
 mod config;
@@ -58,6 +59,10 @@ enum Command {
     Serve,
     /// Create an administrator account. The password is read from BEAM_ADMIN_PASSWORD.
     CreateAdmin { username: String },
+    /// Copy the accounts, model and uploaded files to a new folder. Safe while the server runs.
+    Backup { folder: std::path::PathBuf },
+    /// Put a backup back. Stop the server first; what is replaced is kept beside it.
+    Restore { folder: std::path::PathBuf },
 }
 
 /// Threads that run blocking work (queries, password checks) at once. Each
@@ -85,6 +90,8 @@ async fn run() -> ExitCode {
         Err(message) => Err(message),
         Ok((config, personal)) => match cli.command {
             Some(Command::CreateAdmin { username }) => create_admin(&config, &username),
+            Some(Command::Backup { folder }) => backup::backup(&config, &folder).map(|said| println!("{said}")),
+            Some(Command::Restore { folder }) => backup::restore(&config, &folder).map(|said| println!("{said}")),
             Some(Command::Serve) | None => serve(config, personal && !cli.no_browser).await,
         },
     };

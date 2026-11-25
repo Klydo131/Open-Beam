@@ -357,11 +357,20 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                                     tr {
                                         th scope="row" { (name) }
                                         @let identifier = is_identifier(name, &set.key);
+                                        @let float = numbers.get(index).is_some_and(|p| p.edm == EdmType::Double);
                                         @for offset in 0..beam_odata::PROFILE_WIDTH {
                                             @if offset == 1 && identifier {
                                                 td.num title="Not added up: the values are identifiers, not amounts" { "—" }
                                             } @else {
-                                                td.num { (show(figures.get(at + offset).and_then(Option::as_ref))) }
+                                                @let text = figures.get(at + offset).and_then(Option::as_ref);
+                                                // Quartiles and the median are interpolated, and a
+                                                // float column's figures carry float noise: 15
+                                                // significant digits are all they hold.
+                                                @if float || (3..=5).contains(&offset) {
+                                                    td.num { (text.map_or("—".to_string(), |t| significant(t))) }
+                                                } @else {
+                                                    td.num { (show(text)) }
+                                                }
                                             }
                                         }
                                     }
@@ -1055,9 +1064,33 @@ fn exact_number(text: &str) -> String {
     out
 }
 
+/// A float figure to 15 significant digits, the most a float holds, then
+/// grouped like any other: `0.15000000000000002` becomes `0.15`.
+fn significant(text: &str) -> String {
+    match text.parse::<f64>() {
+        Ok(value) if value.is_finite() && value != 0.0 && !text.contains(['e', 'E']) => {
+            let magnitude = value.abs().log10().floor() as i32;
+            let places = (14 - magnitude).clamp(0, 17) as usize;
+            exact_number(&format!("{value:.places$}"))
+        }
+        _ => exact_number(text),
+    }
+}
+
 #[cfg(test)]
 mod exact_tests {
-    use super::exact_number;
+    use super::{exact_number, significant};
+
+    #[test]
+    fn float_noise_is_not_shown() {
+        assert_eq!(significant("0.15000000000000002"), "0.15");
+        assert_eq!(significant("10.094999999999999"), "10.095");
+        assert_eq!(significant("11250.75"), "11,250.75");
+        assert_eq!(significant("3.0"), "3");
+        assert_eq!(significant("-2.5"), "-2.5");
+        assert_eq!(significant("1e+20"), "1e+20");
+        assert_eq!(significant("0"), "0");
+    }
 
     #[test]
     fn every_digit_is_kept() {

@@ -13,5 +13,6 @@ Follow these in order the first time. Each guide takes a few minutes.
 8. [Connect programs and AI assistants](08-connect-programs-and-assistants.md)
 9. [Describe, verify and watch your data](09-describe-verify-and-watch.md)
 10. [Describe the model](10-describe-the-model.md): the business objects behind the datasets and how they link
+11. [Back up and restore](11-back-up-and-restore.md)
 
 For how Open Beam works inside, read the [architecture](../ARCHITECTURE.md).

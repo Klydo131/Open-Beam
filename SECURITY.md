@@ -161,3 +161,9 @@ and sends no telemetry. Accounts are created by you on first run and stored in
 `beam-accounts.sqlite`, which holds password hashes, not passwords. Do not
 commit `beam.toml`, the accounts file, data files or passwords to a public
 repository; this project's `.gitignore` excludes them for that reason.
+
+`beam backup` copies the accounts file, the model and uploaded files to a
+folder; protect backups as you protect the server, since they hold the
+same password hashes and data. `beam restore` checks every file's digest
+and the database before changing anything, so a backup altered or
+damaged since it was made is refused.

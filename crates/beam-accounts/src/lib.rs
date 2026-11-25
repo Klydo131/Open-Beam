@@ -68,6 +68,8 @@ pub enum AccountError {
     TooMany(&'static str),
     #[error("No such question or watch.")]
     ItemNotFound,
+    #[error("{0}")]
+    BadBackup(&'static str),
     #[error("account database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("password hashing failed")]
@@ -477,6 +479,41 @@ impl Store {
 
     /// Returns the account when the username and password match an active
     /// account. Takes about the same time whether or not the username exists.
+    /// Writes a consistent copy of the database to `to`, which must not
+    /// exist yet, while the server keeps running (SQLite's `VACUUM INTO`).
+    /// Deleted rows are left out of the copy.
+    pub fn backup_to(&self, to: &Path) -> Result<(), AccountError> {
+        let target = to
+            .to_str()
+            .ok_or(AccountError::BadBackup("the backup path must be valid UTF-8"))?;
+        self.conn().execute("VACUUM INTO ?1", [target])?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Checks that `path` is a whole, undamaged Open Beam account database,
+    /// without changing it.
+    pub fn check_file(path: &Path) -> Result<(), AccountError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let verdict: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if verdict != "ok" {
+            return Err(AccountError::BadBackup("the account database is damaged"));
+        }
+        let accounts: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'accounts'",
+            [],
+            |row| row.get(0),
+        )?;
+        if accounts != 1 {
+            return Err(AccountError::BadBackup("this is not an Open Beam account database"));
+        }
+        Ok(())
+    }
+
     /// The account a typed username names, if any: one indexed lookup.
     pub fn find(&self, username: &str) -> Result<Option<Account>, AccountError> {
         let Ok(username) = normalise_username(username) else {
