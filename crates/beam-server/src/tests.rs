@@ -4630,3 +4630,67 @@ async fn profile_totals_keep_every_digit() {
     assert!(about.contains("9,007,199,254,740,993"), "the exact largest value");
     assert!(!about.contains("9,007,199,254,740,992"));
 }
+
+#[tokio::test]
+async fn every_lesson_lands_on_its_tip_and_people_see_only_their_lessons() {
+    let site = editable_site(&format!("{SALE_AND_ITEM}{OF_ITEM}"));
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    let saved = upload(&site, &bob, &csrf, "mine.csv", b"id,amount\n1,2\n", "mine").await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    for (who, password, admin) in [("ada", ADMIN_PASSWORD, true), ("bob", USER_PASSWORD, false)] {
+        let (cookie, _) = sign_in(&site, who, password).await;
+        let learn = get(&site, "/learn", Some(&cookie)).await;
+        assert_eq!(learn.status, StatusCode::OK);
+        assert_eq!(learn.body.contains("For administrators"), admin, "{who}");
+        // Every "Try it" opens a page holding that lesson's tip.
+        let links: Vec<String> = learn
+            .body
+            .split("href=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|href| href.contains("#learn-"))
+            .map(str::to_string)
+            .collect();
+        assert!(links.len() >= 10, "{who}: {links:?}");
+        for link in &links {
+            let (path, id) = link.split_once('#').unwrap();
+            let page = get(&site, path, Some(&cookie)).await;
+            assert_eq!(page.status, StatusCode::OK, "{link}");
+            assert!(page.body.contains(&format!("id=\"{id}\"")), "{who}: {link} has no tip");
+        }
+        // A person who added a file can try sharing it.
+        if !admin {
+            assert!(links.iter().any(|l| l.ends_with("/share#learn-share")), "{links:?}");
+            assert!(!links.iter().any(|l| l.contains("/admin/")));
+        }
+    }
+    // Signed out, the page asks for sign-in.
+    assert_eq!(get(&site, "/learn", None).await.status, StatusCode::SEE_OTHER);
+}
+
+#[test]
+fn tutorial_motion_stops_within_five_seconds_and_honours_reduced_motion() {
+    let css = include_str!("../static/app.css");
+    let rule = css
+        .lines()
+        .find(|l| l.starts_with(".learn-arrow {"))
+        .expect("the arrow rule");
+    // "animation: <name> <duration>s <timing> <count>": finite and short.
+    let words: Vec<&str> = rule
+        .split("animation:")
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    let seconds: f64 = words[1].trim_end_matches('s').parse().unwrap();
+    let count: f64 = words[3].parse().expect("a finite number of repeats, never infinite");
+    assert!(seconds * count <= 5.0, "WCAG 2.2.2: moving for {} s", seconds * count);
+    // Any of the reduced-motion blocks may hold it.
+    assert!(css
+        .split("@media (prefers-reduced-motion: reduce)")
+        .skip(1)
+        .any(|block| block.contains(".learn-arrow { animation: none; }")));
+}

@@ -867,7 +867,10 @@ pub async fn page_route(State(state): State<Arc<AppState>>, headers: HeaderMap) 
     let can_edit = state.model_path.is_some() && signed.session.account.role == beam_accounts::Role::Admin;
     let body = html! {
         (body)
-        @if can_edit { p { a.button.quiet href="/model/edit" { "Edit the model" } } }
+        @if can_edit {
+            (crate::learn::spot("model", "select Edit the model, change it, then preview before applying."))
+            p { a.button.quiet href="/model/edit" { "Edit the model" } }
+        }
     };
     page(StatusCode::OK, layout("Model", Some(&signed), body))
 }

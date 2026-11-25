@@ -613,6 +613,7 @@ pub async fn about(
         section.panel {
             h2 { "What this data means" }
             @if curator {
+                (crate::learn::spot("describe", "say what one row is, then what each column holds, and Save."))
                 form method="post" action={ (base) "/about" } {
                     input type="hidden" name="csrf" value=(csrf);
                     label for="description" { "About this dataset" }
@@ -705,6 +706,7 @@ pub async fn about(
                 }
             }
             @if curator {
+                (crate::learn::spot("watch", "open this, choose what to watch, and save it."))
                 details {
                     summary { "Add a watch" }
                     form.stack method="post" action={ (base) "/watches" } {
@@ -1025,6 +1027,7 @@ pub async fn overview(State(state): App, headers: HeaderMap) -> Response {
 /// The form on the Chart view that saves the chart on screen as a verified question.
 pub fn save_question_form(set: &EntitySet, csrf: &str, current: &[(&str, &str)], title: &str) -> Markup {
     html! {
+        (crate::learn::spot("verify", "draw the answer above, then open this and name the question."))
         details {
             summary { "Save as a verified question" }
             form.stack method="post" action={ "/datasets/" (set.name) "/questions" } {

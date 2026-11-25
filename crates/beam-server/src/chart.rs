@@ -310,6 +310,7 @@ pub async fn chart(
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
         h1 { (set.name) }
         (table::dataset_tabs(set, Tab::Chart, &carried, table::can_manage(&signed, &entry)))
+        (crate::learn::spot("chart", "choose what to show and what to group it by, then Draw."))
         form.filter method="get" action={ "/datasets/" (set.name) "/chart" } {
             @for (name, value) in &carried { input type="hidden" name=(name) value=(value); }
             label for="agg" { "Show" }

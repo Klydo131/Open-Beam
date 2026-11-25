@@ -1,6 +1,8 @@
 # Guides
 
 Follow these in order the first time. Each guide takes a few minutes.
+Once Open Beam is running, its **Learn** page (in the menu) teaches each
+task in the app itself, pointing at the control to use.
 
 0. [Start here](00-start-here.md) — for everyone, no technical skills needed
 1. [Install Open Beam](01-install.md) — build from source

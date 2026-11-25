@@ -11,6 +11,7 @@ mod config;
 mod curate;
 mod export;
 mod feed;
+mod learn;
 mod mcp;
 mod model;
 mod model_edit;

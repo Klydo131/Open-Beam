@@ -233,6 +233,7 @@ fn upload_page(signed: &Signed, state: &AppState, error: Option<&str>) -> Respon
         p.crumbs { a href="/" { "Datasets" } " / Add data" }
         h1 { "Add data" }
         @if let Some(error) = error { p.notice.error role="alert" { (error) } }
+        (crate::learn::spot("add", "choose a CSV, Excel or Parquet file, then check the preview."))
         section.panel.narrow {
             form method="post" action="/data" enctype="multipart/form-data" {
                 input type="hidden" name="csrf" value=(signed.session.csrf);
@@ -512,6 +513,7 @@ pub async fn sharing(
             @if close.is_empty() && others.is_empty() {
                 p { "Everyone with an account can already see it." }
             } @else {
+                (crate::learn::spot("share", "pick a colleague and select Share."))
                 form method="post" action={ "/datasets/" (set.name) "/share" } {
                     input type="hidden" name="csrf" value=(csrf);
                     label for="account" { "Colleague" }

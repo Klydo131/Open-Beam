@@ -450,12 +450,14 @@ pub async fn dataset(
         p.crumbs { a href="/" { "Datasets" } " / " (set.name) }
         div.titlebar {
             h1 { (set.name) }
+            (crate::learn::spot("download", "Download Excel gives you exactly the rows on screen."))
             div.actions {
                 a.button.quiet href=(with_query(&format!("/datasets/{}/export.csv", set.name), &here)) download { "Download CSV" }
                 a.button href=(with_query(&format!("/datasets/{}/export.xlsx", set.name), &here)) download { "Download Excel" }
             }
         }
         (dataset_tabs(set, Tab::Table, &carried, can_manage(&signed, &entry)))
+        (crate::learn::spot("filter", "choose a column, a condition and a value, then Apply."))
         form.filter method="get" action={ "/datasets/" (set.name) } {
             @if let Some(column) = view.sort {
                 input type="hidden" name="sort" value=(column);
@@ -538,6 +540,7 @@ pub async fn dataset(
             @if page_number > 1 { a href=(table_link(set, &query, page_number - 1, None)) { "Previous" } }
             @if has_next { a href=(table_link(set, &query, page_number + 1, None)) { "Next" } }
         }
+        (crate::learn::spot("excel", "copy the Power BI address below into Get Data, OData feed."))
         section.panel.elsewhere {
             h2 { "Use this data somewhere else" }
             ul.destinations {

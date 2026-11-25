@@ -177,6 +177,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/watches", get(curate::overview))
         .route("/admin/system", get(system::page_route))
         .route("/model", get(crate::model::page_route))
+        .route("/learn", get(crate::learn::page_route))
         .route("/model/edit", get(crate::model_edit::edit_route))
         .route("/model/plan", post(crate::model_edit::plan_route))
         .route("/model/apply", post(crate::model_edit::apply_route))

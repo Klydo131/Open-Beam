@@ -133,7 +133,9 @@ for you, and a C++ compiler. Full instructions for Windows, macOS and Linux are 
 
 ## Guides
 
-Step-by-step guides, in order:
+Inside Open Beam, the **Learn** page in the menu has short lessons for
+every task, each with a "Try it" that opens the real page and points at
+where to start. For installing and running it, step-by-step guides, in order:
 
 0. [Start here](docs/guides/00-start-here.md) — for everyone
 1. [Install Open Beam](docs/guides/01-install.md) — build from source

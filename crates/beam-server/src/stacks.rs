@@ -128,12 +128,13 @@ fn light(status: Option<WatchStatus>) -> Markup {
 
 pub fn lanes(lanes: &[Lane<'_>], facts: &Facts, picked: Option<&str>) -> Markup {
     html! {
-        @for lane in lanes.iter().filter(|l| !l.entries.is_empty()) {
+        @for (index, lane) in lanes.iter().filter(|l| !l.entries.is_empty()).enumerate() {
             section.lane aria-labelledby={ "lane-" (lane.number) } {
                 div.section-label {
                     h2 #{ "lane-" (lane.number) } { (lane.title) }
                     span.count { (lane.entries.len()) }
                 }
+                @if index == 0 { (crate::learn::spot("datasets", "each card is a dataset. Choose one to see what it holds.")) }
                 ul.shelf {
                     @for (entry, note) in &lane.entries {
                         @let name = &entry.set.name;

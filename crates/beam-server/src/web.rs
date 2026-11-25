@@ -69,6 +69,7 @@ pub fn layout(title: &str, signed: Option<&Signed>, body: Markup) -> Markup {
                                 a href="/admin/system" { "System" }
                             }
                             a href="/account" { "Settings" }
+                            a href="/learn" { "Learn" }
                         }
                         form.signout method="post" action="/logout" {
                             input type="hidden" name="csrf" value=(signed.session.csrf);
@@ -814,6 +815,7 @@ pub async fn accounts(State(state): App, Query(query): Query<HashMap<String, Str
         (notice(&query))
         section.panel {
             h2 { "Add an account" }
+            (crate::learn::spot("accounts", "enter a username and a first password, choose the role, then Add account."))
             form.inline method="post" action="/admin/accounts" {
                 input type="hidden" name="csrf" value=(csrf);
                 div { label for="new-username" { "Username" }
