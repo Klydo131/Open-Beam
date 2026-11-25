@@ -169,6 +169,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/datasets/{name}", get(table::dataset))
         .route("/datasets/{name}/chart", get(chart::chart))
         .route("/datasets/{name}/present", get(crate::present::deck))
+        .route("/datasets/{name}/present.xlsx", get(crate::present::workbook))
         .route("/datasets/{name}/present/{file}", get(crate::present::svg))
         .route("/datasets/{name}/about", get(curate::about).post(curate::save_notes))
         .route("/datasets/{name}/questions", post(curate::add_question))

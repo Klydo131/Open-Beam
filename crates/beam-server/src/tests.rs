@@ -4804,3 +4804,100 @@ fn slides_print_one_widescreen_page_each() {
     assert!(css.contains(".slide + .slide { break-before: page; }"));
     assert!(css.contains("scroll-snap-type: y mandatory"));
 }
+
+#[tokio::test]
+async fn the_deck_downloads_as_a_workbook_with_tables_and_native_charts() {
+    use calamine::Reader;
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    for (title, kind) in [("=1+1 sales by region", "bar"), ("Sales by day", "line")] {
+        let group = if kind == "bar" { "region" } else { "sold_on" };
+        let saved = submit(
+            &site,
+            &ada,
+            &csrf,
+            "/datasets/sales/questions",
+            &[
+                ("question", title),
+                ("group", group),
+                ("agg", "sum"),
+                ("measure", "amount"),
+                ("kind", kind),
+            ],
+        )
+        .await;
+        assert_eq!(saved.location(), "/datasets/sales/about?ok=question");
+    }
+    // Two questions: title, an overview of both, then each.
+    let deck = get(&site, "/datasets/sales/present", Some(&ada)).await.body;
+    assert!(
+        deck.contains("At a glance") && deck.contains("href=\"#slide-4\""),
+        "{deck}"
+    );
+    assert!(deck.contains("/datasets/sales/present.xlsx"));
+
+    // The raw bytes, outside the text helper.
+    let request = Request::builder()
+        .uri("/datasets/sales/present.xlsx")
+        .header(HOST, "beam.test:9000")
+        .header(COOKIE, &ada)
+        .body(Body::empty())
+        .unwrap();
+    let response = site.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let mut book = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    assert_eq!(book.sheet_names(), ["Overview", "Q1", "Q2"]);
+    let q1 = book.worksheet_range("Q1").unwrap();
+    assert_eq!(
+        q1.get_value((0, 0)).unwrap().to_string(),
+        "=1+1 sales by region",
+        "text stays text"
+    );
+    assert_eq!(q1.get_value((3, 0)).unwrap().to_string(), "Group");
+    assert!(q1.rows().any(|row| row[0] == "EU"));
+    // Native charts and named tables, as Excel and Power BI read them.
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    let names: Vec<String> = zip.file_names().filter_map(Result::ok).map(|n| n.to_string()).collect();
+    assert!(
+        names.contains(&"xl/charts/chart1.xml".to_string()) && names.contains(&"xl/charts/chart2.xml".to_string()),
+        "{names:?}"
+    );
+    assert!(names.contains(&"xl/tables/table1.xml".to_string()), "{names:?}");
+    let mut chart = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("xl/charts/chart1.xml").unwrap(), &mut chart).unwrap();
+    assert!(
+        chart.contains("'Q1'!$B$5"),
+        "the chart reads the table's values: {chart}"
+    );
+    let formulas = (0..zip.len()).any(|i| {
+        let mut entry = zip.by_index(i).unwrap();
+        let mut text = String::new();
+        entry.name().is_ok_and(|n| n.starts_with("xl/worksheets/"))
+            && std::io::Read::read_to_string(&mut entry, &mut text).is_ok()
+            && text.contains("<f>")
+    });
+    assert!(!formulas, "no cell holds a formula");
+}
+
+#[tokio::test]
+async fn a_slide_shows_no_more_groups_than_the_chart_view() {
+    let site = site(false, 100);
+    let (ada, csrf) = sign_in(&site, "ada", ADMIN_PASSWORD).await;
+    // 120 different labels: a text grouping, so 24 bars as on the Chart view.
+    let saved = submit(
+        &site,
+        &ada,
+        &csrf,
+        "/datasets/many/questions",
+        &[("question", "Items"), ("group", "label")],
+    )
+    .await;
+    assert_eq!(saved.location(), "/datasets/many/about?ok=question");
+    let deck = get(&site, "/datasets/many/present", Some(&ada)).await.body;
+    assert_eq!(deck.matches("<rect class=\"bar\"").count(), 24, "{deck}");
+    assert!(deck.contains("The first 24 groups are shown"));
+    // No questions: the title slide says so and counts itself alone.
+    let empty = get(&site, "/datasets/sales/present", Some(&ada)).await.body;
+    assert!(empty.contains("No verified questions yet") && empty.contains("1 / 1"));
+}

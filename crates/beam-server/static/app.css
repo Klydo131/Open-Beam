@@ -331,3 +331,9 @@ main.deck { height: 100vh; max-width: none; margin: 0; padding: 0; overflow-y: a
   .slide-nav, .slide-meta a { display: none; }
   .slide-chart .chart { max-height: 5in; }
 }
+.slide-actions { margin: 0.4rem 0 0; display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+.overview { flex: 1; min-height: 0; display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); align-content: start; overflow: hidden; }
+.overview-card { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.8rem; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); font-weight: 600; }
+.overview-card:hover { border-color: var(--accent); text-decoration: none; }
+.overview-card .chart { width: 100%; max-height: 22vh; }
+@media print { .slide-actions { display: none; } }

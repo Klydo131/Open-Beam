@@ -21,6 +21,12 @@ use std::sync::Arc;
 const MAX_BARS: u64 = 24;
 const MAX_POINTS: u64 = 120;
 
+/// Most groups a chart shows: bars for unordered groups, points for ordered
+/// ones (dates, numbers).
+pub(crate) fn point_limit(ordered: bool) -> usize {
+    (if ordered { MAX_POINTS } else { MAX_BARS }) as usize
+}
+
 const AGGREGATES: &[(&str, &str, Aggregate)] = &[
     ("count", "Number of rows", Aggregate::Count),
     ("sum", "Sum of", Aggregate::Sum),

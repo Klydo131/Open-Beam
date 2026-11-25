@@ -8,6 +8,12 @@
 //!   Microsoft 365, 2019 and later inserts and can turn into editable shapes
 //!   ("Convert to Shape"). The file carries its own colours, since
 //!   PowerPoint does not have this site's stylesheet.
+//! - "Download as Excel" gives a workbook: an overview sheet, then one
+//!   sheet per question holding its figures as an Excel table and a native
+//!   Excel chart over them. Power BI loads the tables (its Excel connector
+//!   picks up named tables; without them it can only guess).
+//! - An overview slide shows every chart at once, small, for a look at the
+//!   whole before the detail (a dashboard's "single-page view").
 //! - Every slide is worked out from current data, as verified questions
 //!   always are, and says who verified it and when.
 
@@ -20,9 +26,15 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use beam_accounts::Question;
 use maud::{html, Markup, DOCTYPE};
+use rust_xlsxwriter::{Chart, ChartType, Format, Table, TableColumn, Workbook};
 use std::sync::Arc;
 
 type App = State<Arc<AppState>>;
+
+/// A question's chart from current data: its points, whether it reads best
+/// as a line, and whether points past the Chart view's limit were left out;
+/// or why it cannot be drawn now.
+type Drawn = Result<(Vec<(String, f64)>, bool, bool), String>;
 
 /// A question's chart, from current data: its points, and whether it reads
 /// best as a line.
@@ -31,19 +43,27 @@ async fn drawn(
     account: &beam_accounts::Account,
     set: &beam_odata::EntitySet,
     question: &Question,
-) -> Result<(Vec<(String, f64)>, bool), String> {
+) -> Drawn {
     let options = crate::curate::question_options(set, &question.settings)?;
     let answer = crate::api::summary(state, account, &set.name, &options)
         .await
         .map_err(|e| e.message)?;
-    let points = answer["groups"]
+    let mut points: Vec<(String, f64)> = answer["groups"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|g| Some((g["label"].as_str()?.to_string(), g["value"].as_f64()?)))
         .collect();
     let line = question.settings.split('&').any(|p| p == "kind=line");
-    Ok((points, line))
+    // The same limit as the Chart view, so a slide shows what was verified.
+    let group = options.iter().find(|(k, _)| k == "group").map(|(_, v)| v.as_str());
+    let ordered = group
+        .and_then(|g| set.property(g))
+        .is_some_and(|p| !matches!(p.edm, beam_odata::EdmType::String | beam_odata::EdmType::Boolean));
+    let limit = crate::chart::point_limit(ordered);
+    let cut = points.len() > limit;
+    points.truncate(limit);
+    Ok((points, line, cut))
 }
 
 fn chart(points: &[(String, f64)], line: bool, title: &str) -> Markup {
@@ -80,7 +100,9 @@ pub async fn deck(State(state): App, Path(name): Path<String>, headers: HeaderMa
     for question in &questions {
         slides.push((question, drawn(&state, account, set, question).await));
     }
-    let total = slides.len() + 1;
+    // Title, an overview when there is more than one, then the questions.
+    let first = if slides.len() > 1 { 3 } else { 2 };
+    let total = if slides.is_empty() { 1 } else { slides.len() + first - 1 };
     let base = format!("/datasets/{}", set.name);
     let markup = html! {
         (DOCTYPE)
@@ -99,15 +121,41 @@ pub async fn deck(State(state): App, Path(name): Path<String>, headers: HeaderMa
                         h1 { (set.name) }
                         @if let Some(about) = &about { p.slide-lede { (about) } }
                         p.slide-meta { (slides.len()) " verified " (if slides.len() == 1 { "question" } else { "questions" }) ", worked out from the current data." }
+                        @if slides.is_empty() {
+                            p { "No verified questions yet. Draw an answer on the " a href={ (base) "/chart" } { "Chart" } " view and save it as a verified question; it becomes a slide here." }
+                        } @else {
+                            p.slide-actions {
+                                a.button href={ (base) "/present.xlsx" } download { "Download as Excel, with charts" }
+                                " "
+                                span.hint { "Opens in Excel; Power BI loads its tables. To print a PDF deck, use your browser's Print." }
+                            }
+                        }
                         (controls(&base, 1, total))
                     }
+                    @if slides.len() > 1 {
+                        section.slide #slide-2 {
+                            h2 { "At a glance" }
+                            div.overview {
+                                @for (index, (question, result)) in slides.iter().enumerate() {
+                                    a.overview-card href={ "#slide-" (index + 3) } {
+                                        span { (question.question) }
+                                        @if let Ok((points, line, _)) = result {
+                                            @if !points.is_empty() { (chart(points, *line, &question.question)) }
+                                        }
+                                    }
+                                }
+                            }
+                            (controls(&base, 2, total))
+                        }
+                    }
                     @for (index, (question, result)) in slides.iter().enumerate() {
-                        @let number = index + 2;
+                        @let number = index + first;
                         section.slide id={ "slide-" (number) } {
                             h2 { (question.question) }
                             @match result {
-                                Ok((points, line)) if !points.is_empty() => {
+                                Ok((points, line, cut)) if !points.is_empty() => {
                                     div.slide-chart { (chart(points, *line, &question.question)) }
+                                    @if *cut { p.slide-meta { "The first " (points.len()) " groups are shown, as on the Chart view." } }
                                 }
                                 Ok(_) => p.empty { "No rows match this question now." },
                                 Err(why) => p.notice.error { "This question no longer fits the data: " (why) },
@@ -116,19 +164,14 @@ pub async fn deck(State(state): App, Path(name): Path<String>, headers: HeaderMa
                                 "Verified by " (question.approved_by.as_deref().unwrap_or("someone no longer here"))
                                 " on " (question.approved_at.get(..10).unwrap_or(&question.approved_at))
                                 " · dataset " (set.name)
-                                @if matches!(result, Ok((points, _)) if !points.is_empty()) {
+                                @if matches!(result, Ok((points, _, _)) if !points.is_empty()) {
                                     " · " a href={ (base) "/present/" (question.id) ".svg" } download { "Download for PowerPoint" }
                                 }
                             }
                             (controls(&base, number, total))
                         }
                     }
-                    @if slides.is_empty() {
-                        section.slide #slide-2 {
-                            h2 { "No verified questions yet" }
-                            p { "Draw an answer on the " a href={ (base) "/chart" } { "Chart" } " view and save it as a verified question; it becomes a slide here." }
-                        }
-                    }
+
                 }
             }
         }
@@ -206,7 +249,7 @@ pub async fn svg(State(state): App, Path((name, file)): Path<(String, String)>, 
         );
     };
     let (points, line) = match drawn(&state, account, set, &question).await {
-        Ok(drawn) if !drawn.0.is_empty() => drawn,
+        Ok((points, line, _)) if !points.is_empty() => (points, line),
         _ => {
             return message_page(
                 StatusCode::CONFLICT,
@@ -220,6 +263,123 @@ pub async fn svg(State(state): App, Path((name, file)): Path<(String, String)>, 
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{}-{id}.svg\"", set.name)) {
+        headers.insert(CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+/// The deck as an Excel workbook: an overview sheet, then a sheet per
+/// question with its figures as a named table and a native chart over them.
+fn workbook_bytes(dataset: &str, slides: &[(&Question, Drawn)]) -> Result<Vec<u8>, rust_xlsxwriter::XlsxError> {
+    let mut book = Workbook::new();
+    let bold = Format::new().set_bold();
+    let title = Format::new().set_bold().set_font_size(14);
+    let overview = book.add_worksheet().set_name("Overview")?;
+    overview.write_string_with_format(0, 0, dataset, &title)?;
+    overview.write_string(
+        1,
+        0,
+        "Verified questions, worked out from the data when this file was made.",
+    )?;
+    for (column, heading) in ["Sheet", "Question", "Verified by", "Verified on"].iter().enumerate() {
+        overview.write_string_with_format(3, column as u16, *heading, &bold)?;
+    }
+    for (index, (question, _)) in slides.iter().enumerate() {
+        let row = 4 + index as u32;
+        overview.write_string(row, 0, format!("Q{}", index + 1))?;
+        overview.write_string(row, 1, &question.question)?;
+        overview.write_string(row, 2, question.approved_by.as_deref().unwrap_or(""))?;
+        overview.write_string(row, 3, question.approved_at.get(..10).unwrap_or(&question.approved_at))?;
+    }
+    overview.set_column_width(1, 50)?;
+    for (index, (question, result)) in slides.iter().enumerate() {
+        let name = format!("Q{}", index + 1);
+        let sheet = book.add_worksheet().set_name(&name)?;
+        // Text from people is written as text, never as a formula.
+        sheet.write_string_with_format(0, 0, &question.question, &title)?;
+        let verified = format!(
+            "Verified by {} on {}",
+            question.approved_by.as_deref().unwrap_or("someone no longer here"),
+            question.approved_at.get(..10).unwrap_or(&question.approved_at)
+        );
+        sheet.write_string(1, 0, verified)?;
+        match result {
+            Ok((points, line, cut)) if !points.is_empty() => {
+                let last = 3 + points.len() as u32;
+                for (offset, (label, value)) in points.iter().enumerate() {
+                    sheet.write_string(4 + offset as u32, 0, label)?;
+                    sheet.write_number(4 + offset as u32, 1, *value)?;
+                }
+                // A table name may not look like a cell, and Q1 is one.
+                let table = Table::new().set_name(format!("Question{}", index + 1)).set_columns(&[
+                    TableColumn::new().set_header("Group"),
+                    TableColumn::new().set_header("Value"),
+                ]);
+                sheet.add_table(3, 0, last, 1, &table)?;
+                if *cut {
+                    sheet.write_string(
+                        last + 2,
+                        0,
+                        format!("The first {} groups, as on the Chart view.", points.len()),
+                    )?;
+                }
+                sheet.set_column_width(0, 24)?;
+                let mut chart = Chart::new(if *line { ChartType::Line } else { ChartType::Bar });
+                chart
+                    .add_series()
+                    .set_categories((name.as_str(), 4, 0, last, 0))
+                    .set_values((name.as_str(), 4, 1, last, 1));
+                chart.title().set_name(&question.question);
+                chart.legend().set_hidden();
+                sheet.insert_chart(3, 3, &chart)?;
+            }
+            Ok(_) => {
+                sheet.write_string(3, 0, "No rows match this question now.")?;
+            }
+            Err(why) => {
+                sheet.write_string(3, 0, format!("This question no longer fits the data: {why}"))?;
+            }
+        }
+    }
+    book.save_to_buffer()
+}
+
+pub async fn workbook(State(state): App, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    let signed = match require_signed_in(&state, &headers) {
+        Ok(signed) => signed,
+        Err(response) => return response,
+    };
+    let account = &signed.session.account;
+    let Some(entry) = catalog::find(&state, account, &name) else {
+        return message_page(
+            StatusCode::NOT_FOUND,
+            "Dataset not found",
+            "There is no dataset with that name.",
+        );
+    };
+    let set = &entry.set;
+    let questions = state.accounts.questions(&set.name).unwrap_or_default();
+    let mut slides = Vec::new();
+    for question in &questions {
+        slides.push((question, drawn(&state, account, set, question).await));
+    }
+    let bytes = match workbook_bytes(&set.name, &slides) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return message_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "The workbook could not be made.",
+            )
+        }
+    };
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{}-slides.xlsx\"", set.name)) {
         headers.insert(CONTENT_DISPOSITION, value);
     }
     response
