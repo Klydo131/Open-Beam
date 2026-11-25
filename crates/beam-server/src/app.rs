@@ -18,7 +18,9 @@ use beam_engine::Engine;
 use std::sync::Arc;
 
 /// The figures of a dataset's profile, as the profile query returns them.
-pub type Profile = Arc<Vec<Option<f64>>>;
+/// Profile figures as the engine wrote them, so totals of large or exact
+/// decimal values keep every digit.
+pub type Profile = Arc<Vec<Option<String>>>;
 
 pub struct AppState {
     pub engine: Engine,

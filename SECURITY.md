@@ -150,6 +150,9 @@ Against attacks that need no account:
   the same address, for the same account) is written at most once a
   minute, with a count of the ones left out, so a flood of guesses
   cannot flood the record: 300 wrong passwords in a row write six lines.
+  Sign-ins that fail for names that are not accounts are limited the same
+  way. A count written when its minute has passed carries that time, not
+  the time of the attempts it counts.
 
 ## Your data and credentials
 

@@ -177,10 +177,10 @@ pub fn plan_profile(set: &EntitySet, columns: &[&str]) -> Result<Summary, QueryE
         .map(|(i, c)| {
             let fence = format!("1.5 * (q.q3_{i} - q.q1_{i})");
             format!(
-                "CAST(count({c}) AS DOUBLE), CAST(sum({c}) AS DOUBLE), CAST(min({c}) AS DOUBLE), \
-                 CAST(any_value(q.q1_{i}) AS DOUBLE), CAST(quantile_cont({c}, 0.5) AS DOUBLE), \
-                 CAST(any_value(q.q3_{i}) AS DOUBLE), CAST(max({c}) AS DOUBLE), \
-                 CAST(count(*) FILTER (WHERE {c} < q.q1_{i} - {fence} OR {c} > q.q3_{i} + {fence}) AS DOUBLE)"
+                "CAST(count({c}) AS VARCHAR), CAST(sum({c}) AS VARCHAR), CAST(min({c}) AS VARCHAR), \
+                 CAST(any_value(q.q1_{i}) AS VARCHAR), CAST(quantile_cont({c}, 0.5) AS VARCHAR), \
+                 CAST(any_value(q.q3_{i}) AS VARCHAR), CAST(max({c}) AS VARCHAR), \
+                 CAST(count(*) FILTER (WHERE {c} < q.q1_{i} - {fence} OR {c} > q.q3_{i} + {fence}) AS VARCHAR)"
             )
         })
         .collect::<Vec<_>>()
@@ -189,7 +189,7 @@ pub fn plan_profile(set: &EntitySet, columns: &[&str]) -> Result<Summary, QueryE
     Ok(Summary {
         sql: format!(
             "WITH q AS (SELECT {quartiles} FROM {table}) \
-             SELECT CAST(count(*) AS DOUBLE), {figures} FROM {table}, q"
+             SELECT CAST(count(*) AS VARCHAR), {figures} FROM {table}, q"
         ),
         params: Vec::new(),
         ordered: false,

@@ -10,9 +10,11 @@
 //!   an account, since people sometimes type their password there.
 //! - Lines go to standard error, for the service manager (systemd, Docker)
 //!   to keep and send on to a separate system (V16.4.3).
-//! - Repeated refusals of one kind, from one address, for one account are
-//!   written at most once a [`WINDOW`], the next line counting the ones
-//!   left out, so a flood of guesses cannot flood the record.
+//! - Repeated refusals of one kind, from one address, for one account, and
+//!   failures naming no account, are written at most once a [`WINDOW`]; a
+//!   later line counts the ones left out (`left_out`), so a flood of
+//!   guesses cannot flood the record. A count written when its window
+//!   passes carries that time, not the time of the attempts.
 
 use beam_accounts::Account;
 use serde_json::{json, Value};
@@ -124,6 +126,14 @@ pub fn flush() {
     }
 }
 
+/// Whether an event is one that comes in floods: refusals, and failures
+/// naming no account (made-up usernames sprayed from one address). A
+/// failure for a real account is always written; those are capped by the
+/// lockout already.
+fn repeats(outcome: &str, who: Option<&Account>) -> bool {
+    REPEATING.contains(&outcome) || (outcome == "failure" && who.is_none())
+}
+
 fn shortened(value: Value) -> Value {
     match value {
         Value::String(text) if text.chars().count() > MAX_TEXT => {
@@ -153,7 +163,7 @@ pub fn record(event: &str, outcome: &str, who: Option<&Account>, from: Option<Ip
     }
     // Tests run side by side in one process and would share this table,
     // so they see every line; `admit` and `due` are tested on their own.
-    if REPEATING.contains(&outcome) && !cfg!(test) {
+    if repeats(outcome, who) && !cfg!(test) {
         // What was refused is part of the key, so refusals on different
         // pages are each written; the path is not, so varying it cannot
         // get round the limit.
@@ -340,5 +350,24 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(line.contains("198.51.100.23"), "{line}");
+    }
+
+    #[test]
+    fn floods_are_recognised_but_real_accounts_failing_are_always_written() {
+        let bob = Account {
+            id: 1,
+            username: "bob".into(),
+            role: beam_accounts::Role::User,
+            active: true,
+            created_at: String::new(),
+            last_sign_in: None,
+            display_name: None,
+            team: None,
+            mode: beam_accounts::Mode::Basic,
+        };
+        assert!(repeats("failure", None));
+        assert!(!repeats("failure", Some(&bob)));
+        assert!(repeats("locked", Some(&bob)));
+        assert!(!repeats("success", None));
     }
 }

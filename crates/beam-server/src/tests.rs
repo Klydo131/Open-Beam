@@ -4609,3 +4609,24 @@ async fn pages_show_numbers_and_names_the_way_people_read_them() {
     let home = get(&modeled, "/", Some(&ada)).await.body;
     assert!(home.contains("sales_<wbr>with_<wbr>many"), "{home}");
 }
+
+#[tokio::test]
+async fn profile_totals_keep_every_digit() {
+    let site = site(false, 50);
+    let (bob, csrf) = sign_in(&site, "bob", USER_PASSWORD).await;
+    // 2^53 + 1 and the total 2^53 + 3 cannot be held exactly as floats.
+    let saved = upload(
+        &site,
+        &bob,
+        &csrf,
+        "big.csv",
+        b"n,amount\n9007199254740993,12345678901234.56\n2,0.01\n",
+        "big",
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    let about = get(&site, "/datasets/big/about", Some(&bob)).await.body;
+    assert!(about.contains("9,007,199,254,740,995"), "the exact total: {about}");
+    assert!(about.contains("9,007,199,254,740,993"), "the exact largest value");
+    assert!(!about.contains("9,007,199,254,740,992"));
+}

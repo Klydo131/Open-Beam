@@ -322,8 +322,9 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                         .await
                         .ok()
                         .and_then(|rows| {
-                            rows.first()
-                                .map(|row| Arc::new(row.iter().map(Value::as_f64).collect::<Vec<_>>()))
+                            rows.first().map(|row| {
+                                Arc::new(row.iter().map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>())
+                            })
                         })
                 }
                 Err(_) => None,
@@ -332,7 +333,7 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
             worked_out
         }
     };
-    let show = |v: Option<f64>| v.map_or("—".to_string(), format_number);
+    let show = |v: Option<&String>| v.map_or("—".to_string(), |text| exact_number(text));
     html! {
         section.panel {
             h2 { "Profile" }
@@ -340,7 +341,7 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                 None => p.empty { "The profile could not be worked out in time." },
                 Some(figures) => {
                     p.hint {
-                        (show(figures[0])) @if figures[0] == Some(1.0) { " row. " } @else { " rows. " } "Compare the row count and totals with the source to confirm nothing was lost or counted twice. "
+                        (show(figures[0].as_ref())) @if figures[0].as_deref() == Some("1") { " row. " } @else { " rows. " } "Compare the row count and totals with the source to confirm nothing was lost or counted twice. "
                         "Half of the values lie between the 25th and 75th percentiles."
                     }
                     div.tablewrap {
@@ -360,7 +361,7 @@ async fn profile_section(state: &Arc<AppState>, set: &EntitySet, numbers: &[&Pro
                                             @if offset == 1 && identifier {
                                                 td.num title="Not added up: the values are identifiers, not amounts" { "—" }
                                             } @else {
-                                                td.num { (show(figures.get(at + offset).copied().flatten())) }
+                                                td.num { (show(figures.get(at + offset).and_then(Option::as_ref))) }
                                             }
                                         }
                                     }
@@ -1034,4 +1035,39 @@ pub fn save_question_form(set: &EntitySet, csrf: &str, current: &[(&str, &str)],
 fn is_identifier(column: &str, key: &str) -> bool {
     let lower = column.to_ascii_lowercase();
     column == key || lower == "id" || lower.ends_with("_id")
+}
+
+/// A number as the engine wrote it, with its whole part grouped in threes
+/// and no digit changed: `12345678901234.57` becomes `12,345,678,901,234.57`
+/// and `3.0` becomes `3`. Exponent forms (`1e+20`) are shown as written.
+fn exact_number(text: &str) -> String {
+    let (sign, digits) = text.strip_prefix('-').map_or(("", text), |rest| ("-", rest));
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return text.to_string();
+    }
+    let fraction = fraction.trim_end_matches('0');
+    let mut out = format!("{sign}{}", crate::table::group_digits(whole));
+    if !fraction.is_empty() {
+        out.push('.');
+        out.push_str(fraction);
+    }
+    out
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::exact_number;
+
+    #[test]
+    fn every_digit_is_kept() {
+        assert_eq!(exact_number("9007199254740994"), "9,007,199,254,740,994");
+        assert_eq!(exact_number("12345678901234.57"), "12,345,678,901,234.57");
+        assert_eq!(exact_number("18446744073709551614"), "18,446,744,073,709,551,614");
+        assert_eq!(exact_number("3.0"), "3");
+        assert_eq!(exact_number("-1234.50"), "-1,234.5");
+        assert_eq!(exact_number("0.0000001"), "0.0000001");
+        assert_eq!(exact_number("1e+20"), "1e+20");
+        assert_eq!(exact_number("nan"), "nan");
+    }
 }
